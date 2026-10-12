@@ -14,6 +14,7 @@ import {
   readmeVersionSites,
 } from "../../scripts/release/version-sites.mjs";
 
+/** Build an in-memory release tree so version planning can be tested without file writes. */
 const fixture = (overrides = {}) => ({
   "Cargo.toml":
     '[package]\nname = "vitest-dedup"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -33,11 +34,11 @@ const fixture = (overrides = {}) => ({
     2,
   )}\n`,
   "README.md":
-    "```yaml\n- uses: figueiredoluiz/vitest-dedup@v0\n  with:\n    version: 0.1.0\n```\n",
+    "```yaml\n- uses: figueiredoluiz/vitest-dedup@v0.1.0\n  with:\n    version: 0.1.0\n```\n",
   ...overrides,
 });
 
-test("a patch bump rewrites every site and moves no major pin", () => {
+test("a patch bump rewrites every site including the exact Action ref", () => {
   const { previous, planned } = planBump("0.1.1", fixture());
   assert.equal(previous, "0.1.0");
   assert.deepEqual([...planned.keys()].sort(), [...BUMPED_FILES].sort());
@@ -62,15 +63,28 @@ test("a patch bump rewrites every site and moves no major pin", () => {
   const readme = readmeVersionSites(planned.get("README.md"));
   assert.deepEqual(readme.versions, ["0.1.1"]);
   assert.deepEqual(
-    readme.majors,
-    ["0"],
-    "a patch bump must not touch the @vN pin",
+    readme.actionTags,
+    ["0.1.1"],
+    "the Action ref must move with the exact version input",
   );
 });
 
-test("a major bump moves the documented @vN Action pin", () => {
+test("a major bump moves the documented exact Action ref", () => {
   const { planned } = planBump("1.0.0", fixture());
-  assert.deepEqual(readmeVersionSites(planned.get("README.md")).majors, ["1"]);
+  assert.deepEqual(readmeVersionSites(planned.get("README.md")).actionTags, ["1.0.0"]);
+});
+
+test("a prerelease bump accepts only versions the release workflow can publish", () => {
+  const { planned } = planBump("0.2.0-rc.1", fixture());
+  assert.deepEqual(readmeVersionSites(planned.get("README.md")), {
+    versions: ["0.2.0-rc.1"],
+    actionTags: ["0.2.0-rc.1"],
+  });
+  assert.throws(() => planBump("0.2.0-rc-1", fixture()), /not a release version/);
+  assert.deepEqual(
+    readmeVersionSites("- uses: figueiredoluiz/vitest-dedup@v0.2.0-rc-1\n  version: 0.2.0-rc-1\n"),
+    { versions: [], actionTags: [] },
+  );
 });
 
 test("malformed input is refused before anything is planned", () => {
@@ -98,15 +112,15 @@ test("every version site is found in a CRLF checkout, as Windows produces", () =
   assert.equal(cargoVersion(cargo), "1.2.3");
 
   const readme = crlf(
-    "```yaml\n  - uses: figueiredoluiz/vitest-dedup@v1\n    with:\n      version: 1.2.3\n```\n",
+    "```yaml\n  - uses: figueiredoluiz/vitest-dedup@v1.2.3\n    with:\n      version: 1.2.3\n```\n",
   );
-  const { versions, majors } = readmeVersionSites(readme);
+  const { versions, actionTags } = readmeVersionSites(readme);
   assert.deepEqual(
     versions,
     ["1.2.3"],
     "the CRLF README version pin should be found",
   );
-  assert.deepEqual(majors, ["1"], "the CRLF README major pin should be found");
+  assert.deepEqual(actionTags, ["1.2.3"], "the CRLF README exact tag should be found");
 });
 
 test("a Cargo.toml whose shape changed fails loudly instead of partially bumping", () => {
@@ -121,6 +135,12 @@ test("a Cargo.toml whose shape changed fails loudly instead of partially bumping
   assert.throws(
     () => planBump("0.2.0", fixture({ "README.md": "no pins here\n" })),
     /README\.md carries no Action version pin/,
+  );
+  assert.throws(
+    () => planBump("0.2.0", fixture({
+      "README.md": "- uses: figueiredoluiz/vitest-dedup@v0\n  with:\n    version: 0.1.0\n",
+    })),
+    /README\.md carries no exact Action tag/,
   );
 });
 
@@ -150,6 +170,9 @@ test("the planner still matches this repository as it stands today", async () =>
   assert.equal(cargoVersion(planned.get("Cargo.toml")), next);
   assert.equal(JSON.parse(planned.get("package.json")).version, next);
   for (const pinned of readmeVersionSites(planned.get("README.md")).versions) {
+    assert.equal(pinned, next);
+  }
+  for (const pinned of readmeVersionSites(planned.get("README.md")).actionTags) {
     assert.equal(pinned, next);
   }
   assert.deepEqual(
