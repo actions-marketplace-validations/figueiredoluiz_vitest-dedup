@@ -36,6 +36,38 @@ test('only the repository owner can publish or rerun a publication', () => {
   assert.match(npmReleaseJob, /vars\.PUBLISH_NPM == 'true'/)
 })
 
+test('manual dispatch rehearses by default and publishing requires an explicit choice', () => {
+  assert.match(release, /workflow_dispatch:\s*\n\s*inputs:[\s\S]*?publish:\s*\n\s*description:[^\n]+\n\s*type: boolean\s*\n\s*default: false/)
+
+  const rehearseStart = release.indexOf('\n  rehearse:')
+  const publishStart = release.indexOf('\n  publish:')
+  const npmStart = release.indexOf('\n  publish-npm:')
+  assert.ok(rehearseStart > -1 && publishStart > rehearseStart && npmStart > publishStart)
+  const rehearse = release.slice(rehearseStart, publishStart)
+  const publish = release.slice(publishStart, npmStart)
+  assert.match(rehearse, /github\.event_name == 'workflow_dispatch' && inputs\.publish != true/)
+  assert.match(rehearse, /needs: \[resolve, build\]/)
+  assert.match(rehearse, /verify-npm-binaries\.mjs/)
+  assert.match(rehearse, /install-simulation\.test\.mjs/)
+  assert.match(rehearse, /prepare-npm-packages\.mjs native/)
+  assert.match(rehearse, /npm pack/)
+  assert.match(rehearse, /actions\/upload-artifact@/)
+  assert.doesNotMatch(rehearse, /action-gh-release|npm publish|publish-npm-packages\.mjs/)
+  assert.match(publish, /github\.event_name == 'push' \|\| inputs\.publish == true/)
+  assert.match(release, /permissions:\s*\n\s*contents: read/)
+  assert.match(publish, /permissions:\s*\n\s*contents: write\s*\n\s*id-token: write\s*\n\s*attestations: write/)
+})
+
+test('release builds install each target for the repository toolchain', () => {
+  const start = release.indexOf('\n  build:')
+  const end = release.indexOf('\n  rehearse:', start)
+  assert.ok(start > -1 && end > start, 'release.yml has no bounded build job')
+  const build = release.slice(start, end)
+  const install = build.indexOf('rustup target add "$RUST_TARGET"')
+  const compile = build.indexOf('cargo build --release --locked --target "$RUST_TARGET"')
+  assert.ok(install > -1 && compile > install, 'target must be installed for the active toolchain before compilation')
+})
+
 test('npm publishing authenticates with OIDC and never a stored token', () => {
   const job = release.slice(release.indexOf('\n  publish-npm:'))
   assert.match(job, /permissions:\s*\n\s*contents: read\s*\n\s*id-token: write/)
