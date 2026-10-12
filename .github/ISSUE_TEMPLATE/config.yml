@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/figueiredoluiz/vitest-dedup#readme
+    about: Read installation, usage, rules, configuration, and CI guidance.
+  - name: Security vulnerability
+    url: https://github.com/figueiredoluiz/vitest-dedup/security/policy
+    about: Report vulnerabilities privately as described in SECURITY.md.

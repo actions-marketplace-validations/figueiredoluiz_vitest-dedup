@@ -1,0 +1,105 @@
+# Scheduled mutation testing of the fingerprint and analysis contracts.
+#
+# Why this is not a pull-request gate: cargo-mutants rebuilds and re-runs the whole suite once per
+# mutant, and the measured scope is 1,171 mutants -- around 75 minutes on the development machine
+# and longer on a hosted runner. Per-pull-request is impossible, and the answer changes slowly
+# enough that weekly is the right cadence.
+#
+# Why weekly is right *here*, when it is the wrong cadence
+# for the duplication and coverage ratchets: those guard a number that a single commit can move, so
+# a regression should name the commit that caused it. A mutation score does not work that way --
+# the thing it measures is whether the *suite* constrains behaviour, and it can only be measured at
+# a cost no commit can be asked to pay. Weekly, with the run summary naming the survivors, is the
+# honest version. Monday is left free for whatever long scheduled job comes next, so two of them
+# never contend.
+#
+# The score itself is checked by `scripts/check/check-mutation-score.mjs`, which also owns the
+# scope: this workflow asks it for the `--file` arguments rather than repeating the list, so the
+# run and the gate cannot drift apart -- where a contract would otherwise be stated in two places,
+# derive one from the other instead of trusting them to stay equal.
+name: Mutation testing
+
+on:
+  schedule:
+    # Wednesdays, 05:00 UTC.
+    - cron: '0 5 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-testing
+  # Not `true`: a run three hours in should not be thrown away because someone dispatched another.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # cuke-dedup gets this from `[profile.mutants] debug = "none"` in its Cargo.toml. Cargo.toml is
+  # out of scope for this change, so the same effect -- no debuginfo, which is most of the build
+  # time, the link time and the disk -- comes from the environment. See `.cargo/mutants.toml`.
+  CARGO_PROFILE_DEV_DEBUG: none
+  CARGO_PROFILE_TEST_DEBUG: none
+
+jobs:
+  mutants:
+    name: Fingerprint and analysis mutation score
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed on the tool version: cargo-mutants builds in its own copied trees, so this cache
+          # only serves the baseline build, and a tool upgrade is the one thing that invalidates
+          # how that build is produced.
+          key: cargo-mutants-27.1.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+          # No fallback to `cargo install`: a silent 20-minute source build of the tool would make
+          # this job's timeout meaningless, and a version we did not pin would move the score.
+          fallback: none
+
+      # Deviation from cuke-dedup, which spells the run out in bash here: the scope, the
+      # `--jobs 1`, and the "which exit codes are a result" decision all live in the gate script
+      # instead (`--run`, `isScoreableExit`), where they are unit-tested and cannot drift from the
+      # threshold they produced. A scheduled job nobody watches is the worst place to keep an
+      # untested exit-code comparison.
+      - name: Measure the mutation score over the gate's declared scope
+        id: measure
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run --silent mutants | tee score.txt
+
+      # The survivors are the output worth having; the score is just the number that keeps them
+      # from growing. Put them where they are readable a week later without downloading anything.
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Mutation testing"
+            echo
+            # The tail, not the whole log: `score.txt` also holds one line per mutant.
+            if [ -f score.txt ]; then tail -n 3 score.txt; else echo "No score was produced."; fi
+            echo
+            echo "Surviving mutants (each one is a line no test constrains):"
+            echo
+            echo '```'
+            if [ -f mutants.out/missed.txt ]; then cat mutants.out/missed.txt; else echo "(none recorded)"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the mutation report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-mutants-${{ github.run_id }}
+          path: mutants.out
+          if-no-files-found: warn

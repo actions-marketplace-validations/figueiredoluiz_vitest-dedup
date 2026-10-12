@@ -1,0 +1,3515 @@
+{
+  "schemaVersion": 1,
+  "minimumCases": 109,
+  "knownMissBaseline": 0,
+  "minimumRecall": 1,
+  "recallDestination": 1,
+  "cases": [
+    {
+      "name": "cross-file-duplicate-merge-config-cast",
+      "path": "cross-file-duplicate-merge-config-cast",
+      "rule": "cross-file-duplicate",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedUnresolved": 0,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "normalizes the account slug",
+            "normalizes a mixed-case account slug"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "cross-file-duplicate-awaited-module-setup",
+      "path": "cross-file-duplicate-awaited-module-setup",
+      "rule": "cross-file-duplicate",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "counts the seeded rows",
+            "counts the seeded rows"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-file-duplicate-dynamic-import-different-module",
+      "path": "cross-file-duplicate-dynamic-import-different-module",
+      "rule": "cross-file-duplicate",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "renders the servings field",
+            "renders the servings field"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-file-duplicate-module-scope-custom-matcher",
+      "path": "cross-file-duplicate-module-scope-custom-matcher",
+      "rule": "cross-file-duplicate",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "accepts a boundary value",
+            "accepts a boundary value"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-file-duplicate-module-scope-fake-timers",
+      "path": "cross-file-duplicate-module-scope-fake-timers",
+      "rule": "cross-file-duplicate",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "schedules a retry under fake timers",
+            "schedules a retry under real timers"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-file-duplicate-module-scope-spy-value",
+      "path": "cross-file-duplicate-module-scope-spy-value",
+      "rule": "cross-file-duplicate",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "checks out with the flag on",
+            "checks out with the flag off"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-file-duplicate-module-scope-stub-env",
+      "path": "cross-file-duplicate-module-scope-stub-env",
+      "rule": "cross-file-duplicate",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "builds a url in production",
+            "builds a url in development"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-file-duplicate-negative",
+      "path": "cross-file-duplicate-negative",
+      "rule": "cross-file-duplicate",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "lowercases the domain",
+            "normalizes a phone number end to end"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-file-duplicate-per-directory-config",
+      "path": "cross-file-duplicate-per-directory-config",
+      "rule": "cross-file-duplicate",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "resolves a relative link",
+            "resolves a relative link"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-file-duplicate-positive",
+      "path": "cross-file-duplicate-positive",
+      "rule": "cross-file-duplicate",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "lowercases the domain",
+            "normalizes a mixed-case address end to end"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "cross-file-duplicate-same-specifier-different-module",
+      "path": "cross-file-duplicate-same-specifier-different-module",
+      "rule": "cross-file-duplicate",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "titles": [
+            "renders the servings field",
+            "renders the servings field"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-each-row-describe-each",
+      "path": "duplicate-each-row-describe-each",
+      "rule": "duplicate-each-row",
+      "role": "variant",
+      "expectedTests": 6,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "admin permissions",
+            "admin permissions"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-each-row-for-form",
+      "path": "duplicate-each-row-for-form",
+      "rule": "duplicate-each-row",
+      "role": "variant",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "parse.test.ts:20",
+            "parse.test.ts:20"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-each-row-negative",
+      "path": "duplicate-each-row-negative",
+      "rule": "duplicate-each-row",
+      "role": "negative",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-each-row",
+          "titles": [
+            "parses the on flag",
+            "parses the off flag"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "titles": [
+            "parses the on flag",
+            "parses the auto flag"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "titles": [
+            "parses the off flag",
+            "parses the auto flag"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-each-row-positive",
+      "path": "duplicate-each-row-positive",
+      "rule": "duplicate-each-row",
+      "role": "positive",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "parse.test.ts:15",
+            "parse.test.ts:15"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-each-row",
+          "titles": [
+            "parses the on flag",
+            "parses the off flag"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-each-row-const-identifier",
+      "path": "duplicate-each-row-const-identifier",
+      "rule": "duplicate-each-row",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the strict flag",
+            "parses the strict flag"
+          ],
+          "locations": [
+            "parse.test.ts:20",
+            "parse.test.ts:20"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-each-row-const-identifier-negative",
+      "path": "duplicate-each-row-const-identifier-negative",
+      "rule": "duplicate-each-row",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-each-row",
+          "titles": [
+            "runs the fast path",
+            "runs the slow path"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-each-row-const-member",
+      "path": "duplicate-each-row-const-member",
+      "rule": "duplicate-each-row",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "records at level 3",
+            "records at level 3"
+          ],
+          "locations": [
+            "parse.test.ts:18",
+            "parse.test.ts:18"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-suite-describe-each",
+      "path": "duplicate-suite-describe-each",
+      "rule": "duplicate-suite",
+      "role": "variant",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-suite",
+          "titles": [
+            "admin permissions",
+            "editor permissions"
+          ]
+        },
+        {
+          "rule": "duplicate-suite",
+          "titles": [
+            "admin permissions",
+            "viewer permissions"
+          ]
+        },
+        {
+          "rule": "duplicate-suite",
+          "titles": [
+            "editor permissions",
+            "viewer permissions"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-suite-differing-hooks",
+      "path": "duplicate-suite-differing-hooks",
+      "rule": "duplicate-suite",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "login > accepts valid credentials",
+            "login > accepts valid credentials"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-suite",
+          "titles": [
+            "login",
+            "login"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "login > accepts valid credentials",
+            "login > accepts valid credentials"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-suite-globals-config",
+      "path": "duplicate-suite-globals-config",
+      "rule": "duplicate-suite",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "login",
+            "login"
+          ],
+          "locations": [
+            "auth.test.ts:5",
+            "auth.test.ts:15"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-suite-negative",
+      "path": "duplicate-suite-negative",
+      "rule": "duplicate-suite",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-suite",
+          "titles": [
+            "session",
+            "session"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-suite-nested",
+      "path": "duplicate-suite-nested",
+      "rule": "duplicate-suite",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "auth > credentials",
+            "auth > credentials"
+          ],
+          "locations": [
+            "auth.test.ts:19",
+            "auth.test.ts:29"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-suite",
+          "titles": [
+            "auth",
+            "auth"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-suite-positive",
+      "path": "duplicate-suite-positive",
+      "rule": "duplicate-suite",
+      "role": "positive",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "login",
+            "login"
+          ],
+          "locations": [
+            "auth.test.ts:20",
+            "auth.test.ts:30"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "login > accepts valid credentials",
+            "login > accepts valid credentials"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "titles": [
+            "login > accepts valid credentials",
+            "login > accepts valid credentials"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-bench",
+      "path": "duplicate-test-bench",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "parses a short document",
+            "reads a small config"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "parses a long document",
+            "reads a large config"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-concurrency-modifiers",
+      "path": "duplicate-test-concurrency-modifiers",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "drains a queue of three",
+            "drains a queue of three, sequentially"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-dynamic-title",
+      "path": "duplicate-test-dynamic-title",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": true,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "opens a session for ${_}",
+            "resumes a session for ${_}"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "titles": [
+            "opens a session for ${_}",
+            "resumes a session for ${_}"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-in-source",
+      "path": "duplicate-test-in-source",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "converts freezing point",
+            "converts the freezing threshold"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-include-leading-dot-slash",
+      "path": "duplicate-test-include-leading-dot-slash",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "adds two numbers",
+            "sums the same pair again"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-jsx-formatting-only",
+      "path": "duplicate-test-jsx-formatting-only",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "renders the save button",
+            "renders the save button reformatted"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-jsx-identical",
+      "path": "duplicate-test-jsx-identical",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "renders the save button",
+            "renders the save button once more"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-jsx-negative",
+      "path": "duplicate-test-jsx-negative",
+      "rule": "duplicate-test",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "renders a button",
+            "renders a link"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-imported-helper-arity-guard",
+      "path": "duplicate-test-imported-helper-arity-guard",
+      "rule": "duplicate-test",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "accepts a plain label",
+            "accepts a plain label, again"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-imported-helper-differs",
+      "path": "duplicate-test-imported-helper-differs",
+      "rule": "duplicate-test",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "accepts a plain label",
+            "accepts a plain label, again"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-imported-helper-equivalent",
+      "path": "duplicate-test-imported-helper-equivalent",
+      "rule": "duplicate-test",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "accepts a plain label",
+            "accepts a plain label, again"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-imported-helper-reexport",
+      "path": "duplicate-test-imported-helper-reexport",
+      "rule": "duplicate-test",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "accepts a plain label",
+            "accepts a plain label, again"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-imported-helper-same-module",
+      "path": "duplicate-test-imported-helper-same-module",
+      "rule": "duplicate-test",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "accepts a plain label",
+            "accepts a plain label, again"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-name-dynamic-title",
+      "path": "duplicate-test-name-dynamic-title",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": true,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test-name",
+          "titles": [
+            "tenant ${_} is isolated",
+            "tenant ${_} is isolated"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-name-function-title",
+      "path": "duplicate-test-name-function-title",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "parsesAnEmptyDocument",
+            "parsesAnEmptyDocument"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-name-globals-config",
+      "path": "duplicate-test-name-globals-config",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "handles a rejected card",
+            "handles a rejected card"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-name-negative",
+      "path": "duplicate-test-name-negative",
+      "rule": "duplicate-test-name",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test-name",
+          "titles": [
+            "place > handles a rejected card",
+            "refund > handles a rejected card"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-name-parameterized",
+      "path": "duplicate-test-name-parameterized",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "rounds 1",
+            "rounds 1"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "rounds 2",
+            "rounds 2"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test-name",
+          "titles": [
+            "rounds 1",
+            "rounds 2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-name-positive",
+      "path": "duplicate-test-name-positive",
+      "rule": "duplicate-test-name",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "handles a rejected card",
+            "handles a rejected card"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-negative",
+      "path": "duplicate-test-negative",
+      "rule": "duplicate-test",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "totals a two-line cart",
+            "subtotals a two-line cart"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "titles": [
+            "totals a two-line cart",
+            "subtotals a two-line cart"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-poll-vs-sync-assertion",
+      "path": "duplicate-test-poll-vs-sync-assertion",
+      "rule": "duplicate-test",
+      "role": "negative",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "parses a range low",
+            "parses a range high"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "eventually reports ready",
+            "reports ready immediately"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-positive",
+      "path": "duplicate-test-positive",
+      "rule": "duplicate-test",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "totals a two-line cart",
+            "adds up the basket"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-projects-dir",
+      "path": "duplicate-test-projects-dir",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "adds two numbers",
+            "sums the same pair again"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-projects-root",
+      "path": "duplicate-test-projects-root",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "adds two numbers",
+            "sums the same pair again"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-skipif-condition",
+      "path": "duplicate-test-skipif-condition",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "resolves a relative path",
+            "resolves a dotted path"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "normalizes a drive letter",
+            "normalizes a drive letter on posix"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-skipif-expression",
+      "path": "duplicate-test-skipif-expression",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "resolves a relative path",
+            "resolves a dotted path"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-soft-vs-hard-assertion",
+      "path": "duplicate-test-soft-vs-hard-assertion",
+      "rule": "duplicate-test",
+      "role": "negative",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "formats the header softly",
+            "formats the header strictly"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "summarizes one row",
+            "summarizes many rows"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-test-type-test-file",
+      "path": "duplicate-test-type-test-file",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "parses to a string",
+            "also parses to a string"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "duplicate-test-written-each-parameter-negative",
+      "path": "duplicate-test-written-each-parameter-negative",
+      "rule": "duplicate-test",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "reassigns the row then asserts it",
+            "asserts the literal against the row"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "titles": [
+            "reassigns the row then asserts it",
+            "asserts the literal against the row"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-cross-file-and-each-row",
+      "path": "mixed-cross-file-and-each-row",
+      "rule": "cross-file-duplicate",
+      "role": "variant",
+      "expectedTests": 5,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain"
+          ],
+          "locations": [
+            "integration.test.ts:6",
+            "unit.test.ts:22"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "unit.test.ts:27",
+            "unit.test.ts:27"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "mixed-cross-file-and-redundant-hook",
+      "path": "mixed-cross-file-and-redundant-hook",
+      "rule": "cross-file-duplicate",
+      "role": "variant",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain"
+          ],
+          "locations": [
+            "integration.test.ts:6",
+            "unit.test.ts:21"
+          ]
+        },
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "unit.test.ts:27",
+            "unit.test.ts:32"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "mixed-cross-file-and-subsumed",
+      "path": "mixed-cross-file-and-subsumed",
+      "rule": "cross-file-duplicate",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain"
+          ],
+          "locations": [
+            "integration.test.ts:6",
+            "unit.test.ts:36"
+          ]
+        },
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ],
+          "locations": [
+            "unit.test.ts:21",
+            "unit.test.ts:27"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "subsumed-test",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain"
+          ]
+        }
+      ],
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ]
+    },
+    {
+      "name": "mixed-cross-file-and-suite",
+      "path": "mixed-cross-file-and-suite",
+      "rule": "cross-file-duplicate",
+      "role": "variant",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "audit",
+            "audit"
+          ],
+          "locations": [
+            "ledger.test.ts:19",
+            "ledger.test.ts:25"
+          ]
+        },
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "audit > stamps the ledger page",
+            "stamps the ledger page"
+          ],
+          "locations": [
+            "ledger.test.ts:20",
+            "report.test.ts:6"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "audit > stamps the ledger page",
+            "audit > stamps the ledger page"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-duplicate-suite-suppresses-children",
+      "path": "mixed-duplicate-suite-suppresses-children",
+      "rule": "duplicate-suite",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "billing",
+            "billing"
+          ],
+          "locations": [
+            "billing.test.ts:21",
+            "billing.test.ts:31"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "billing > applies tax to a subtotal",
+            "billing > applies tax to a subtotal"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "billing > renders an invoice total",
+            "billing > renders an invoice total"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-duplicate-test-and-cross-file",
+      "path": "mixed-duplicate-test-and-cross-file",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain"
+          ],
+          "locations": [
+            "integration.test.ts:6",
+            "unit.test.ts:18"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain again"
+          ],
+          "locations": [
+            "unit.test.ts:18",
+            "unit.test.ts:23"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "cross-file-duplicate",
+          "locations": [
+            "unit.test.ts:18",
+            "unit.test.ts:23"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-duplicate-test-and-each-row",
+      "path": "mixed-duplicate-test-and-each-row",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 5,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "settles the balance",
+            "settles the balance again"
+          ],
+          "locations": [
+            "flags.test.ts:17",
+            "flags.test.ts:22"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "flags.test.ts:27",
+            "flags.test.ts:27"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "flags.test.ts:27",
+            "flags.test.ts:27"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-duplicate-test-and-name",
+      "path": "mixed-duplicate-test-and-name",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "settles the balance",
+            "settles the balance"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:22"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "settles the balance",
+            "settles the balance"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:22"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "parameterization-candidate",
+          "titles": [
+            "settles the balance",
+            "settles the balance"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "titles": [
+            "settles the balance",
+            "settles the balance"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-duplicate-test-and-near-duplicate",
+      "path": "mixed-duplicate-test-and-near-duplicate",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "settles the balance",
+            "settles the balance again"
+          ],
+          "locations": [
+            "main.test.ts:18",
+            "main.test.ts:23"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ],
+          "locations": [
+            "main.test.ts:28",
+            "main.test.ts:34"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "titles": [
+            "settles the balance",
+            "settles the balance again"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-duplicate-test-and-parameterization",
+      "path": "mixed-duplicate-test-and-parameterization",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "settles the balance",
+            "settles the balance again"
+          ],
+          "locations": [
+            "main.test.ts:19",
+            "main.test.ts:24"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ],
+          "locations": [
+            "main.test.ts:29",
+            "main.test.ts:33"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "parameterization-candidate",
+          "titles": [
+            "settles the balance",
+            "settles the balance again"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-duplicate-test-and-redundant-hook",
+      "path": "mixed-duplicate-test-and-redundant-hook",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "checkout > settles the balance",
+            "checkout > settles the balance again"
+          ]
+        },
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "checkout.test.ts:18",
+            "checkout.test.ts:23"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "mixed-duplicate-test-and-subsumed",
+      "path": "mixed-duplicate-test-and-subsumed",
+      "rule": "duplicate-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "settles the balance",
+            "settles the balance again"
+          ],
+          "locations": [
+            "cart.test.ts:19",
+            "cart.test.ts:24"
+          ]
+        },
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ],
+          "locations": [
+            "cart.test.ts:30",
+            "cart.test.ts:36"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "subsumed-test",
+          "titles": [
+            "settles the balance",
+            "settles the balance again"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ]
+        }
+      ],
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ]
+    },
+    {
+      "name": "mixed-each-row-and-redundant-hook",
+      "path": "mixed-each-row-and-redundant-hook",
+      "rule": "duplicate-each-row",
+      "role": "variant",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:22"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "flags > parses the on flag",
+            "flags > parses the on flag"
+          ],
+          "locations": [
+            "main.test.ts:26",
+            "main.test.ts:26"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "mixed-loop-each-under-projects-entry",
+      "path": "mixed-loop-each-under-projects-entry",
+      "rule": "duplicate-each-row",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": true,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-each-row",
+          "titles": [
+            "`reports default ${key} as %p`",
+            "`reports default ${key} as %p`"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-name-and-cross-file",
+      "path": "mixed-name-and-cross-file",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "rejects an unknown coupon",
+            "rejects an unknown coupon"
+          ],
+          "locations": [
+            "audit.test.ts:6",
+            "coupons.test.ts:17"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "rejects an unknown coupon",
+            "rejects an unknown coupon"
+          ],
+          "locations": [
+            "coupons.test.ts:17",
+            "coupons.test.ts:21"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "rejects an unknown coupon",
+            "rejects an unknown coupon"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-name-and-each-row",
+      "path": "mixed-name-and-each-row",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 5,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "rejects an unknown coupon",
+            "rejects an unknown coupon"
+          ],
+          "locations": [
+            "main.test.ts:18",
+            "main.test.ts:22"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "main.test.ts:26",
+            "main.test.ts:26"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test-name",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-name-and-near-duplicate",
+      "path": "mixed-name-and-near-duplicate",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "syncs configuration",
+            "syncs configuration"
+          ],
+          "locations": [
+            "setup.test.ts:18",
+            "setup.test.ts:24"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "syncs configuration",
+            "syncs configuration"
+          ],
+          "locations": [
+            "setup.test.ts:18",
+            "setup.test.ts:24"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "syncs configuration",
+            "syncs configuration"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-name-and-redundant-hook",
+      "path": "mixed-name-and-redundant-hook",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:22"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "coupons > rejects an unknown coupon",
+            "coupons > rejects an unknown coupon"
+          ],
+          "locations": [
+            "main.test.ts:26",
+            "main.test.ts:30"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "mixed-name-and-subsumed",
+      "path": "mixed-name-and-subsumed",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "applies the coupon",
+            "applies the coupon"
+          ],
+          "locations": [
+            "cart.test.ts:19",
+            "cart.test.ts:25"
+          ]
+        },
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "applies the coupon",
+            "applies the coupon"
+          ],
+          "locations": [
+            "cart.test.ts:19",
+            "cart.test.ts:25"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "applies the coupon",
+            "applies the coupon"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "titles": [
+            "applies the coupon",
+            "applies the coupon"
+          ]
+        }
+      ],
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ]
+    },
+    {
+      "name": "mixed-name-collision-and-parameterization",
+      "path": "mixed-name-collision-and-parameterization",
+      "rule": "duplicate-test-name",
+      "role": "variant",
+      "expectedTests": 5,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "rejects an unknown coupon",
+            "rejects an unknown coupon"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the unit price for one item"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "charges the unit price for one item",
+            "charges the bulk price for ten items"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "rejects an unknown coupon",
+            "rejects an unknown coupon"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-near-duplicate-and-cross-file",
+      "path": "mixed-near-duplicate-and-cross-file",
+      "rule": "near-duplicate-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain"
+          ],
+          "locations": [
+            "integration.test.ts:6",
+            "unit.test.ts:30"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ],
+          "locations": [
+            "unit.test.ts:18",
+            "unit.test.ts:24"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "mixed-near-duplicate-and-each-row",
+      "path": "mixed-near-duplicate-and-each-row",
+      "rule": "near-duplicate-test",
+      "role": "variant",
+      "expectedTests": 5,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ],
+          "locations": [
+            "main.test.ts:16",
+            "main.test.ts:22"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "main.test.ts:28",
+            "main.test.ts:28"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "near-duplicate-test",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-near-duplicate-and-redundant-hook",
+      "path": "mixed-near-duplicate-and-redundant-hook",
+      "rule": "near-duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "main.test.ts:16",
+            "main.test.ts:21"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "setup > configures then seeds",
+            "setup > seeds then configures"
+          ],
+          "locations": [
+            "main.test.ts:25",
+            "main.test.ts:31"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "mixed-near-duplicate-and-subsumed",
+      "path": "mixed-near-duplicate-and-subsumed",
+      "rule": "near-duplicate-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ],
+          "locations": [
+            "main.test.ts:20",
+            "main.test.ts:26"
+          ]
+        },
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ],
+          "locations": [
+            "main.test.ts:33",
+            "main.test.ts:39"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "subsumed-test",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ]
+        }
+      ],
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ]
+    },
+    {
+      "name": "mixed-near-duplicate-and-suite",
+      "path": "mixed-near-duplicate-and-suite",
+      "rule": "near-duplicate-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "taxes",
+            "taxes"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:23"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ],
+          "locations": [
+            "main.test.ts:29",
+            "main.test.ts:35"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "taxes > applies tax to a subtotal",
+            "taxes > applies tax to a subtotal"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-parameterization-and-cross-file",
+      "path": "mixed-parameterization-and-cross-file",
+      "rule": "parameterization-candidate",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "cross-file-duplicate",
+          "severity": "warning",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain"
+          ],
+          "locations": [
+            "integration.test.ts:6",
+            "unit.test.ts:27"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ],
+          "locations": [
+            "unit.test.ts:19",
+            "unit.test.ts:23"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "parameterization-candidate",
+          "titles": [
+            "lowercases the domain",
+            "lowercases the domain"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-parameterization-and-each-row",
+      "path": "mixed-parameterization-and-each-row",
+      "rule": "parameterization-candidate",
+      "role": "variant",
+      "expectedTests": 5,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:21"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "main.test.ts:25",
+            "main.test.ts:25"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "parameterization-candidate",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-parameterization-and-near-duplicate",
+      "path": "mixed-parameterization-and-near-duplicate",
+      "rule": "parameterization-candidate",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ],
+          "locations": [
+            "main.test.ts:18",
+            "main.test.ts:22"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ],
+          "locations": [
+            "main.test.ts:26",
+            "main.test.ts:32"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "parameterization-candidate",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ]
+        },
+        {
+          "rule": "near-duplicate-test",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-parameterization-and-redundant-hook",
+      "path": "mixed-parameterization-and-redundant-hook",
+      "rule": "parameterization-candidate",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:22"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "pricing > charges nothing for an empty basket",
+            "pricing > charges the bulk price for ten items"
+          ],
+          "locations": [
+            "main.test.ts:26",
+            "main.test.ts:30"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "mixed-parameterization-and-subsumed",
+      "path": "mixed-parameterization-and-subsumed",
+      "rule": "parameterization-candidate",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ],
+          "locations": [
+            "cart.test.ts:18",
+            "cart.test.ts:22"
+          ]
+        },
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ],
+          "locations": [
+            "cart.test.ts:27",
+            "cart.test.ts:33"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "subsumed-test",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ]
+        }
+      ],
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ]
+    },
+    {
+      "name": "mixed-parameterization-and-suite",
+      "path": "mixed-parameterization-and-suite",
+      "rule": "parameterization-candidate",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "taxes",
+            "taxes"
+          ],
+          "locations": [
+            "main.test.ts:18",
+            "main.test.ts:24"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "charges nothing for an empty basket",
+            "charges the bulk price for ten items"
+          ],
+          "locations": [
+            "main.test.ts:30",
+            "main.test.ts:34"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "taxes > applies tax to a subtotal",
+            "taxes > applies tax to a subtotal"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-subsumed-and-each-row",
+      "path": "mixed-subsumed-and-each-row",
+      "rule": "subsumed-test",
+      "role": "variant",
+      "expectedTests": 5,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ],
+          "locations": [
+            "main.test.ts:19",
+            "main.test.ts:25"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "main.test.ts:34",
+            "main.test.ts:34"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "subsumed-test",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ]
+        }
+      ],
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ]
+    },
+    {
+      "name": "mixed-subsumed-and-redundant-hook",
+      "path": "mixed-subsumed-and-redundant-hook",
+      "rule": "subsumed-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:22"
+          ]
+        },
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ],
+          "locations": [
+            "main.test.ts:26",
+            "main.test.ts:32"
+          ]
+        }
+      ],
+      "expectedAbsent": [],
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ]
+    },
+    {
+      "name": "mixed-subsumed-and-suite",
+      "path": "mixed-subsumed-and-suite",
+      "rule": "subsumed-test",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "taxes",
+            "taxes"
+          ],
+          "locations": [
+            "main.test.ts:18",
+            "main.test.ts:24"
+          ]
+        },
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ],
+          "locations": [
+            "main.test.ts:31",
+            "main.test.ts:37"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "taxes > applies tax to a subtotal",
+            "taxes > applies tax to a subtotal"
+          ]
+        }
+      ],
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ]
+    },
+    {
+      "name": "mixed-suite-and-each-row",
+      "path": "mixed-suite-and-each-row",
+      "rule": "duplicate-suite",
+      "role": "variant",
+      "expectedTests": 5,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "taxes",
+            "taxes"
+          ],
+          "locations": [
+            "main.test.ts:17",
+            "main.test.ts:23"
+          ]
+        },
+        {
+          "rule": "duplicate-each-row",
+          "severity": "warning",
+          "titles": [
+            "parses the on flag",
+            "parses the on flag"
+          ],
+          "locations": [
+            "main.test.ts:29",
+            "main.test.ts:29"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "taxes > applies tax to a subtotal",
+            "taxes > applies tax to a subtotal"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-suite-and-redundant-hook",
+      "path": "mixed-suite-and-redundant-hook",
+      "rule": "duplicate-suite",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "billing",
+            "billing"
+          ],
+          "locations": [
+            "billing.test.ts:20",
+            "billing.test.ts:36"
+          ]
+        },
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "billing.test.ts:21",
+            "billing.test.ts:26"
+          ]
+        },
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "billing > orders",
+            "billing > orders"
+          ],
+          "locations": [
+            "billing.test.ts:25",
+            "billing.test.ts:41"
+          ]
+        },
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "billing.test.ts:37",
+            "billing.test.ts:42"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "billing > orders > reads the meter",
+            "billing > orders > reads the meter"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mixed-suite-copy-with-internal-duplicates",
+      "path": "mixed-suite-copy-with-internal-duplicates",
+      "rule": "duplicate-suite",
+      "role": "variant",
+      "expectedTests": 4,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "duplicate-suite",
+          "severity": "warning",
+          "titles": [
+            "billing",
+            "billing"
+          ],
+          "locations": [
+            "billing.test.ts:20",
+            "billing.test.ts:30"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "billing > applies tax to a subtotal",
+            "billing > applies tax to a subtotal"
+          ],
+          "locations": [
+            "billing.test.ts:21",
+            "billing.test.ts:25"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "billing > applies tax to a subtotal",
+            "billing > applies tax to a subtotal"
+          ],
+          "locations": [
+            "billing.test.ts:21",
+            "billing.test.ts:25"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "severity": "error",
+          "titles": [
+            "billing > applies tax to a subtotal",
+            "billing > applies tax to a subtotal"
+          ],
+          "locations": [
+            "billing.test.ts:31",
+            "billing.test.ts:35"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "severity": "warning",
+          "titles": [
+            "billing > applies tax to a subtotal",
+            "billing > applies tax to a subtotal"
+          ],
+          "locations": [
+            "billing.test.ts:31",
+            "billing.test.ts:35"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "billing > applies tax to a subtotal",
+            "billing > applies tax to a subtotal"
+          ],
+          "locations": [
+            "billing.test.ts:21",
+            "billing.test.ts:31"
+          ]
+        },
+        {
+          "rule": "duplicate-test-name",
+          "titles": [
+            "billing > applies tax to a subtotal",
+            "billing > applies tax to a subtotal"
+          ],
+          "locations": [
+            "billing.test.ts:21",
+            "billing.test.ts:31"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "near-duplicate-test-composed",
+      "path": "near-duplicate-test-composed",
+      "rule": "near-duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "grants access after loading the profile",
+            "grants access after loading the profile, reordered and renamed"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "near-duplicate-test-each-rows",
+      "path": "near-duplicate-test-each-rows",
+      "rule": "near-duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "seeds 3 users then configures",
+            "configures then seeds three users"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "near-duplicate-test-globals-config",
+      "path": "near-duplicate-test-globals-config",
+      "rule": "near-duplicate-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "near-duplicate-test-negative",
+      "path": "near-duplicate-test-negative",
+      "rule": "near-duplicate-test",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "near-duplicate-test",
+          "titles": [
+            "enabling after selecting activates the flag",
+            "enabling before selecting leaves the flag inactive"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "near-duplicate-test-positive",
+      "path": "near-duplicate-test-positive",
+      "rule": "near-duplicate-test",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "near-duplicate-test",
+          "severity": "warning",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "configures then seeds",
+            "seeds then configures"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "parameterization-candidate-globals-config",
+      "path": "parameterization-candidate-globals-config",
+      "rule": "parameterization-candidate",
+      "role": "variant",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "applies no discount at zero items",
+            "applies no discount at one item"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "applies no discount at one item",
+            "applies the bulk discount at ten items"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "parameterization-candidate-jsx-prop-value",
+      "path": "parameterization-candidate-jsx-prop-value",
+      "rule": "parameterization-candidate",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "renders the primary button",
+            "renders the secondary button"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "parameterization-candidate-negative",
+      "path": "parameterization-candidate-negative",
+      "rule": "parameterization-candidate",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "parameterization-candidate",
+          "titles": [
+            "coerces the number one",
+            "coerces the string one"
+          ]
+        },
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "coerces the number one",
+            "coerces the string one"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "parameterization-candidate-positive",
+      "path": "parameterization-candidate-positive",
+      "rule": "parameterization-candidate",
+      "role": "positive",
+      "expectedTests": 3,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "applies no discount at zero items",
+            "applies no discount at one item"
+          ]
+        },
+        {
+          "rule": "parameterization-candidate",
+          "severity": "warning",
+          "titles": [
+            "applies no discount at one item",
+            "applies the bulk discount at ten items"
+          ]
+        }
+      ],
+      "expectedAbsent": [
+        {
+          "rule": "duplicate-test",
+          "titles": [
+            "applies no discount at zero items",
+            "applies no discount at one item"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "redundant-hook-after-all",
+      "path": "redundant-hook-after-all",
+      "rule": "redundant-hook",
+      "role": "variant",
+      "expectedTests": 1,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "afterAll",
+            "afterAll"
+          ],
+          "locations": [
+            "db.test.ts:9",
+            "db.test.ts:15"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "redundant-hook-after-each",
+      "path": "redundant-hook-after-each",
+      "rule": "redundant-hook",
+      "role": "variant",
+      "expectedTests": 1,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "afterEach",
+            "afterEach"
+          ],
+          "locations": [
+            "db.test.ts:14",
+            "db.test.ts:20"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "redundant-hook-before-all",
+      "path": "redundant-hook-before-all",
+      "rule": "redundant-hook",
+      "role": "variant",
+      "expectedTests": 1,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeAll",
+            "beforeAll"
+          ],
+          "locations": [
+            "db.test.ts:19",
+            "db.test.ts:24"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "redundant-hook-globals-config",
+      "path": "redundant-hook-globals-config",
+      "rule": "redundant-hook",
+      "role": "variant",
+      "expectedTests": 1,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "db.test.ts:12",
+            "db.test.ts:18"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "redundant-hook-kind-mismatch",
+      "path": "redundant-hook-kind-mismatch",
+      "rule": "redundant-hook",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "redundant-hook",
+          "locations": [
+            "db.test.ts:13",
+            "db.test.ts:19"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "redundant-hook-negative",
+      "path": "redundant-hook-negative",
+      "rule": "redundant-hook",
+      "role": "negative",
+      "expectedTests": 1,
+      "expectedIncomplete": false,
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "redundant-hook",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "redundant-hook-non-adjacent",
+      "path": "redundant-hook-non-adjacent",
+      "rule": "redundant-hook",
+      "role": "variant",
+      "expectedTests": 1,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "db.test.ts:19",
+            "db.test.ts:26"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "redundant-hook-positive",
+      "path": "redundant-hook-positive",
+      "rule": "redundant-hook",
+      "role": "positive",
+      "expectedTests": 1,
+      "expectedIncomplete": false,
+      "expectedFindings": [
+        {
+          "rule": "redundant-hook",
+          "severity": "warning",
+          "titles": [
+            "beforeEach",
+            "beforeEach"
+          ],
+          "locations": [
+            "db.test.ts:18",
+            "db.test.ts:24"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "subsumed-test-globals-config",
+      "path": "subsumed-test-globals-config",
+      "rule": "subsumed-test",
+      "role": "variant",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ],
+      "expectedFindings": [
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    },
+    {
+      "name": "subsumed-test-negative",
+      "path": "subsumed-test-negative",
+      "rule": "subsumed-test",
+      "role": "negative",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ],
+      "expectedFindings": [],
+      "expectedAbsent": [
+        {
+          "rule": "subsumed-test",
+          "titles": [
+            "cart > reports the total before the coupon",
+            "cart > applies the coupon then reports the total"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "subsumed-test-positive",
+      "path": "subsumed-test-positive",
+      "rule": "subsumed-test",
+      "role": "positive",
+      "expectedTests": 2,
+      "expectedIncomplete": false,
+      "arguments": [
+        "--rule",
+        "subsumed-test=warning"
+      ],
+      "expectedFindings": [
+        {
+          "rule": "subsumed-test",
+          "severity": "warning",
+          "titles": [
+            "cart > applies the coupon",
+            "cart > applies the coupon and recalculates"
+          ]
+        }
+      ],
+      "expectedAbsent": []
+    }
+  ],
+  "knownFalsePositiveBaseline": 0,
+  "mixedRuleCoverage": [
+    {
+      "pair": [
+        "duplicate-test",
+        "duplicate-test-name"
+      ],
+      "case": "mixed-duplicate-test-and-name"
+    },
+    {
+      "pair": [
+        "duplicate-test",
+        "parameterization-candidate"
+      ],
+      "case": "mixed-duplicate-test-and-parameterization"
+    },
+    {
+      "pair": [
+        "duplicate-test",
+        "near-duplicate-test"
+      ],
+      "case": "mixed-duplicate-test-and-near-duplicate"
+    },
+    {
+      "pair": [
+        "duplicate-test",
+        "cross-file-duplicate"
+      ],
+      "case": "mixed-duplicate-test-and-cross-file"
+    },
+    {
+      "pair": [
+        "duplicate-test",
+        "subsumed-test"
+      ],
+      "case": "mixed-duplicate-test-and-subsumed"
+    },
+    {
+      "pair": [
+        "duplicate-test",
+        "duplicate-suite"
+      ],
+      "case": "mixed-suite-copy-with-internal-duplicates"
+    },
+    {
+      "pair": [
+        "duplicate-test",
+        "duplicate-each-row"
+      ],
+      "case": "mixed-duplicate-test-and-each-row"
+    },
+    {
+      "pair": [
+        "duplicate-test",
+        "redundant-hook"
+      ],
+      "case": "mixed-duplicate-test-and-redundant-hook"
+    },
+    {
+      "pair": [
+        "duplicate-test-name",
+        "parameterization-candidate"
+      ],
+      "case": "mixed-name-collision-and-parameterization"
+    },
+    {
+      "pair": [
+        "duplicate-test-name",
+        "near-duplicate-test"
+      ],
+      "case": "mixed-name-and-near-duplicate"
+    },
+    {
+      "pair": [
+        "duplicate-test-name",
+        "cross-file-duplicate"
+      ],
+      "case": "mixed-name-and-cross-file"
+    },
+    {
+      "pair": [
+        "duplicate-test-name",
+        "subsumed-test"
+      ],
+      "case": "mixed-name-and-subsumed"
+    },
+    {
+      "pair": [
+        "duplicate-test-name",
+        "duplicate-suite"
+      ],
+      "case": "mixed-suite-copy-with-internal-duplicates"
+    },
+    {
+      "pair": [
+        "duplicate-test-name",
+        "duplicate-each-row"
+      ],
+      "case": "mixed-name-and-each-row"
+    },
+    {
+      "pair": [
+        "duplicate-test-name",
+        "redundant-hook"
+      ],
+      "case": "mixed-name-and-redundant-hook"
+    },
+    {
+      "pair": [
+        "parameterization-candidate",
+        "near-duplicate-test"
+      ],
+      "case": "mixed-parameterization-and-near-duplicate"
+    },
+    {
+      "pair": [
+        "parameterization-candidate",
+        "cross-file-duplicate"
+      ],
+      "case": "mixed-parameterization-and-cross-file"
+    },
+    {
+      "pair": [
+        "parameterization-candidate",
+        "subsumed-test"
+      ],
+      "case": "mixed-parameterization-and-subsumed"
+    },
+    {
+      "pair": [
+        "parameterization-candidate",
+        "duplicate-suite"
+      ],
+      "case": "mixed-parameterization-and-suite"
+    },
+    {
+      "pair": [
+        "parameterization-candidate",
+        "duplicate-each-row"
+      ],
+      "case": "mixed-parameterization-and-each-row"
+    },
+    {
+      "pair": [
+        "parameterization-candidate",
+        "redundant-hook"
+      ],
+      "case": "mixed-parameterization-and-redundant-hook"
+    },
+    {
+      "pair": [
+        "near-duplicate-test",
+        "cross-file-duplicate"
+      ],
+      "case": "mixed-near-duplicate-and-cross-file"
+    },
+    {
+      "pair": [
+        "near-duplicate-test",
+        "subsumed-test"
+      ],
+      "case": "mixed-near-duplicate-and-subsumed"
+    },
+    {
+      "pair": [
+        "near-duplicate-test",
+        "duplicate-suite"
+      ],
+      "case": "mixed-near-duplicate-and-suite"
+    },
+    {
+      "pair": [
+        "near-duplicate-test",
+        "duplicate-each-row"
+      ],
+      "case": "mixed-near-duplicate-and-each-row"
+    },
+    {
+      "pair": [
+        "near-duplicate-test",
+        "redundant-hook"
+      ],
+      "case": "mixed-near-duplicate-and-redundant-hook"
+    },
+    {
+      "pair": [
+        "cross-file-duplicate",
+        "subsumed-test"
+      ],
+      "case": "mixed-cross-file-and-subsumed"
+    },
+    {
+      "pair": [
+        "cross-file-duplicate",
+        "duplicate-suite"
+      ],
+      "case": "mixed-cross-file-and-suite"
+    },
+    {
+      "pair": [
+        "cross-file-duplicate",
+        "duplicate-each-row"
+      ],
+      "case": "mixed-cross-file-and-each-row"
+    },
+    {
+      "pair": [
+        "cross-file-duplicate",
+        "redundant-hook"
+      ],
+      "case": "mixed-cross-file-and-redundant-hook"
+    },
+    {
+      "pair": [
+        "subsumed-test",
+        "duplicate-suite"
+      ],
+      "case": "mixed-subsumed-and-suite"
+    },
+    {
+      "pair": [
+        "subsumed-test",
+        "duplicate-each-row"
+      ],
+      "case": "mixed-subsumed-and-each-row"
+    },
+    {
+      "pair": [
+        "subsumed-test",
+        "redundant-hook"
+      ],
+      "case": "mixed-subsumed-and-redundant-hook"
+    },
+    {
+      "pair": [
+        "duplicate-suite",
+        "duplicate-each-row"
+      ],
+      "case": "mixed-suite-and-each-row"
+    },
+    {
+      "pair": [
+        "duplicate-suite",
+        "redundant-hook"
+      ],
+      "case": "mixed-suite-and-redundant-hook"
+    },
+    {
+      "pair": [
+        "duplicate-each-row",
+        "redundant-hook"
+      ],
+      "case": "mixed-each-row-and-redundant-hook"
+    }
+  ]
+}

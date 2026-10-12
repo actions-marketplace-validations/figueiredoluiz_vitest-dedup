@@ -1,0 +1,8 @@
+name: vitest-dedup CodeQL configuration
+
+queries:
+  - uses: security-extended
+
+paths-ignore:
+  # Analyzer test inputs, not product code; they include intentionally invalid or unusual JavaScript.
+  - fixtures/**

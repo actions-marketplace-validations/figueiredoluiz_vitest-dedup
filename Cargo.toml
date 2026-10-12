@@ -1,0 +1,57 @@
+[package]
+name = "vitest-dedup"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.0"
+description = "Static analysis for duplicate and near-duplicate Vitest tests"
+license = "MIT"
+repository = "https://github.com/figueiredoluiz/vitest-dedup"
+readme = "README.md"
+keywords = ["vitest", "testing", "lint", "duplicate", "cli"]
+categories = ["command-line-utilities", "development-tools::testing"]
+
+[lib]
+name = "vitest_dedup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vitest-dedup"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+globset = "0.4"
+ignore = "0.4"
+oxc_allocator = "=0.153.0"
+oxc_ast = "=0.153.0"
+oxc_ast_visit = "=0.153.0"
+oxc_parser = "=0.153.0"
+oxc_resolver = "11"
+oxc_semantic = "=0.153.0"
+oxc_span = "=0.153.0"
+oxc_syntax = "=0.153.0"
+ryu-js = "1.0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+# Peak RSS has no safe portable API in `std`, and the library crate is `#![forbid(unsafe_code)]`.
+# The one `getrusage` call `--debug-memory` needs therefore lives in the binary (`src/main.rs`),
+# and this dependency is scoped to the platforms that have it: on Windows the crate is not
+# compiled at all and the binary reports no peak RSS rather than a wrong one. `libc` is already in
+# `Cargo.lock` transitively, so this adds a direct edge, not a new dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.15"
+
+# Catch accidental debug output, unfinished code, and undocumented unsafe operations.
+# CI and developer checks deny warnings; deliberately invalid JS corpus files are unaffected.
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+undocumented_unsafe_blocks = "warn"

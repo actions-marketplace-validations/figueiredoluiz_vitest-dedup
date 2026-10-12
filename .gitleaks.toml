@@ -1,0 +1,18 @@
+title = "vitest-dedup secret scanning"
+
+[extend]
+useDefault = true
+
+# The mutants cache key is a tool version string, which the generic-api-key rule reads as a key.
+[[allowlists]]
+description = "cargo-mutants cache key in mutants.yml (a tool version, not a credential)"
+condition = "AND"
+paths = ['''^\.github/workflows/mutants\.yml$''']
+regexes = ['''^cargo-mutants-27\.1\.0$''']
+
+# The gate's fixture holds the same cache key literal, and it must not be flagged on its own source.
+[[allowlists]]
+description = "cargo-mutants cache key literal in the secret-scan gate (a tool version, not a credential)"
+condition = "AND"
+paths = ['''^scripts/check/check-secret-scan\.mjs$''']
+regexes = ['''^cargo-mutants-27\.1\.0$''']

@@ -1,0 +1,303 @@
+#!/usr/bin/env node
+// Git hooks verify immutable snapshots, never the caller's unstaged files.
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync, realpathSync, readdirSync, symlinkSync, unlinkSync, mkdirSync, mkdtempSync, openSync, closeSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const SELF = fileURLToPath(import.meta.url)
+const ZERO = /^0+$/
+const OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/
+const GIT_ENV = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT']
+/**
+ * Run Git in the selected repository, capturing output and propagating failures.
+ * @param {string} root Repository directory.
+ * @param {string[]} args Git arguments, passed without a shell.
+ * @param {NodeJS.ProcessEnv} [env] Environment for this Git operation.
+ * @returns {string} Captured stdout with surrounding whitespace removed.
+ */
+const git = (root, args, env = process.env) => execFileSync('git', args, { cwd: root, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+
+/**
+ * Copy the environment without Git repository paths or command-scoped config.
+ * Ordinary variables, including caller build flags, remain available to checks.
+ * @param {NodeJS.ProcessEnv} env Caller environment; never modified.
+ * @returns {NodeJS.ProcessEnv} Environment for isolated verification subprocesses.
+ */
+export function cleanEnvironment(env) {
+  const result = { ...env }
+  for (const key of GIT_ENV) delete result[key]
+  for (const key of Object.keys(result)) if (/^GIT_CONFIG_(KEY|VALUE)_[0-9]+$/.test(key)) delete result[key]
+  return result
+}
+
+/**
+ * Read pre-push ref records and deduplicate non-deletion local commit IDs.
+ * @param {string} input Git's four-field, newline-separated hook input.
+ * @returns {string[]} Unique local object IDs in their first-seen order.
+ * @throws {Error} If a record or either object ID is malformed.
+ */
+export function pushCommits(input) {
+  const commits = new Set()
+  for (const line of input.trim().split('\n').filter(Boolean)) {
+    const fields = line.trim().split(/\s+/)
+    if (fields.length !== 4 || !OID.test(fields[1]) || !OID.test(fields[3])) throw new Error('Malformed pre-push ref input')
+    if (!ZERO.test(fields[1])) commits.add(fields[1])
+  }
+  return [...commits]
+}
+
+/**
+ * Decide whether changed paths require Rust checks in the fast profile.
+ * Callers include deleted paths and both sides of renames.
+ * @param {string[]} paths Repository-relative paths from a NUL-delimited Git diff.
+ * @returns {boolean} Whether Rust sources, Cargo metadata, or the coverage gate changed.
+ */
+export function rustChanged(paths) {
+  return paths.some(path => path.endsWith('.rs') || /(^|\/)Cargo\.(toml|lock)$/.test(path) || path === 'scripts/check/check-coverage.mjs')
+}
+
+/**
+ * Build an ordered check list without running commands or modifying files.
+ * Full checks always include Rust lints/tests; the rust flag selects coverage too.
+ * @param {'fast'|'full'} profile Verification depth.
+ * @param {boolean} [rust=true] Include conditional Rust checks or coverage.
+ * @returns {string[][]} Commands represented as executable followed by arguments.
+ * @throws {Error} If the profile is unsupported.
+ */
+export function commands(profile, rust = true) {
+  if (!['fast', 'full'].includes(profile)) throw new Error(`Unknown verification profile: ${profile}`)
+  const steps = [
+    ['npm', 'run', 'check:release-workflow'],
+    ['npm', 'run', 'check:versions'],
+    ['npm', 'run', 'check:docs'],
+    ['npm', 'run', 'check:names'],
+    ['npm', 'run', 'skills:check'],
+  ]
+  if (rust || profile === 'full') steps.push(
+    ['cargo', 'fmt', '--all', '--check'],
+    ['cargo', 'clippy', '--all-targets', '--all-features', '--locked'],
+  )
+  if (profile === 'fast') steps.push(['npm', 'run', 'test:dev-checks'], ['npm', 'run', 'test:check-lib'])
+  else {
+    steps.push(['cargo', 'test', '--all-targets', '--all-features', '--locked'], ['npm', 'run', 'check'])
+    if (rust) steps.push(['npm', 'run', 'check:coverage:rust'])
+  }
+  return steps
+}
+
+/**
+ * Run checks sequentially with isolated Git variables and warnings denied.
+ * Save complete output per step; stop on the first failure with bounded diagnostics.
+ * @param {string} root Directory where checks run.
+ * @param {string[][]} steps Executables and arguments in execution order.
+ * @param {object} options Environment, required logRoot, and optional spawn/print adapters.
+ * @returns {void}
+ * @throws {Error} If a command fails to start, exits unsuccessfully, or is signalled.
+ */
+export function runSteps(root, steps, { env = process.env, logRoot, spawn = spawnSync, print = console.log } = {}) {
+  const runEnv = cleanEnvironment(env)
+  const flags = (runEnv.RUSTFLAGS || '').trim()
+  runEnv.RUSTFLAGS = /(?:^|\s)-D\s*warnings$/.test(flags) ? flags : `${flags} -D warnings`.trim()
+  mkdirSync(logRoot, { recursive: true })
+  for (const [i, [command, ...args]] of steps.entries()) {
+    const log = join(logRoot, `${i + 1}-${command}.log`)
+    const fd = openSync(log, 'w')
+    let result
+    try { result = spawn(command, args, { cwd: root, env: runEnv, stdio: ['ignore', fd, fd], shell: process.platform === 'win32' && command === 'npm' }) }
+    finally { closeSync(fd) }
+    if (result.error || result.status !== 0) {
+      print(readFileSync(log, 'utf8').split(/\r?\n/).slice(-100).join('\n'))
+      throw new Error(`${command} ${args.join(' ')} failed${result.error ? `: ${result.error.message}` : ` (exit ${result.status ?? result.signal})`}. Log: ${log}`)
+    }
+    print(`PASS ${command} ${args.join(' ')}`)
+  }
+}
+
+/**
+ * Validate exported symlinks before a gate can follow them outside the snapshot.
+ * Internal links/chains are allowed; directory links are resolved without walking them.
+ * @param {string} snapshot Exported source directory, before runner cache aliases exist.
+ * @returns {void}
+ * @throws {Error} If a link escapes the export, is dangling, or cannot resolve a cycle.
+ */
+function validateSnapshotLinks(snapshot) {
+  const base = realpathSync(snapshot)
+  const directories = [snapshot]
+  while (directories.length) {
+    const directory = directories.pop()
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name)
+      if (entry.isSymbolicLink()) {
+        let target
+        try { target = realpathSync(path) }
+        catch { throw new Error(`Snapshot symlink cannot be resolved: ${JSON.stringify(relative(snapshot, path))}`) }
+        const outside = relative(base, target)
+        if (outside === '..' || outside.startsWith(`..${sep}`) || isAbsolute(outside)) throw new Error(`Snapshot symlink escapes the exported tree: ${JSON.stringify(relative(snapshot, path))}`)
+      } else if (entry.isDirectory()) directories.push(path)
+    }
+  }
+}
+
+/**
+ * Export the index or a commit, validate links/whitespace, then check synchronously.
+ * Include skip-worktree entries without changing the source index or sparse selection.
+ * The temporary repository and commit index are removed on success or failure.
+ * @template T
+ * @param {string} root Source repository directory.
+ * @param {string|null} revision Commit-ish, or null to export the staged index.
+ * @param {(snapshot: string) => T} check Synchronous consumer of the exported source.
+ * @param {NodeJS.ProcessEnv} [env] Environment used to access the source repository.
+ * @returns {T} The check's result; errors propagate after cleanup.
+ */
+export function withSnapshot(root, revision, check, env = process.env) {
+  const work = mkdtempSync(join(tmpdir(), 'vitest-dedup-hook-'))
+  const snapshot = join(work, 'source')
+  mkdirSync(snapshot)
+  try {
+    const exportEnv = { ...env }
+    if (revision) {
+      const commit = git(root, ['rev-parse', '--verify', `${revision}^{commit}`], env)
+      exportEnv.GIT_INDEX_FILE = join(work, 'index')
+      git(root, ['read-tree', commit], exportEnv)
+    }
+    git(root, ['checkout-index', '--all', '--ignore-skip-worktree-bits', `--prefix=${snapshot.replaceAll('\\', '/')}/`], exportEnv)
+    validateSnapshotLinks(snapshot)
+    const isolated = cleanEnvironment(env)
+    git(snapshot, ['init', '--quiet'], isolated)
+    git(snapshot, ['add', '--force', '--all'], isolated)
+    git(snapshot, ['diff', '--cached', '--check'], isolated)
+    return check(snapshot)
+  } finally { rmSync(work, { recursive: true, force: true }) }
+}
+
+/**
+ * Make the selected Cargo cache available at target for existing corpus gates.
+ * Preserve real cache directories; remove only a temporary alias created here.
+ * Reject nested caches and existing-target conflicts before creating directories.
+ * @template T
+ * @param {string} root Checkout or snapshot directory.
+ * @param {string} cache Absolute Cargo cache path.
+ * @param {() => T} body Synchronous checks that need the cache alias.
+ * @returns {T} The body's result; errors propagate after alias cleanup.
+ * @throws {Error} If the cache is nested under target or conflicts with an existing target.
+ */
+export function withTargetCache(root, cache, body) {
+  const local = join(root, 'target')
+  const nested = relative(local, cache)
+  if (nested && nested !== '..' && !nested.startsWith(`..${sep}`) && !isAbsolute(nested)) throw new Error('CARGO_TARGET_DIR cannot be inside the checkout target directory; use target itself or a cache outside target')
+  if (existsSync(local)) {
+    if (!existsSync(cache) || realpathSync(local) !== realpathSync(cache)) throw new Error('Existing target directory conflicts with CARGO_TARGET_DIR; choose its matching cache before verification')
+    return body()
+  }
+  mkdirSync(cache, { recursive: true })
+  if (existsSync(local) && realpathSync(local) === realpathSync(cache)) return body()
+  symlinkSync(cache, local, process.platform === 'win32' ? 'junction' : 'dir')
+  try { return body() }
+  finally { unlinkSync(local) }
+}
+
+/**
+ * Make the checkout's installed dependencies visible in a snapshot for gates that spawn them.
+ * A snapshot exports tracked files only and `node_modules` is never tracked, while the title
+ * harness in `npm run check` spawns the pinned Vitest from it and fails by design when it is
+ * absent. Link rather than copy; remove only the alias created here; never touch a real directory.
+ * @template T
+ * @param {string} snapshot Exported source directory.
+ * @param {string} root Checkout whose `node_modules` is linked in, when it has one.
+ * @param {() => T} body Synchronous checks that may spawn installed dependencies.
+ * @returns {T} The body's result; errors propagate after alias cleanup.
+ */
+export function withNodeModules(snapshot, root, body) {
+  const installed = join(root, 'node_modules')
+  const local = join(snapshot, 'node_modules')
+  if (!existsSync(installed) || existsSync(local)) return body()
+  symlinkSync(installed, local, process.platform === 'win32' ? 'junction' : 'dir')
+  try { return body() }
+  finally { unlinkSync(local) }
+}
+
+/**
+ * Serialize verification using a lock directory in the common Git directory.
+ * Record the owner PID and remove an acquired lock when the synchronous body finishes.
+ * Stale locks require manual recovery after confirming the recorded process exited.
+ * @template T
+ * @param {string} common Common Git directory shared by repository worktrees.
+ * @param {() => T} body Synchronous verification operation.
+ * @returns {T} The body's result.
+ * @throws {Error} If the lock exists; body errors propagate after cleanup.
+ */
+export function withLock(common, body) {
+  const lock = join(common, 'delivery-check.lock')
+  try { mkdirSync(lock) }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error
+    throw new Error(`Repository verification is already running. Lock: ${lock}. If its recorded process has exited, remove the stale lock and retry.`)
+  }
+  try {
+    writeFileSync(join(lock, 'owner'), `pid=${process.pid}\n`)
+    return body()
+  } finally { rmSync(lock, { recursive: true, force: true }) }
+}
+
+/**
+ * Install this checkout's hooks using worktree-specific Git configuration.
+ * Refuse to replace a different hook manager or install missing hook files.
+ * @param {string} root Repository checkout directory.
+ * @returns {string} Absolute path to the installed hook directory.
+ * @throws {Error} If hook configuration cannot be inspected or would be overwritten.
+ */
+export function installHooks(root) {
+  const hooks = join(root, '.githooks')
+  const current = spawnSync('git', ['config', '--get', 'core.hooksPath'], { cwd: root, encoding: 'utf8' })
+  if (current.status !== 0 && current.status !== 1) throw new Error('Cannot inspect existing hooks configuration')
+  if (current.stdout.trim() && resolve(root, current.stdout.trim()) !== hooks) throw new Error('Existing core.hooksPath was preserved; integrate these hooks with your existing hook manager instead')
+  for (const name of ['pre-commit', 'pre-push']) if (!existsSync(join(hooks, name))) throw new Error(`Missing hook: ${name}`)
+  git(root, ['config', '--local', 'extensions.worktreeConfig', 'true'])
+  git(root, ['config', '--worktree', 'core.hooksPath', hooks])
+  return hooks
+}
+
+/**
+ * Dispatch manual checks, staged/commit snapshot verification, or hook installation.
+ * Manual modes check the checkout; hook modes check isolated exports under one lock.
+ * Deletion-only pushes run no checks. Check logs are retained in the common Git directory.
+ * @param {string[]} [args] Mode followed by optional pre-push remote arguments.
+ * @param {object} [options] Caller environment, ref input, check/print adapters, and root.
+ * @returns {void}
+ * @throws {Error} If usage, ref input, snapshot/cache validation, or verification fails.
+ */
+export function main(args = process.argv.slice(2), { env = process.env, input, check = runSteps, print = console.log, root = process.cwd() } = {}) {
+  const [mode, ...rest] = args
+  if (!['fast', 'full', 'pre-commit', 'pre-push', 'install'].includes(mode) || (mode !== 'pre-push' && rest.length)) throw new Error('Usage: verify.mjs fast|full|pre-commit|pre-push|install')
+  root = resolve(git(root, ['rev-parse', '--show-toplevel'], env))
+  if (mode === 'install') { print(`Hooks installed for this worktree: ${installHooks(root)}`); return }
+  const commits = mode === 'pre-push' ? pushCommits(input ?? readFileSync(0, 'utf8')) : []
+  if (mode === 'pre-push' && !commits.length) { print('No commits to verify (deletion or up-to-date push).'); return }
+  const common = resolve(root, git(root, ['rev-parse', '--git-common-dir'], env))
+  const cache = env.CARGO_TARGET_DIR ? resolve(root, env.CARGO_TARGET_DIR) : join(dirname(common), 'target')
+  const logs = join(common, 'delivery-check-logs', `${Date.now()}-${process.pid}`)
+  const runEnv = { ...env, CARGO_TARGET_DIR: cache, CARGO_LLVM_COV_TARGET_DIR: env.CARGO_LLVM_COV_TARGET_DIR ? resolve(root, env.CARGO_LLVM_COV_TARGET_DIR) : join(cache, 'llvm-cov-target') }
+  withLock(common, () => {
+    if (mode === 'fast' || mode === 'full') {
+      withTargetCache(root, cache, () => check(root, commands(mode), { env: runEnv, logRoot: logs, print }))
+      return
+    }
+    const paths = git(root, ['diff', '--cached', '--no-renames', '--name-only', '--diff-filter=ACDMRT', '-z'], env).split('\0').filter(Boolean)
+    const revisions = mode === 'pre-commit' ? [null] : commits
+    for (const [i, revision] of revisions.entries()) {
+      print(revision ? `Verifying proposed commit ${revision}` : 'Verifying the staged index')
+      withSnapshot(root, revision, snapshot => {
+        // Full push verification includes coverage: a new ref may have no available remote base.
+        withNodeModules(snapshot, root, () => withTargetCache(snapshot, cache, () => check(snapshot, commands(mode === 'pre-commit' ? 'fast' : 'full', revision ? true : rustChanged(paths)), { env: runEnv, logRoot: join(logs, String(i)), print })))
+      }, env)
+    }
+  })
+  print(`Verification complete. Logs: ${logs}`)
+}
+
+if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(SELF)) {
+  try { main() }
+  catch (error) { console.error(error.message); process.exitCode = 1 }
+}

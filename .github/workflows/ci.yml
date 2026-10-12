@@ -1,0 +1,465 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A pushed branch and its pull request would otherwise run the same expensive matrix twice.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm run test:dev-checks
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Windows is in the matrix deliberately: the JSON reporter normalizes path separators to
+      # forward slashes, and that is exactly the kind of correctness nothing catches on Linux.
+      # `cargo test` (not `--lib`): the integration suites are the mechanisms that close the
+      # blind spots review kept finding — the adversarial matrix and the docs-contract test only
+      # exist as `tests/` targets, and running only the lib would skip them entirely.
+      - run: cargo test --locked --all-features --all-targets
+
+  corpus:
+    name: Fixture corpus gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # Every npm gate script that runs the release binary builds it first (see `package.json`),
+      # because locally nothing else guaranteed the binary came from the working tree and a gate
+      # that measures a stale binary reports the previous commit's answer. That makes this step
+      # redundant here, and it stays anyway: it keeps a cold compile of the oxc tree in a step of
+      # its own rather than inside a gate's timing, and once it has run, the gate's own
+      # `cargo build` is an up-to-date no-op. The same holds in `recall`, `memory` and
+      # `npm-install-simulation` below; it is stated once, here.
+      - run: cargo build --release --locked
+      # `lib/js-tokens.mjs`'s `findCallback` is consumed by the textual-distinctness sweep below
+      # but has no fixture of its own to fail through, so it gets a direct unit test instead --
+      # a single explicit file, not a glob, per `run-action-tests.mjs`'s documented lesson about
+      # `node --test` silently resolving a glob or directory to zero real tests.
+      - run: node --test scripts/check/lib/external-corpus-retention.test.mjs scripts/check/lib/js-tokens.test.mjs scripts/check/lib/isolation.test.mjs scripts/check/lib/rust-test-modules.test.mjs
+      # Asserts every fixture's `@vitest-dedup:` expectation block holds: how many tests the
+      # extractor must find, and for each pair under test, which rule must fire between which
+      # participants -- or that a silence is `distinct`/`not-compared`, isolating the one variable
+      # it claims. A positive expectation going silent is a recall regression; a negative one
+      # firing is a precision regression, and `duplicate-test` defaults to error severity, so that
+      # would mean failing other people's builds on correct code. Also runs the fixture isolation
+      # gate over the same fixtures, which is why `npm run check:fixtures` is not a separate step
+      # here or a separate entry in `npm run check`: the corpus gate is its superset.
+      #
+      # Invoked through npm rather than as `node scripts/check/check-duplicates-corpus.mjs`, so
+      # that CI and a developer run the same entry point and the build prefix above cannot rot
+      # untested.
+      - run: npm run check:corpus
+      # Wrapper, not a bare `node --test`: the directory form silently ran zero tests while
+      # reporting success. The wrapper asserts a floor on how many actually ran.
+      - name: Action runner tests
+        run: node scripts/check/run-action-tests.mjs
+
+  # The second corpus control: a labelled recall set, measured rather than retained.
+  #
+  # Its own job rather than a step in `corpus` above, because it answers a different question and
+  # a failure here means something different. `corpus` asserts hand-written expectations over
+  # shapes someone already thought of; `run-external-corpus.mjs` asserts known-positive RETENTION,
+  # whose labels are selected by the detector being evaluated -- so a rule can miss every
+  # reordered-setup pair forever while retaining 100% of the exact duplicates it already found.
+  # Retention measured that way cannot see a miss, so this job supplies the half it cannot:
+  # one self-contained case per rule behaviour, each declaring what must be found, what must NOT
+  # be, and which desired findings the analyzer does not produce yet, behind a recall floor and a
+  # known-miss baseline that both ratchet in one direction.
+  recall:
+    name: Recall corpus gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cargo build --release --locked
+      - run: npm run check:recall
+
+  # The differential-title harness (V4): runs one `.each` fixture through real Vitest and
+  # through this analyzer and asserts the rendered titles byte-match. It exists because the
+  # ad-hoc probe that produced §4's measurements died with its review session, and the T6 mirror
+  # it went on to verify is exactly the kind of change that drifts silently -- title text is a
+  # comparison key for `duplicate-test-name` and `duplicate-each-row`, not decoration. Vitest is
+  # a pinned devDependency (5.0.3, the version §4 measured); a future upgrade re-runs this diff
+  # as its first gate. Runs per pull request; npm ci is required here and nowhere else in this
+  # workflow because this is the only job that needs the JavaScript dependency tree.
+  titles:
+    name: Differential title harness
+    runs-on: ubuntu-22.04
+    # `npm ci` runs third-party postinstall scripts; the checkout token is dead weight after the
+    # fetch, so it is not persisted into the steps that follow, and the job holds nothing beyond
+    # read access to the repository it just checked out.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci --no-audit --no-fund
+      - run: cargo build --release --locked
+      - run: node scripts/check/verify-titles.mjs
+
+  # The prose gate. Findings in code fell to nearly zero over four pull requests while findings
+  # in *prose* did not, and two of the last ones were mechanical: a fenced block labelled ```json
+  # that carried `…` placeholders, and "a million tests costs 3.4 GB" at 3,642 bytes per test --
+  # decimally 3.64, with 3.4 the binary figure. `tests/docs_contract.rs` already makes claims
+  # about behaviour falsifiable by parsing the documented tables and driving the real binary
+  # against them; nothing checked arithmetic, units, or whether a fenced example parses.
+  #
+  # `check-doc-accuracy.mjs` carries both checks, the tolerances, and the argument for why only
+  # two of them exist; this comment deliberately does not repeat its numbers. Its own unit tests
+  # run here too -- a gate whose assertions are untested is the same defect one level up -- and
+  # they are named as an explicit file list, never a glob or a directory, per
+  # `run-action-tests.mjs`'s documented lesson about `node --test` resolving either to zero real
+  # tests while reporting success.
+  #
+  # Per pull request, and the cheapest job in this workflow: no cargo, no network, no build. It
+  # reads tracked markdown and Rust doc comments and finishes in well under a second.
+  docs-accuracy:
+    name: Documentation accuracy gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node --test scripts/check/check-doc-accuracy.test.mjs
+      - run: npm run check:docs
+
+  # Two ratchets against the owner's bar: duplication below 1%, coverage above 98%. Each gate is
+  # pinned to its last measured value and fails on a regression rather than on arrival; raising a
+  # floor toward the bar is a deliberate edit in the script that owns it.
+  #
+  # The scripts are the authority on the current floors, and this comment deliberately does not
+  # repeat them. An earlier version quoted the numbers here, and they were stale within two
+  # commits -- a second copy of a measurement is a second thing to forget to update, which is the
+  # documentation-drift defect this repository keeps finding. `check-duplication.mjs` and
+  # `check-coverage.mjs` carry the floors, the targets, and the reasoning for both.
+  #
+  # This job runs per pull request because neither half needs cargo: jscpd reads the sources, and
+  # the JS coverage run drives the existing Node suites. It is the cheapest job in this workflow.
+  # The Rust half of coverage is separate, below, for the opposite reason.
+  quality-gates:
+    name: Duplication and JS coverage ratchets
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # jscpd is pinned to an exact version inside the script and fetched through npx. An
+      # unpinned tokenizer would move the recorded thresholds on its own, which would make them
+      # something other than a measurement.
+      - run: npm run check:duplication
+      # Nothing measured the JavaScript before this. It covers npm/lib, the Action, the release
+      # scripts and scripts/check/lib, per module, and names every production file it cannot
+      # reach rather than leaving the hole invisible.
+      - run: npm run check:coverage:js
+
+  # The memory target and current ratchets. The destination is 1,000,000 tests inside 2 GB,
+  # i.e. 2 KB retained per test; the scripts below own the higher limits CI currently enforces.
+  #
+  # Nothing measured this before. Peak memory on a real 24,147-test codebase was cut from 947 MB
+  # to 149 MB -- 39 KB per test down to 6.2 KB -- with no gate behind it, so the first `String`
+  # added to `src/model.rs` would have given the improvement back silently. Both halves run over a
+  # synthetic corpus generated from a fixed seed (`scripts/check/lib/memory-corpus.mjs`): no
+  # network, byte-identical on every machine, and large enough to separate a per-test constant
+  # from fixed process cost, which `fixtures/` at ~300 tests cannot do.
+  #
+  # `check-memory.mjs` is the ratchet, at one fixed scale. `check-memory-scaling.mjs` asserts the
+  # shape: every measurement this project has is a single point at 24k tests, so anything
+  # super-linear is invisible today -- and super-linear is what makes the tool unusable on exactly
+  # the legacy monorepo it was built for. The scripts carry the floors, the target and the
+  # reasoning; this comment deliberately does not repeat the numbers, because a second copy of a
+  # measurement is a second thing to forget to update.
+  #
+  # BOTH run per pull request, not on a schedule. Cost is about 50 seconds of analysis (0.4s at
+  # 1k, 3.4s at 10k, 36s at 100k) plus 3s of generation, on top of a `cargo build --release` that
+  # shares `Swatinem/rust-cache` with the `corpus` and `recall` jobs above -- so unlike
+  # `rust-coverage` below, there is no second cold build to avoid. And attribution is the whole
+  # point: a memory regression has to name the merge that caused it, which a weekly schedule
+  # cannot do. The 100k scale peaks around 435 MB of RSS, comfortably inside a runner.
+  memory:
+    name: Memory budget and scaling gates
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cargo build --release --locked
+      # The generator's own unit tests first, so a corpus regression fails with its own name
+      # rather than as a digest mismatch inside a gate. They assert determinism, the pinned
+      # digests, and that the declared mix -- nesting, hooks, vi.mock, .each rows, the body-size
+      # tail, every title form, repeated bodies -- is actually present. A weight edited to zero
+      # would otherwise still produce a stable digest and a plausible number, measured over a
+      # corpus that no longer models anything. An explicit file list, never a glob or a directory,
+      # per `run-action-tests.mjs`'s documented lesson about `node --test` resolving either to
+      # zero real tests while reporting success.
+      - run: node --test scripts/check/lib/memory-corpus.test.mjs scripts/check/lib/memory-record.test.mjs
+      # The ratchet: bytes retained per test at one fixed scale, against the last measured value.
+      # It asserts the corpus digest and an EXACT test count first -- a run that analyzed nothing
+      # has excellent memory, and that is the silent-success shape four of this repository's own
+      # gates have shipped.
+      - run: npm run check:memory
+      # The shape: retained bytes must stay linear in test count across 1k, 10k and 100k.
+      - run: npm run check:memory:scaling
+
+  # The Rust half of the coverage ratchet, deliberately NOT on pull requests.
+  #
+  # `cargo llvm-cov` needs a profile-instrumented build of the whole oxc dependency tree, and the
+  # instrumented profile cannot share `Swatinem/rust-cache` with the `test` job -- different
+  # RUSTFLAGS, different fingerprint -- so on a pull request this would be a second cold build of
+  # the most expensive thing in this repository, roughly doubling CI wall-clock for a number that
+  # moves slowly.
+  #
+  # Running it on every push to `main` instead keeps the ratchet attributable: a regression names
+  # the merge commit that caused it, which is the property a weekly schedule would lose. That is
+  # why this is not modelled on a weekly schedule -- weekly is right for an observation post over
+  # pinned third-party code, and wrong for a floor on our own.
+  rust-coverage:
+    name: Rust coverage ratchet
+    runs-on: ubuntu-22.04
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Its own cache: the instrumented build shares nothing with the `test` job's.
+          prefix-key: llvm-cov
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # The script redirects the instrumented build's output and prints a per-module table, per
+      # `AGENTS.md`'s bounded-output rule. It also asserts the run executed at least 500 tests --
+      # a coverage percentage over a suite that did not run is the silent-success failure this
+      # repository keeps rediscovering: every gate must assert a floor on work performed, because
+      # one that can only report "nothing failed" also passes when nothing was measured.
+      - run: npm run check:coverage:rust
+
+  self-check:
+    name: Analyze a known corpus
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      # Smoke test of the real binary end to end. The fixture tree contains intentional findings,
+      # so a non-zero exit is expected; what is being checked is that the run completes, emits a
+      # parseable report, and does not crash on the adversarial fixtures.
+      - name: Run against the fixture tree
+        run: |
+          set +e
+          ./target/release/vitest-dedup fixtures --reporters terminal,json --output reports/ci
+          code=$?
+          set -e
+          if [ "$code" -gt 1 ]; then
+            echo "::error::analyzer exited $code (operational error, not a quality-gate failure)"
+            exit 1
+          fi
+          # Floors, not just a schema check. Before the zero-work exit guard, this job asserted
+          # only that `schemaVersion` was a string, which an empty analysis satisfies: pointing
+          # the binary at an empty directory exited 0 and reported `tests: 0, findings: 0`. The
+          # binary now exits 2, while this independent floor still protects the report contract.
+          #
+          # That is the worst failure mode a gate has -- green because it measured nothing -- and
+          # the rule against it, every gate asserts a floor on work performed, had been applied to
+          # the fixture corpus gate and the Action wrapper but never to this end-to-end smoke test.
+          #
+          # The numbers are floors with slack, not exact counts: the fixture tree grows, and this
+          # job is a smoke test. `check-duplicates-corpus.mjs` is what asserts per-fixture exact
+          # expectations, so a floor here only has to catch collapse.
+          #
+          # Type first, THEN the floor, for every field this block reads. A floor written as
+          # `r.filesAnalyzed < 100` is not a floor when the field is absent or renamed:
+          # `undefined < 100` is `false`, so the comparison passes, the job prints
+          # `files: undefined` and exits 0 -- the exact silent success these floors were added to
+          # prevent, reproduced inside the fix for it. A missing or wrong-typed field is named and
+          # fails here, because the analyzer and this gate disagreeing about the report schema is
+          # a defect in its own right and never a passing run.
+          node -e "
+            const r = require('./reports/ci.json');
+            const fail = (message) => { throw new Error(message) };
+            const count = (field) => {
+              const value = r[field];
+              if (!Number.isInteger(value) || value < 0) fail('report field ' + field + ' is ' + JSON.stringify(value) + ', not a non-negative integer; the analyzer and this gate disagree about the report schema');
+              return value;
+            };
+            if (typeof r.schemaVersion !== 'string') fail('report field schemaVersion is ' + JSON.stringify(r.schemaVersion) + ', not a string');
+            if (!Array.isArray(r.findings)) fail('report field findings is ' + JSON.stringify(r.findings) + ', not an array');
+            r.findings.forEach((f, i) => {
+              if (!f || typeof f.rule !== 'string' || f.rule === '') fail('findings[' + i + '] carries no non-empty rule string; the rule-coverage floor below would collapse every such finding into one bucket and still pass');
+            });
+            const filesAnalyzed = count('filesAnalyzed');
+            const testsAnalyzed = count('testsAnalyzed');
+            if (filesAnalyzed < 100) fail('only ' + filesAnalyzed + ' file(s) analyzed; discovery over fixtures/ has collapsed');
+            if (testsAnalyzed < 200) fail('only ' + testsAnalyzed + ' test(s) extracted; extraction over fixtures/ has collapsed');
+            if (r.findings.length < 20) fail('only ' + r.findings.length + ' finding(s); the fixture tree contains intentional duplicates, so this means analysis has collapsed');
+            const rules = new Set(r.findings.map((f) => f.rule));
+            if (rules.size < 5) fail('findings cover only ' + rules.size + ' rule(s) (' + [...rules].join(', ') + '); the fixture tree exercises every rule, so this means whole rules stopped firing');
+            console.log('findings:', r.findings.length, 'tests:', testsAnalyzed, 'files:', filesAnalyzed, 'rules:', [...rules].sort().join(', '));
+          "
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fixture-report
+          path: reports/ci.json
+
+  npm-dist:
+    name: npm distribution (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # Windows is in this matrix for the launcher, not for coverage theatre: it is the only
+      # platform where the binary is named `.exe`, where npm's bin entry becomes a `.cmd` shim,
+      # and where `npm` itself cannot be spawned without going through Node.
+      - run: npm test
+      # Every version site -- Cargo.toml, Cargo.lock, package.json and its eight
+      # optionalDependencies, the README's Action pins, the changelog entry -- must already agree
+      # on `main`, not only at release time. Discovering a mismatch while cutting a tag is what
+      # this moves earlier.
+      - run: npm run check:versions
+      # Validates skills/vitest-dedup/SKILL.md's frontmatter (kebab-case name matching its
+      # directory, a non-empty description within the length limit) and that the body is
+      # non-empty. The Agent Skill is distributed via `npx skills add`, not the npm tarball, so
+      # nothing else in this workflow exercises it.
+      - run: npm run skills:check
+      # Catches a `files` allowlist that would publish a tarball missing the launcher, or one
+      # bloated with the whole repository.
+      - run: npm run pack:check
+
+  npm-install-simulation:
+    name: npm install simulation
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cargo build --release --locked
+      # Packs the real tarballs, installs them into a throwaway project, and drives the installed
+      # `vitest-dedup` through all three documented exit codes. The env var makes a missing binary
+      # a failure rather than a skip, so this job cannot quietly degrade into running nothing.
+      - name: Pack, install, and run the distribution
+        env:
+          VITEST_DEDUP_REQUIRE_INSTALL_SIM: "1"
+        run: node --test npm/test/install-simulation.test.mjs
+
+  release-workflow-guard:
+    name: Release workflow guard
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # release.yml is otherwise exercised for the first time only when a tag is pushed. This runs
+      # the same `node -e` payloads the release workflow embeds (extracted from release.yml, not
+      # copied) and checks that npm/lib/targets.mjs and npm/prebuilt-targets.json still agree.
+      - run: node scripts/check/check-release-workflow.mjs
+
+  secret-history:
+    name: Secret history scan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl --proto "=https" --tlsv1.2 -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # HEAD reaches every parent of a merge commit; the action scans only first parents.
+      - name: Scan the checked-out history
+        run: gitleaks git --config .gitleaks.toml --redact --no-banner --exit-code 1
+
+  rust-msrv:
+    name: Declared MSRV build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read declared Rust MSRV
+        id: rust
+        shell: bash
+        run: |
+          msrv=$(sed -nE 's/^rust-version = "([0-9.]+)"$/\1/p' Cargo.toml | head -1)
+          test -n "$msrv" || { echo "rust-version is missing from Cargo.toml" >&2; exit 1; }
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install "${{ steps.rust.outputs.msrv }}" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +"${{ steps.rust.outputs.msrv }}" check --all-targets --all-features --locked

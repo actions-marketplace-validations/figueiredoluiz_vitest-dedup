@@ -1,0 +1,23 @@
+/target
+node_modules
+*.log
+
+# Generated analysis reports. `--output` defaults here, so a local run would
+# otherwise leave artifacts staged for commit.
+/reports
+
+# Generated npm platform packages. Built from npm/prebuilt-targets.json by
+# scripts/release/prepare-npm-packages.mjs on every release; never hand-edited, never committed.
+/npm/platforms
+
+# cargo-mutants working output (`mutants.out`, plus the `.old` copy it keeps of the previous run).
+# Written by scripts/check/check-mutation-score.mjs's producer; `.cargo/mutants.toml` sets
+# `gitignore = true`, so this entry also keeps it out of the trees cargo-mutants copies per job.
+/mutants.out
+/mutants.out.old
+
+# Generated synthetic corpora for the memory gates. Built from a fixed seed by
+# scripts/check/lib/memory-corpus.mjs on every run of check-memory.mjs and
+# check-memory-scaling.mjs; byte-identical from the seed, so there is nothing here worth
+# committing and ~71MB at the 100k scale that is worth not committing.
+/.memory-corpus

@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VitestDedup report</title>
+<script>
+try {
+  var storedTheme = localStorage.getItem('vitest-dedup-theme');
+  if (storedTheme === 'light' || storedTheme === 'dark') {
+    document.documentElement.dataset.theme = storedTheme;
+  }
+} catch (error) {}
+</script>
+<style>
+:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --page: #ffffff;
+  --surface: #f6f7f9;
+  --text: #1b1f24;
+  --muted: #5b6472;
+  --border: #ccd2da;
+  --field: #ffffff;
+  --code-bg: #00000010;
+  --error: #b3261e;
+  --warning: #8a5a00;
+  --off: #5b6472;
+  --alert-bg: #fff4e5;
+  --alert-border: #b3261e;
+  --alert-text: #7a1f18;
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d1117;
+  --surface: #161b22;
+  --text: #e6edf3;
+  --muted: #9da7b3;
+  --border: #313944;
+  --field: #1c2128;
+  --code-bg: #ffffff14;
+  --error: #ff7b72;
+  --warning: #f0b429;
+  --off: #9da7b3;
+  --alert-bg: #3b1f14;
+  --alert-border: #ff7b72;
+  --alert-text: #ffd7d2;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d1117;
+    --surface: #161b22;
+    --text: #e6edf3;
+    --muted: #9da7b3;
+    --border: #313944;
+    --field: #1c2128;
+    --code-bg: #ffffff14;
+    --error: #ff7b72;
+    --warning: #f0b429;
+    --off: #9da7b3;
+    --alert-bg: #3b1f14;
+    --alert-border: #ff7b72;
+    --alert-text: #ffd7d2;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text);
+}
+.wrap { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+.report-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.report-header h1 { margin: 0 0 .35rem; font-size: 1.5rem; }
+.summary-line { margin: 0; color: var(--muted); }
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: .45rem;
+  padding: .5rem .8rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.theme-toggle:hover { border-color: var(--text); }
+.theme-toggle:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+.incomplete-alert {
+  display: flex;
+  gap: .75rem;
+  align-items: flex-start;
+  margin: 1.25rem 0;
+  padding: 1rem 1.1rem;
+  border: 2px solid var(--alert-border);
+  border-radius: .5rem;
+  background: var(--alert-bg);
+  color: var(--alert-text);
+}
+.incomplete-alert .icon { font-size: 1.4rem; line-height: 1; }
+.incomplete-alert strong { display: block; font-size: 1.02rem; margin-bottom: .25rem; }
+/* One line per cause that fired. Indented under the sentence it qualifies rather than run
+   together into prose: the reader is scanning for which of these applies to them. */
+.incomplete-causes { margin: .4rem 0 0; padding-left: 1.1rem; }
+.incomplete-causes li { margin-top: .15rem; }
+.controls {
+  display: flex;
+  gap: .75rem;
+  flex-wrap: wrap;
+  margin: 1.5rem 0;
+}
+input, select { font: inherit; color: inherit; padding: .55rem .7rem; border: 1px solid var(--border); border-radius: .35rem; background: var(--field); }
+#search { min-width: 18rem; flex: 1; }
+.rule-group { margin: 1.75rem 0; }
+.rule-group > h2 {
+  font-size: 1.05rem;
+  margin: 0 0 .75rem;
+  padding-bottom: .35rem;
+  border-bottom: 1px solid var(--border);
+}
+.rule-group > h2 code { font-size: .95em; }
+.file-group { margin: 0 0 1.1rem; }
+.file-group > h3 {
+  font-size: .85rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 0 0 .5rem;
+}
+.file-group > h3 code { font-family: ui-monospace, monospace; }
+.finding {
+  border: 1px solid var(--border);
+  border-left-width: .35rem;
+  border-radius: .4rem;
+  padding: .9rem 1rem;
+  margin: .6rem 0;
+  background: var(--surface);
+}
+.finding[data-severity="error"] { border-left-color: var(--error); }
+.finding[data-severity="warning"] { border-left-color: var(--warning); }
+.finding[data-severity="off"] { border-left-color: var(--off); }
+.finding-head { display: flex; align-items: center; gap: .6rem; margin-bottom: .4rem; }
+.severity-badge { font-weight: 700; text-transform: uppercase; font-size: .72rem; letter-spacing: .02em; }
+.severity-badge.error { color: var(--error); }
+.severity-badge.warning { color: var(--warning); }
+.severity-badge.off { color: var(--off); }
+/* Baselined findings stay fully legible: this marks accepted debt, it never dims or hides it. */
+.severity-badge.baselined { color: var(--muted); border: 1px solid var(--muted); border-radius: .25rem; padding: .05rem .3rem; }
+.finding .message { margin: .2rem 0 .6rem; }
+.locations { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .3rem; }
+.locations li { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline; }
+.locations code { font-family: ui-monospace, monospace; background: var(--code-bg); padding: .05rem .35rem; border-radius: .25rem; }
+.locations .title { color: var(--muted); }
+/* Collapsed by default: a snippet is consulted on demand, not imposed on every scan. */
+.snippet { margin-top: .25rem; }
+.snippet summary { cursor: pointer; color: var(--muted); font-size: .8rem; user-select: none; }
+.snippet summary:hover { color: var(--text); }
+.snippet pre {
+  margin: .35rem 0 0;
+  padding: .6rem .75rem;
+  background: var(--code-bg);
+  border-radius: .35rem;
+  overflow: auto;
+  max-height: 22rem;
+  font-size: .8rem;
+  line-height: 1.45;
+}
+.snippet code { font-family: ui-monospace, monospace; }
+.snippet-unavailable { margin: .25rem 0 0; color: var(--muted); font-size: .8rem; font-style: italic; }
+.empty-state { padding: 2.5rem 1rem; text-align: center; color: var(--muted); border: 1px dashed var(--border); border-radius: .5rem; }
+/* Per-rule totals (P2): each is a filter button, not plain text. The active one mirrors the
+   rule dropdown's selection so the two controls read as one mechanism. */
+.rule-totals { display: flex; gap: .45rem; flex-wrap: wrap; margin: 0 0 1.25rem; }
+.rule-total {
+  font: inherit;
+  font-size: .8rem;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: .2rem .7rem;
+  cursor: pointer;
+}
+.rule-total:hover { border-color: var(--text); color: var(--text); }
+.rule-total:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+.rule-total.active { color: var(--text); border-color: var(--text); font-weight: 600; }
+[hidden] { display: none !important; }
+@media (max-width: 640px) {
+  .wrap { padding: 1.25rem .9rem 3rem; }
+  #search { min-width: 100%; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="report-header">
+  <div>
+    <h1>VitestDedup report</h1>
+    <p class="summary-line">{{SUMMARY_LINE}}</p>
+  </div>
+  <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false" aria-label="Switch color theme">
+    <span id="theme-icon" aria-hidden="true">&#x25d0;</span>
+    <span id="theme-label">System</span>
+  </button>
+</div>
+{{INCOMPLETE_BANNER}}
+{{RULE_TOTALS}}
+<!--
+  Participant snippets (the <details class="snippet"> blocks inside location entries) are
+  sliced from the exact source text the analyzer parsed and fingerprinted this run, retained
+  only because this reporter was requested -- never re-read from disk at generation time, so
+  they cannot drift from what was compared. A location that cannot be sliced says so
+  explicitly. Locations are still printed as path:line:column so an editor can jump straight
+  to the real source.
+-->
+<div class="controls">
+  <input id="search" type="search" placeholder="Search findings" aria-label="Search findings">
+  <select id="severity-filter" aria-label="Filter by severity">
+    <option value="">All severities</option>
+    <option value="error">Error</option>
+    <option value="warning">Warning</option>
+    <option value="off">Off</option>
+  </select>
+  <select id="rule-filter" aria-label="Filter by rule">
+    <option value="">All rules</option>
+    {{RULE_OPTIONS}}
+  </select>
+</div>
+<main id="findings">
+{{FINDINGS_BODY}}
+</main>
+</div>
+<script type="application/json" id="report-data">{{REPORT_JSON}}</script>
+<script>
+(function () {
+  "use strict";
+  var searchInput = document.getElementById('search');
+  var severitySelect = document.getElementById('severity-filter');
+  var ruleSelect = document.getElementById('rule-filter');
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.finding'));
+  var fileGroups = Array.prototype.slice.call(document.querySelectorAll('.file-group'));
+  var ruleGroups = Array.prototype.slice.call(document.querySelectorAll('.rule-group'));
+
+  function applyFilters() {
+    var query = searchInput.value.toLowerCase();
+    var severity = severitySelect.value;
+    var rule = ruleSelect.value;
+    cards.forEach(function (card) {
+      var matchesSeverity = !severity || card.dataset.severity === severity;
+      var matchesRule = !rule || card.dataset.rule === rule;
+      var matchesQuery = !query || card.textContent.toLowerCase().indexOf(query) !== -1;
+      card.hidden = !(matchesSeverity && matchesRule && matchesQuery);
+    });
+    fileGroups.forEach(function (group) {
+      group.hidden = group.querySelectorAll('.finding:not([hidden])').length === 0;
+    });
+    ruleGroups.forEach(function (group) {
+      group.hidden = group.querySelectorAll('.file-group:not([hidden])').length === 0;
+    });
+  }
+
+  var ruleTotals = Array.prototype.slice.call(document.querySelectorAll('.rule-total'));
+
+  // P2: a total button toggles the rule filter it names. Clicking the active one clears the
+  // filter again, so "show only this rule" and "show everything" are one control apart; the
+  // dropdown and the buttons always reflect the same selection.
+  function setRuleFilter(rule) {
+    ruleSelect.value = rule;
+    ruleTotals.forEach(function (button) {
+      button.classList.toggle('active', button.getAttribute('data-rule-total') === rule);
+    });
+    applyFilters();
+  }
+
+  ruleTotals.forEach(function (button) {
+    button.addEventListener('click', function () {
+      var rule = button.getAttribute('data-rule-total');
+      setRuleFilter(ruleSelect.value === rule ? '' : rule);
+    });
+  });
+
+  if (searchInput) {
+    searchInput.addEventListener('input', applyFilters);
+    severitySelect.addEventListener('change', applyFilters);
+    ruleSelect.addEventListener('change', function () {
+      ruleTotals.forEach(function (button) {
+        button.classList.toggle('active', button.getAttribute('data-rule-total') === ruleSelect.value);
+      });
+      applyFilters();
+    });
+  }
+
+  var themeToggle = document.getElementById('theme-toggle');
+  var themeIcon = document.getElementById('theme-icon');
+  var themeLabel = document.getElementById('theme-label');
+  var themePreference = window.matchMedia('(prefers-color-scheme: dark)');
+
+  function currentTheme() {
+    return document.documentElement.dataset.theme || (themePreference.matches ? 'dark' : 'light');
+  }
+
+  function updateThemeToggle() {
+    var theme = currentTheme();
+    var isDark = theme === 'dark';
+    themeToggle.setAttribute('aria-pressed', String(isDark));
+    themeToggle.setAttribute('aria-label', 'Switch to ' + (isDark ? 'light' : 'dark') + ' theme');
+    themeIcon.textContent = isDark ? String.fromCharCode(9788) : String.fromCharCode(9728);
+    themeLabel.textContent = isDark ? 'Dark' : 'Light';
+  }
+
+  themeToggle.addEventListener('click', function () {
+    var theme = currentTheme() === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem('vitest-dedup-theme', theme); } catch (error) {}
+    updateThemeToggle();
+  });
+  if (themePreference.addEventListener) {
+    themePreference.addEventListener('change', function () {
+      if (!document.documentElement.dataset.theme) updateThemeToggle();
+    });
+  }
+  updateThemeToggle();
+})();
+</script>
+</body>
+</html>

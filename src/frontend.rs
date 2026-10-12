@@ -1,0 +1,55 @@
+//! The only module tree permitted to import `oxc_*`.
+//!
+//! Everything above this boundary consumes [`crate::model`]. Keeping the parser contained is what
+//! makes the pre-1.0 oxc pin survivable: a breaking release is a rewrite of this subtree, not of
+//! the analyzer.
+
+mod extract;
+mod fingerprint;
+mod helpers;
+mod registry;
+mod resolver;
+
+use crate::discovery::SourceFile;
+use crate::model::TestCase;
+
+pub use registry::{take_cell_census, Globals};
+
+/// Everything one parsed file contributed.
+#[derive(Clone, Debug, Default)]
+pub struct FileExtraction {
+    /// Test cases in source order.
+    pub tests: Vec<TestCase>,
+    /// Exact source bytes for imported declaration locations, for snippets and suppressions.
+    /// Only helpers that actually contributed declarations are retained, once per path.
+    pub helper_sources: std::collections::BTreeMap<std::path::PathBuf, String>,
+    /// Set when the file could not be fully understood, so absence of a finding proves nothing.
+    pub incomplete: bool,
+    /// Human-readable reasons the extraction was incomplete.
+    pub diagnostics: Vec<String>,
+    /// Set when this file contributed zero tests, extraction found nothing wrong with it
+    /// (`diagnostics` is empty), and every `test`/`describe` declaration this extractor did find
+    /// was a statically known-empty `.each`/`.for` table (`test.each([])`, `describe.each([])`).
+    /// Vitest itself runs such a table zero times -- reporting "No test suite found in file" for
+    /// it, not a clean pass -- so zero tests here is a proven, correct answer, not a sign that
+    /// extraction missed something. `main.rs`'s "discovered a file but extracted no tests" guard
+    /// (which otherwise blames `test.globals`) uses this to say the right thing instead: never to
+    /// suppress the guard itself, since a zero-test `globals: true` file this analyzer failed to
+    /// recognize would look identical to a caller that only checked "tests is empty".
+    pub proven_empty: bool,
+}
+
+/// Parses one source file and extracts its Vitest test cases.
+///
+/// Never panics on malformed input: a file that fails to parse yields an empty extraction with
+/// `incomplete` set, matching the product rule that operational degradation stays visible.
+pub fn extract(source: &str, file: &SourceFile, globals: Globals) -> FileExtraction {
+    extract::extract(source, file, globals)
+}
+
+/// Extracts a historical caller without reading present-day imported declarations.
+/// Until helper blobs can be resolved in that same revision, called imports are refused and
+/// their registration scopes are unresolved; the revision baseline is explicitly partial.
+pub fn extract_from_revision(source: &str, file: &SourceFile, globals: Globals) -> FileExtraction {
+    extract::extract_with_imports(source, file, globals, false)
+}

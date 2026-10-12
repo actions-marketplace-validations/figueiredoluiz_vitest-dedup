@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+root=$(git rev-parse --show-toplevel)
+work=$(mktemp -d "${TMPDIR:-/tmp}/vitest-dedup-hook-driver.XXXXXX")
+trap 'rm -rf "$work"' 0
+trap 'exit 1' HUP INT TERM
+cd "$root"
+# Secrets are checked against the index before anything else runs; a commit with a credential in it
+# never reaches the verifier.
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "gitleaks is required by the pre-commit hook. Install it with: brew install gitleaks" >&2
+  exit 1
+fi
+gitleaks protect --staged --config "$root/.gitleaks.toml" --redact --no-banner --exit-code 1
+# Load the driver from the same index that it will verify.
+git show :scripts/dev/verify.mjs > "$work/verify.mjs"
+node "$work/verify.mjs" pre-commit

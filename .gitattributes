@@ -1,0 +1,30 @@
+# Every text file is LF in the index and LF in the working tree, on every platform.
+#
+# Without this, Git's default on Windows checks out CRLF, and this repository parses its own
+# text files in anger: the release scripts read CHANGELOG.md, the corpus gates read fixture
+# headers, and the doc gates read markdown. Those parsers are written against `\n`.
+#
+# That was not theoretical. `bump-version.mjs` matches `/^## Notes toward the first release\n/m`,
+# which cannot match across `\r\n`, so `planChangelog` found no promotable section and
+# `npm distribution (windows-latest)` failed on `main` -- reproduced locally by converting
+# CHANGELOG.md to CRLF, which fails the same test with the same message.
+#
+# `eol=lf` rather than only `text=auto`: `text=auto` normalises what goes INTO the index (already
+# true here -- no tracked file contains CRLF) while leaving checkout to `core.autocrlf`, which is
+# the setting that produced the failure. `eol=lf` fixes the checkout too, so the answer does not
+# depend on a contributor's local Git config.
+#
+# Binary files are unaffected: `text=auto` asks Git to detect them, and detected binaries are
+# never converted.
+* text=auto eol=lf
+
+# Declared explicitly rather than left to detection, because a mis-detected binary that gets
+# newline-converted is silently corrupted, and these are the types this repository ships or
+# fixtures.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.gz binary
+*.zip binary

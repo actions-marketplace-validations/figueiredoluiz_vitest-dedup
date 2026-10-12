@@ -1,0 +1,103 @@
+name: VitestDedup
+description: Detect duplicate and near-duplicate Vitest tests
+author: figueiredoluiz
+branding:
+  icon: copy
+  color: green
+inputs:
+  path:
+    description: Repository-relative directory to analyze
+    default: .
+  config:
+    description: Explicit .vitest-dedup.json configuration file
+    default: ""
+  threshold:
+    description: Maximum percentage of tests allowed to participate in error-level findings
+    default: ""
+  reporters:
+    description: >-
+      Comma-separated reporters (terminal, jsonl, json, html, sarif). `terminal` and `jsonl` both
+      write to stdout and cannot be combined. The JSON reporter is always enabled so the action can
+      publish its outputs.
+    default: terminal
+  output:
+    description: Filename prefix for file-based reports, without extension
+    default: reports/vitest-dedup
+  rule:
+    description: Newline- or comma-separated rule severity overrides, e.g. duplicate-test=warning
+    default: ""
+  globals:
+    description: >-
+      Treat bare test/describe/it identifiers as Vitest, for projects configured with
+      test.globals = true. VitestDedup reads this setting from a single-project Vitest config
+      automatically; this input is only needed to override that detection or when the config
+      cannot be classified -- notably a monorepo using test.projects, where each project can
+      resolve globals differently and detection reports Unknown rather than guessing. A globals
+      project analyzed as non-globals extracts zero tests, which is reported as an error
+      condition and marks the run incomplete rather than passing silently (unless every
+      discovered file's only declarations are statically empty `.each`/`.for` tables, a shape
+      Vitest itself also runs zero times, in which case a distinct message names that instead).
+    default: "false"
+  fail-on-incomplete:
+    description: >-
+      Fail when the analysis could not fully cover the discovered corpus. "true" (or "any")
+      counts every cause; "reads" only causes meaning the analyzed project could not be fully
+      read; "limits" only the analyzer's own bounded work being capped.
+    default: "false"
+  baseline:
+    description: >-
+      Path to a committed VitestDedup baseline file. Findings it accounts for are still reported
+      and marked as baselined, but do not fail the quality gate. `--update-baseline` is
+      deliberately not exposed as an input: rewriting a committed record of accepted debt is not a
+      CI gate operation, and a workflow that could do it silently would turn every failing run into
+      an accepted one.
+    default: ""
+  fail-on-new:
+    description: >-
+      Fail when more than this many findings are absent from the baseline. Requires `baseline`.
+      This is a quality-gate failure (exit 1), and it is additional to `threshold` rather than a
+      replacement for it.
+    default: ""
+  changed-since:
+    description: >-
+      Report only findings touching a file changed since this Git revision. The whole corpus is
+      still analyzed -- cross-file duplicates with an unchanged twin are still reported -- but
+      findings lying entirely within unchanged files are withheld, which marks the run incomplete.
+      Requires full history: set `fetch-depth: 0` on `actions/checkout`, or the run fails with an
+      operational error rather than diffing against a truncated history.
+    default: ""
+  version:
+    description: Exact VitestDedup release version to download and verify
+    required: true
+outputs:
+  exit-code:
+    description: Native VitestDedup exit code (0 clean, 1 quality gate failed, 2 operational error)
+  findings:
+    description: Total number of findings
+  errors:
+    description: Number of error-severity findings
+  warnings:
+    description: Number of warning-severity findings
+  tests-analyzed:
+    description: Number of tests discovered and analyzed
+  files-analyzed:
+    description: Number of files parsed
+  incomplete:
+    description: >-
+      "true" when the run could not fully cover the corpus, including when `changed-since` withheld
+      findings in unchanged files. When this is true, the absence of a finding is not evidence that
+      none exists.
+  baselined:
+    description: >-
+      Number of findings the baseline accounted for. `findings`/`errors`/`warnings` above count
+      every finding, baselined or not -- a baseline changes what fails the gate, not what was
+      found.
+  new-findings:
+    description: Number of findings absent from the baseline
+  json-report:
+    description: Path to the JSON report
+  html-report:
+    description: Path to the HTML report, when the html reporter was selected
+runs:
+  using: node24
+  main: .github/actions/vitest-dedup/index.js
