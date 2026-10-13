@@ -25,7 +25,7 @@
 //! from turning the fingerprinter into something that silently gets slower or flakier as it scales:
 //!
 //! - **Memoized, not repeated.** [`resolve`] is keyed on `(importing file, specifier)` and cached
-//!   for the lifetime of the process (see [`CACHE`]). `import_origins` already re-parses each
+//!   for the lifetime of the extraction worker (see [`CACHE`]). `import_origins` already re-parses each
 //!   file's imports once per test body in that file (a pre-existing, documented cost -- see its
 //!   doc comment in `fingerprint.rs`); without memoization, resolution would multiply that same
 //!   cost by a real filesystem walk per call. The cache collapses it back down to one resolution
@@ -42,11 +42,11 @@
 //! - **Never resolved mid-traversal.** [`resolve`] is only ever called from `import_origins`, which
 //!   runs once before a body's identifier walk begins. The serializer and behavior collector never
 //!   touch the filesystem themselves -- they consume the already-resolved [`Resolved`] value.
-//! - **A thread-local cache, not a global lock.** This crate does not spawn threads of its own, so a
-//!   `thread_local!` cache needs no synchronization and imposes no lock contention if it is ever
-//!   driven from a multi-threaded test harness -- each thread pays for its own first resolution of
-//!   a given pair, which only affects speed, never the result, since resolution is a pure function
-//!   of its inputs plus the (for one run) unchanging filesystem.
+//! - **A thread-local cache, not a global lock.** Extraction runs on an explicitly sized worker
+//!   stack. Each worker retains its resolver and memoized results throughout the file and all of
+//!   its helper/fingerprint passes, then drops them. Independent extractions do not share cache
+//!   state or contend for a lock. Resolution still assumes the analyzed tree is unchanged during
+//!   a run; cache lifetime only affects speed, not the result under that assumption.
 //!
 //! `fingerprint`'s own doc comment records the measured wall-clock cost of adding this on the
 //! external corpus.
@@ -58,7 +58,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 thread_local! {
-    /// One resolver per thread, built lazily on first use and reused for the rest of the run.
+    /// One resolver per worker, built lazily and reused until that extraction completes.
     /// `TsconfigDiscovery::Auto` means each call finds *its own* nearest `tsconfig.json` by
     /// walking up from the importing file -- the right default for a monorepo with one
     /// `tsconfig.json` per package (two of the pinned corpora are), and equally correct for a single

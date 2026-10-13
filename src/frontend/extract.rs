@@ -59,45 +59,153 @@ pub(super) fn extract_with_imports(
     globals: Globals,
     allow_imported: bool,
 ) -> FileExtraction {
-    // The census counts cells per file: spans restart at zero in every source, so the dedup
-    // scope must not survive from the previous file (Copilot review, PR #28 round 2).
-    super::registry::reset_cell_census_file_scope();
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run(source, file, globals, allow_imported)
-    })) {
-        Ok(extraction) => extraction,
-        Err(_) => FileExtraction {
-            helper_sources: Default::default(),
-            tests: Vec::new(),
-            incomplete: true,
-            diagnostics: vec!["internal error: extraction panicked and was recovered".to_owned()],
-            proven_empty: false,
-        },
+    if let Some(reason) = parse_refusal(source) {
+        return refused_extraction(reason);
+    }
+    // A finite input budget and an explicit stack work together: stack size alone only moves
+    // the crash threshold, while a lexical bracket count alone misses regexes and operator chains.
+    let result = std::thread::scope(|scope| {
+        #[cfg(test)]
+        let census = super::registry::test_cell_census_snapshot();
+        let worker = std::thread::Builder::new()
+            .name("vitest-dedup-extract".to_owned())
+            .stack_size(EXTRACTION_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                #[cfg(test)]
+                super::registry::restore_test_cell_census(census);
+                super::registry::reset_cell_census_file_scope();
+                let extraction = run(source, file, globals, allow_imported);
+                #[cfg(test)]
+                let extraction = (extraction, super::registry::test_cell_census_snapshot());
+                extraction
+            })
+            .map_err(|error| format!("could not start bounded extraction thread: {error}"))?;
+        let extraction = worker
+            .join()
+            .map_err(|_| "internal error: extraction panicked and was recovered".to_owned())?;
+        #[cfg(test)]
+        let extraction = {
+            let (extraction, census) = extraction;
+            super::registry::restore_test_cell_census(census);
+            extraction
+        };
+        Ok(extraction)
+    });
+    result.unwrap_or_else(refused_extraction)
+}
+
+/// Visible refusal shared by preflight, thread creation failure and recovered worker panics.
+fn refused_extraction(reason: String) -> FileExtraction {
+    FileExtraction {
+        helper_sources: Default::default(),
+        tests: Vec::new(),
+        incomplete: true,
+        diagnostics: vec![reason],
+        proven_empty: false,
     }
 }
 
-/// Maximum bracket nesting depth this frontend will hand to `oxc_parser`.
-///
-/// `oxc_parser` is a recursive-descent parser: each nesting level of `(`, `[`, or `{` costs a
-/// stack frame, and sufficiently deep nesting exhausts the thread stack and **aborts the
-/// process** -- not a panic, not a `Result`, nothing `std::panic::catch_unwind` around [`extract`]
-/// can catch, because the OS kills the thread before Rust's unwinding machinery ever runs. This
-/// was proven, not guessed, by the fingerprint agent: `std::mem::forget`-ing both the
-/// `Allocator` and `ParserReturn` (skipping every `Drop` impl) still overflowed, ruling out
-/// destructor recursion; the identical adversarial input parses cleanly under
-/// `RUST_MIN_STACK=67108864` but dies on a default-size thread; and a binary search on a
-/// default-size thread found parsing succeeds at 500 levels of nesting and overflows at 1000.
-///
-/// 256 sits comfortably under that measured 1000-level failure point -- leaving headroom for
-/// thread-stack variance across platforms/CI and for oxc's own per-frame stack usage changing in
-/// a future patch release -- while being far beyond anything a real, human-written test file
-/// approaches. Do not raise this without re-measuring the failure threshold against the actual
-/// pinned oxc version, and do not delete this guard as "dead code" without understanding that it
-/// is the only thing standing between one hostile or machine-generated fixture and a
-/// whole-process abort that destroys every other file's results in the same run --
-/// `docs/vitest-surface.md`'s "degrade visibly, never crash" rule has no `Result`-based escape
-/// hatch for a stack overflow.
+/// Explicit stack headroom for parsing, semantic construction, AST visitors and helper frames.
+/// The independent raw syntax budget below is essential: this stack is finite, not crash recovery.
+const EXTRACTION_STACK_BYTES: usize = 128 * 1024 * 1024;
+
+/// Maximum lexical bracket depth, retaining the existing tighter limit on ordinary source.
+/// This scan is an admission heuristic, not a safety bound: regex/JSX can confuse its masking.
 pub(super) const MAX_NESTING_DEPTH: usize = 256;
+
+/// Independent upper bound on recursion-bearing raw syntax units. It deliberately also counts
+/// text in strings/comments/regexes, so lexical ambiguity cannot hide recursive syntax. Wide or
+/// punctuation-heavy generated inputs may be refused even when their actual syntax is shallow.
+const MAX_RAW_SYNTAX_UNITS: usize = 8_192;
+
+/// Checks every production parser entry before Oxc sees source. No JS tokenization or recursion.
+/// Keywords cover bracket-free unary/control/type chains; punctuation covers calls, member and
+/// label chains, arrows, JSX, operators, nested templates and bracket nesting. Commas, digits and
+/// ordinary identifier text are uncharged, retaining flat data without pretending to parse JS.
+pub(super) fn parse_refusal(source: &str) -> Option<String> {
+    if source.len() > crate::discovery::MAX_SOURCE_FILE_BYTES as usize {
+        return Some(
+            "file exceeds the maximum supported source size; skipped before parsing".to_owned(),
+        );
+    }
+    let bytes = source.as_bytes();
+    let mut units = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || matches!(bytes[i], b'_' | b'$') {
+            let start = i;
+            i += 1;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'$'))
+            {
+                i += 1;
+            }
+            if matches!(
+                &bytes[start..i],
+                b"if"
+                    | b"else"
+                    | b"for"
+                    | b"while"
+                    | b"do"
+                    | b"new"
+                    | b"void"
+                    | b"typeof"
+                    | b"delete"
+                    | b"await"
+                    | b"yield"
+                    | b"return"
+                    | b"throw"
+                    | b"in"
+                    | b"instanceof"
+                    | b"as"
+                    | b"satisfies"
+                    | b"keyof"
+                    | b"readonly"
+                    | b"infer"
+                    | b"unique"
+                    | b"extends"
+                    | b"declare"
+            ) {
+                units += 1;
+            }
+        } else {
+            if matches!(
+                bytes[i],
+                b'(' | b'['
+                    | b'{'
+                    | b'<'
+                    | b'>'
+                    | b'='
+                    | b'.'
+                    | b':'
+                    | b'?'
+                    | b'!'
+                    | b'+'
+                    | b'-'
+                    | b'*'
+                    | b'/'
+                    | b'%'
+                    | b'&'
+                    | b'|'
+                    | b'^'
+                    | b'~'
+                    | b'`'
+                    | b'@'
+                    | b'\\'
+            ) {
+                units += 1;
+            }
+            i += 1;
+        }
+        if units > MAX_RAW_SYNTAX_UNITS {
+            return Some(format!("file exceeds the maximum supported raw syntax budget ({MAX_RAW_SYNTAX_UNITS} units); skipped before parsing to avoid a stack overflow"));
+        }
+    }
+    let depth = max_nesting_depth(source);
+    (depth > MAX_NESTING_DEPTH).then(|| format!(
+        "file exceeds the maximum supported bracket nesting depth ({depth} > {MAX_NESTING_DEPTH}); skipped without parsing to avoid a parser stack overflow"
+    ))
+}
 
 /// How many helper frames [`Walker::begin_helper_expansion`] will hold open at once.
 ///
@@ -124,7 +232,7 @@ const MAX_HELPER_EXPANSION_DEPTH: usize = 8;
 /// measured files carrying this shape spend three of it each per pass, six per file in total.
 const MAX_HELPER_EXPANSIONS: usize = 2_000;
 
-/// Conservatively estimates the maximum bracket nesting depth in `source`, without parsing it.
+/// Estimates bracket nesting with a lexical masking heuristic, without parsing `source`.
 ///
 /// A naive byte-level scan counting `(`/`[`/`{` against `)`/`]`/`}` cannot tell a real bracket
 /// from one that is only *text* -- inside a string literal, a comment, or a template literal's
@@ -146,12 +254,10 @@ const MAX_HELPER_EXPANSIONS: usize = 2_000;
 /// reject a file that never actually nests that deep (a false rejection, which is safe, but an
 /// unnecessary one this scan can just as easily avoid).
 ///
-/// An unterminated string masks to the end of its line (real JS strings cannot legally contain a
-/// raw newline either), an unterminated block comment or template literal masks to the end of the
-/// file -- both mirror what the real tokenizer does with the same malformed input, so nothing
-/// past that point is miscounted in either direction. Over-counting genuine code brackets remains
-/// fine and deliberate: the guard only needs to be a safe upper bound on what the real parser
-/// will recurse through, and must never *undercount* a genuinely pathological file.
+/// For actual quoted text, an unterminated string masks to the end of its line; an unterminated
+/// block comment or template masks to EOF. Regex literals and JSX are not recognized, however,
+/// so this heuristic can undercount. The independent raw syntax budget in [`parse_refusal`]
+/// bounds admission even when masking mistakes code for text.
 pub(super) fn max_nesting_depth(source: &str) -> usize {
     /// One entry of the template-literal context stack.
     enum Frame {
@@ -271,27 +377,6 @@ fn run(source: &str, file: &SourceFile, globals: Globals, allow_imported: bool) 
             proven_empty: false,
         };
     };
-
-    // Guard against the recursive-descent parser's stack-overflow failure mode *before* it ever
-    // sees the source (see `MAX_NESTING_DEPTH`'s doc) -- a caught panic is not available here,
-    // so refusing to parse is the only sound response to input this deeply nested.
-    let depth = max_nesting_depth(source);
-    if depth > MAX_NESTING_DEPTH {
-        return FileExtraction {
-            helper_sources: Default::default(),
-            tests: Vec::new(),
-            incomplete: true,
-            // No path in the text: `FileExtraction::diagnostics` reaches callers that prefix
-            // every entry with the file's path themselves (and relativize it -- extract has no
-            // analysis root to measure against), so embedding one here would print the same
-            // file twice, once absolute (S12).
-            diagnostics: vec![format!(
-                "file exceeds the maximum supported bracket nesting depth ({depth} > \
-                 {MAX_NESTING_DEPTH}); skipped without parsing to avoid a parser stack overflow"
-            )],
-            proven_empty: false,
-        };
-    }
 
     let allocator = Allocator::default();
     let parser_return = Parser::new(&allocator, source, source_type).parse();
@@ -4998,6 +5083,22 @@ mod tests {
         let extraction = extract_source(&source, "nested-ok.test.ts", Globals::Disabled);
         assert_eq!(extraction.tests.len(), 1);
         assert!(!extraction.incomplete);
+    }
+
+    #[test]
+    fn raw_syntax_budget_has_an_exact_independent_boundary() {
+        assert!(parse_refusal(&"!".repeat(MAX_RAW_SYNTAX_UNITS)).is_none());
+        assert!(parse_refusal(&"void ".repeat(MAX_RAW_SYNTAX_UNITS)).is_none());
+        for source in [
+            "!".repeat(MAX_RAW_SYNTAX_UNITS + 1),
+            "void ".repeat(MAX_RAW_SYNTAX_UNITS + 1),
+            format!("'{}'", "!".repeat(MAX_RAW_SYNTAX_UNITS + 1)),
+        ] {
+            assert!(parse_refusal(&source)
+                .unwrap()
+                .contains("raw syntax budget"));
+        }
+        assert!(parse_refusal(&format!("[{}]", vec!["1"; 20_000].join(","))).is_none());
     }
 
     #[test]
