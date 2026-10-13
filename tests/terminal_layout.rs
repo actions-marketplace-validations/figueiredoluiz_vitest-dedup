@@ -328,3 +328,162 @@ fn detection_timing_does_not_change_zero_work_or_incomplete_policy() {
         }
     }
 }
+
+/// All destinations retain the same findings; only successful file-only runs announce paths.
+#[test]
+fn report_announcements_preserve_destinations_stems_and_machine_bytes() {
+    let dir = duplicate_project();
+    let prefix = dir.path().join("nested reports").join("résult.v1");
+    let mut reference = None;
+    for reporters in [
+        "json,html,sarif",
+        "terminal,json,html,sarif",
+        "jsonl,json,html,sarif",
+    ] {
+        let run = Command::cargo_bin("vitest-dedup")
+            .unwrap()
+            .arg(dir.path())
+            .args(["--no-metrics", "--reporters", reporters, "--output"])
+            .arg(&prefix)
+            .output()
+            .unwrap();
+        assert_eq!(run.status.code(), Some(1));
+        // report_path appends extensions, retaining any suffix already present on the stem.
+        let paths: Vec<_> = ["json", "html", "sarif"]
+            .iter()
+            .map(|extension| std::path::PathBuf::from(format!("{}.{extension}", prefix.display())))
+            .collect();
+        let artifacts: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        let report: Value = serde_json::from_slice(&artifacts[0]).unwrap();
+        assert_eq!(report["testsAnalyzed"], 2);
+        assert_eq!(report["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(reference.get_or_insert(artifacts.clone()), &artifacts);
+        let stdout = String::from_utf8(run.stdout).unwrap();
+        if reporters == "json,html,sarif" {
+            let expected = format!(
+                "Reports written to:\n{}",
+                paths
+                    .iter()
+                    .map(|path| format!("  {}\n", path.display()))
+                    .collect::<String>()
+            );
+            assert_eq!(stdout, expected);
+        } else {
+            assert!(!stdout.contains("Reports written to:"));
+            if reporters.starts_with("jsonl") {
+                let records: Vec<Value> = stdout
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0]["type"], "finding");
+                assert_eq!(records[1]["type"], "summary");
+            }
+        }
+    }
+    // JSON succeeds, then HTML fails: no complete-run announcement may be printed.
+    let failed_prefix = dir.path().join("partial");
+    std::fs::create_dir(dir.path().join("partial.html")).unwrap();
+    let run = Command::cargo_bin("vitest-dedup")
+        .unwrap()
+        .arg(dir.path())
+        .args(["--reporters", "json,html", "--output"])
+        .arg(&failed_prefix)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(2));
+    assert!(dir.path().join("partial.json").is_file());
+    assert!(run.stdout.is_empty());
+    assert!(String::from_utf8(run.stderr)
+        .unwrap()
+        .contains("writing report"));
+}
+
+/// Read failures stay early, bounded and visible; truncating display never truncates analysis.
+#[test]
+fn early_read_failures_are_bounded_without_changing_findings() {
+    let dir = duplicate_project();
+    for i in 0..25 {
+        std::fs::write(dir.path().join(format!("bad{i:02}.test.ts")), [0xff]).unwrap();
+    }
+    let run = Command::cargo_bin("vitest-dedup")
+        .unwrap()
+        .arg(dir.path())
+        .args(["--reporters", "jsonl,json", "--output"])
+        .arg(dir.path().join("report"))
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["testsAnalyzed"], 2);
+    assert_eq!(report["filesAnalyzed"], 1);
+    assert_eq!(report["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(report["incompleteCauses"]["filesUnreadable"], 25);
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("vitest-dedup: skipping "))
+            .count(),
+        20
+    );
+    assert_eq!(stderr.matches("... and 5 more read failure(s)").count(), 1);
+    assert!(!String::from_utf8(run.stdout)
+        .unwrap()
+        .contains("read failure"));
+    // An output error must not hide the earlier read diagnostics or their omission count.
+    let blocked = dir.path().join("blocked");
+    std::fs::write(&blocked, "file").unwrap();
+    let run = Command::cargo_bin("vitest-dedup")
+        .unwrap()
+        .arg(dir.path())
+        .args(["--reporters", "json", "--output"])
+        .arg(blocked.join("report"))
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(2));
+    assert!(run.stdout.is_empty());
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    assert!(
+        stderr.find("... and 5 more read failure(s)").unwrap()
+            < stderr.find("creating report directory").unwrap()
+    );
+}
+
+/// Empty-table coverage has its own bounded list and remains an operational zero-work result.
+#[test]
+fn statically_empty_table_diagnostics_bound_file_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..12 {
+        std::fs::write(dir.path().join(format!("empty{i:02}.test.ts")),
+            "import { test, expect } from 'vitest'; test.each([])('empty %s', n => { expect(n).toBe(1); });").unwrap();
+    }
+    let run = Command::cargo_bin("vitest-dedup")
+        .unwrap()
+        .arg(dir.path())
+        .args(["--reporters", "jsonl"])
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(2));
+    let records: Vec<Value> = String::from_utf8(run.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["testsAnalyzed"], 0);
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    assert!(stderr.contains("every declaration found is a statically empty"));
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("  empty"))
+            .count(),
+        10
+    );
+    assert!(stderr.contains("... and 2 more"));
+}

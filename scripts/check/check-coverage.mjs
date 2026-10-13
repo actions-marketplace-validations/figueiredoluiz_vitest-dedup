@@ -128,6 +128,8 @@ const RUST_MODULES = {
   'src/analysis/pairs.rs': 100,
   'src/cli.rs': 98,
   'src/config.rs': 98,
+  // Extracted CLI rendering: measured at 98.72% (308/312 instrumented lines).
+  'src/diagnostics.rs': 98,
   'src/discovery.rs': 94,
   'src/frontend.rs': 100,
   'src/frontend/extract.rs': 98,
