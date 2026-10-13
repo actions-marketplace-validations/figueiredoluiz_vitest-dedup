@@ -426,44 +426,86 @@ pub(super) fn resolve_callee(
     source: &str,
     file: &Path,
 ) -> Option<ResolvedCallee> {
-    match expr {
-        Expression::Identifier(ident) => resolve_identifier(ident, registry, semantic.scoping()),
-        Expression::StaticMemberExpression(member) => resolve_member(
-            &member.object,
-            member.property.name.as_str(),
-            registry,
-            semantic,
-            source,
-            file,
-        ),
-        Expression::CallExpression(inner) => {
-            let resolved = resolve_callee(&inner.callee, registry, semantic, source, file)?;
-            finish_interior_call(resolved, &inner.arguments, semantic, source, file)
-        }
-        Expression::TaggedTemplateExpression(tagged) => {
-            let resolved = resolve_callee(&tagged.tag, registry, semantic, source, file)?;
-            finish_tagged_call(resolved, &tagged.quasi, semantic, source)
-        }
-        Expression::ParenthesizedExpression(paren) => {
-            resolve_callee(&paren.expression, registry, semantic, source, file)
-        }
-        Expression::ChainExpression(chain) => match &chain.expression {
-            ChainElement::CallExpression(inner) => {
-                let resolved = resolve_callee(&inner.callee, registry, semantic, source, file)?;
-                finish_interior_call(resolved, &inner.arguments, semantic, source, file)
+    // Unwind a member/call chain explicitly. Even a shallow-bracket input can contain thousands
+    // of links; recursive resolution previously consumed one native frame for each link.
+    let mut pending = Vec::new();
+    let mut current = expr;
+    let mut resolved = loop {
+        let object_and_property = match current {
+            Expression::Identifier(ident) => {
+                break resolve_identifier(ident, registry, semantic.scoping())?;
             }
-            ChainElement::StaticMemberExpression(member) => resolve_member(
-                &member.object,
-                member.property.name.as_str(),
-                registry,
-                semantic,
-                source,
-                file,
-            ),
-            _ => None,
-        },
-        _ => None,
+            Expression::StaticMemberExpression(member) => {
+                Some((&member.object, member.property.name.as_str()))
+            }
+            Expression::CallExpression(call) => {
+                pending.push(current);
+                current = &call.callee;
+                continue;
+            }
+            Expression::TaggedTemplateExpression(tagged) => {
+                pending.push(current);
+                current = &tagged.tag;
+                continue;
+            }
+            Expression::ParenthesizedExpression(paren) => {
+                current = &paren.expression;
+                continue;
+            }
+            Expression::ChainExpression(chain) => match &chain.expression {
+                ChainElement::CallExpression(call) => {
+                    pending.push(current);
+                    current = &call.callee;
+                    continue;
+                }
+                ChainElement::StaticMemberExpression(member) => {
+                    Some((&member.object, member.property.name.as_str()))
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let (object, property) = object_and_property?;
+        if is_namespace(object, registry, semantic.scoping()) {
+            break ResolvedCallee {
+                root: canonicalize(property)?,
+                fixtures: Vec::new(),
+                fixtures_unresolved: false,
+                steps: Vec::new(),
+            };
+        }
+        pending.push(current);
+        current = object;
+    };
+    for part in pending.into_iter().rev() {
+        match part {
+            Expression::StaticMemberExpression(member) => {
+                resolved
+                    .steps
+                    .push(ChainStep::Member(member.property.name.to_string()));
+            }
+            Expression::CallExpression(call) => {
+                resolved = finish_interior_call(resolved, &call.arguments, semantic, source, file)?;
+            }
+            Expression::TaggedTemplateExpression(tagged) => {
+                resolved = finish_tagged_call(resolved, &tagged.quasi, semantic, source)?;
+            }
+            Expression::ChainExpression(chain) => match &chain.expression {
+                ChainElement::CallExpression(call) => {
+                    resolved =
+                        finish_interior_call(resolved, &call.arguments, semantic, source, file)?;
+                }
+                ChainElement::StaticMemberExpression(member) => {
+                    resolved
+                        .steps
+                        .push(ChainStep::Member(member.property.name.to_string()));
+                }
+                _ => unreachable!("only supported chain elements are queued"),
+            },
+            _ => unreachable!("only member/call/tagged expressions are queued"),
+        }
     }
+    Some(resolved)
 }
 
 fn resolve_identifier(
@@ -508,28 +550,6 @@ fn resolve_identifier(
             }
         }
     }
-}
-
-fn resolve_member(
-    object: &Expression,
-    property: &str,
-    registry: &Registry,
-    semantic: &Semantic<'_>,
-    source: &str,
-    file: &Path,
-) -> Option<ResolvedCallee> {
-    if is_namespace(object, registry, semantic.scoping()) {
-        let canonical = canonicalize(property)?;
-        return Some(ResolvedCallee {
-            root: canonical,
-            fixtures: Vec::new(),
-            fixtures_unresolved: false,
-            steps: Vec::new(),
-        });
-    }
-    let mut resolved = resolve_callee(object, registry, semantic, source, file)?;
-    resolved.steps.push(ChainStep::Member(property.to_owned()));
-    Some(resolved)
 }
 
 fn is_namespace(expr: &Expression, registry: &Registry, scoping: &Scoping) -> bool {
@@ -1042,8 +1062,8 @@ pub fn take_cell_census() -> Vec<(String, u64)> {
     })
 }
 
-#[derive(Default)]
-struct CellCensus {
+#[derive(Clone, Default)]
+pub(super) struct CellCensus {
     counts: HashMap<String, u64>,
     // Spans are unique within one file, even when the Walker rebuilds its table.
     counted: HashSet<(u32, u32)>,
@@ -1072,6 +1092,16 @@ std::thread_local! {
 #[cfg(test)]
 fn with_cell_census<T>(operation: impl FnOnce(&mut CellCensus) -> T) -> T {
     TEST_CELL_CENSUS.with(|census| operation(&mut census.borrow_mut()))
+}
+
+#[cfg(test)]
+pub(super) fn test_cell_census_snapshot() -> CellCensus {
+    with_cell_census(|census| census.clone())
+}
+
+#[cfg(test)]
+pub(super) fn restore_test_cell_census(snapshot: CellCensus) {
+    with_cell_census(|census| *census = snapshot);
 }
 
 #[cfg(test)]

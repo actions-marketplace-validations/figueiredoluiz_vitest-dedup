@@ -1635,6 +1635,9 @@ fn expression_has_effect(expr: &Expression<'_>, depth: u32) -> bool {
 /// map, same as any other parse failure; that only costs import-specifier precision; see
 /// `free_identity`'s fallback.
 pub(super) fn import_origins(source: &str, file: &Path) -> ImportOrigins {
+    if super::extract::parse_refusal(source).is_some() {
+        return HashMap::new();
+    }
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
     if parsed.fatal_error {

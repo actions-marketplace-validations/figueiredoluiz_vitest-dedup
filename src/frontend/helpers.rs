@@ -450,7 +450,7 @@ pub(super) fn with_parsed_file<T>(
     }
     let source =
         crate::discovery::read_bounded(path, crate::discovery::MAX_SOURCE_FILE_BYTES).ok()??;
-    if super::extract::max_nesting_depth(&source) > super::extract::MAX_NESTING_DEPTH {
+    if super::extract::parse_refusal(&source).is_some() {
         return None;
     }
     let allocator = Allocator::default();

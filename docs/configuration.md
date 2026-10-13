@@ -45,3 +45,19 @@ either cause was proved. Known cases, such as statically empty `.each`/`.for` ta
 specific diagnostic. The flag is opt-in because ambient `describe` and `it` cannot be told apart
 from Cypress, Mocha, or Jasmine without project configuration, and guessing would invent findings
 in those files.
+
+## Source resource limits
+
+Source files are limited to 8 MiB. Before parsing, the frontend also refuses lexical bracket
+nesting deeper than 256 and more than 8,192 raw syntax units. The latter counts opening brackets,
+operator/member/label/escape punctuation and recursive control/type keywords, including occurrences in
+strings, comments and regexes. This conservative bound prevents lexical ambiguity from hiding
+stack-exhausting input; a wide generated file or punctuation-heavy literal can therefore exceed
+it even when its actual syntax is shallow. Nonnegative integer payloads and commas do not consume
+units. These are analyzer resource limits, not JavaScript or Vitest restrictions.
+
+Refused files make analysis incomplete and produce diagnostics; findings in other files remain
+available. First-party imported helpers use the same preflight limits. Use
+`--fail-on-incomplete=reads` (or `--fail-on-incomplete`) to make refused input an operational
+failure. Admitted extraction runs on an explicitly sized worker stack; a larger stack alone
+would not protect against unbounded input.
