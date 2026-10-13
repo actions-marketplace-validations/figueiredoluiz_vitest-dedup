@@ -23,43 +23,8 @@ use vitest_dedup::vitest_config::{self, GlobalsDetection};
 use vitest_dedup::vitest_projects;
 use vitest_dedup::{analysis, discovery};
 
-/// A stderr line that is guaranteed to have been sanitized.
-///
-/// Sanitization used to be a *convention*: every site that pushed onto the diagnostics vector was
-/// expected to remember `terminal_safe`, and every site that printed one was expected to know
-/// whether that had already happened. This file held both habits at once -- the per-file
-/// diagnostics sanitized on push and printed raw, the project-map diagnostics pushed raw and
-/// sanitized on print -- which is indistinguishable from a bug when read locally, and is exactly
-/// what a reviewer flagged the print site for. Either habit is one forgotten call away from
-/// letting repository-controlled text forge or visually rewrite a stderr line.
-///
-/// Making it a type moves the guarantee from memory to the compiler. The wrapped `String` is
-/// private to this module, `new` is the only way to build one, and `Display` is the only way to
-/// read it back, so a `Sanitized` that skipped `terminal_safe` cannot be constructed anywhere in
-/// this binary -- including by code written later, which is the case a convention cannot cover.
-mod sanitized {
-    use std::fmt;
-    use vitest_dedup::reporters::terminal_safe;
-
-    /// Sanitized, printable diagnostic text. Construct with [`Sanitized::new`].
-    pub struct Sanitized(String);
-
-    impl Sanitized {
-        /// Sanitizes `raw` for terminal output. `raw` is assumed to be untrusted: a repository
-        /// path, a config value quoted back, or frontend text carrying either.
-        pub fn new(raw: &str) -> Self {
-            Self(terminal_safe(raw))
-        }
-    }
-
-    impl fmt::Display for Sanitized {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(&self.0)
-        }
-    }
-}
-
-use sanitized::Sanitized;
+mod diagnostics;
+use diagnostics::Sanitized;
 
 /// Reads the process's own peak resident set size.
 ///
@@ -116,7 +81,7 @@ fn main() -> ProcessExitCode {
             // The error chain can carry repository-controlled text (a path from a
             // `.with_context` wrapper, a config value quoted back in a validation message):
             // sanitized the same way a reporter would, so it cannot forge or rewrite this line.
-            eprintln!("vitest-dedup: {}", Sanitized::new(&format!("{error:#}")));
+            let _ = diagnostics::write_error(&mut std::io::stderr().lock(), &error);
             process_code(ExitCode::OperationalError)
         }
     }
@@ -281,6 +246,7 @@ fn report_path(prefix: &std::path::Path, extension: &str) -> std::path::PathBuf 
 /// message; the caller maps results to the process exit code.
 fn run() -> Result<ExitCode> {
     let args = ParsedArgs::parse()?;
+    let mut stderr = std::io::stderr().lock();
     let config = Config::load(&args.root, args.to_overrides())?;
 
     // Resolved before any analysis, so an unusable revision, a shallow clone, or a non-repository
@@ -331,7 +297,7 @@ fn run() -> Result<ExitCode> {
     };
     if project_scoping.is_some() {
         for diagnostic in &projects.diagnostics {
-            eprintln!("vitest-dedup: {}", Sanitized::new(diagnostic));
+            writeln!(stderr, "vitest-dedup: {}", Sanitized::new(diagnostic))?;
         }
     }
     // An incomplete project map degrades the run even when every discovered file happens to
@@ -344,7 +310,8 @@ fn run() -> Result<ExitCode> {
     let project_map_incomplete =
         project_scoping.is_some() && (projects.has_unresolved_entries || projects.truncated);
     if project_map_incomplete {
-        eprintln!(
+        writeln!(
+            stderr,
             "vitest-dedup: the Vitest project map is incomplete{}; files it could not attribute \
              were matched against the built-in defaults instead, so a project's `globals` or \
              `include` may have been missed.",
@@ -353,7 +320,7 @@ fn run() -> Result<ExitCode> {
             } else {
                 ""
             }
-        );
+        )?;
     }
 
     let discovered = discovery::discover(&config, project_scoping)?;
@@ -372,10 +339,11 @@ fn run() -> Result<ExitCode> {
                 // this tool generated -- sanitize it before it reaches the terminal, and
                 // relativize it against the analysis root like every other diagnostic path
                 // (S12): absolute here would differ every checkout.
-                eprintln!(
+                writeln!(
+                    stderr,
                     "vitest-dedup: {} sets `test.globals = true`; analyzing ambient declarations.",
                     diagnostic_path(&globals_config, &analysis_root)
-                );
+                )?;
                 Globals::Enabled
             }
             GlobalsDetection::Disabled { .. } => Globals::Disabled,
@@ -393,10 +361,11 @@ fn run() -> Result<ExitCode> {
             GlobalsDetection::Unknown { reason } => {
                 // `reason` may echo back filesystem-derived text (a path, a parse error); sanitize
                 // it for the same reason as the branch above.
-                eprintln!(
+                writeln!(
+                    stderr,
                     "vitest-dedup: could not determine `test.globals` ({}).",
                     Sanitized::new(&reason)
-                );
+                )?;
                 Globals::Disabled
             }
             // `GlobalsDetection` is `#[non_exhaustive]`, so a future variant must not silently
@@ -447,18 +416,19 @@ fn run() -> Result<ExitCode> {
             // baseline's refusal has no equivalent here: there is nothing to refuse, the
             // baseline already is what it is.
             if base_result.incomplete() {
-                eprintln!(
+                writeln!(
+                    stderr,
                     "vitest-dedup: warning: the {} analysis was incomplete, so the \
                      baseline may be partial and the gate stricter than intended.",
                     terminal_safe(revision)
-                );
+                )?;
             }
             let baseline = modes::baseline_from_findings(&base_result.findings);
-            eprintln!(
+            writeln!(stderr,
                 "vitest-dedup: baseline from {}: {} finding(s) in the base revision are treated as accepted.",
                 terminal_safe(revision),
                 baseline.total()
-            );
+            )?;
             Some(baseline)
         }
         None => None,
@@ -498,6 +468,7 @@ fn run() -> Result<ExitCode> {
     // frontend, so reporting it as analyzed overstates coverage on exactly the runs where coverage
     // matters most.
     let mut files_read = 0usize;
+    let mut read_errors = 0usize;
     // Discovery sets `incomplete` for files it refused to read (oversized, unsupported language).
     // Those reasons were previously dropped, leaving the flag with no explanation behind it.
     for skipped in &discovered.skipped {
@@ -559,19 +530,27 @@ fn run() -> Result<ExitCode> {
             Ok(Some(source)) => source,
             Ok(None) => {
                 // `file.path` is a repository-controlled filename: sanitize before printing.
-                eprintln!(
-                    "vitest-dedup: skipping {}: exceeds the {} byte limit",
-                    diagnostic_path(&file.path, &config.root),
-                    discovery::MAX_SOURCE_FILE_BYTES
-                );
+                diagnostics::write_read_error(
+                    &mut stderr,
+                    &mut read_errors,
+                    &format!(
+                        "skipping {}: exceeds the {} byte limit",
+                        display_relative(&file.path, &config.root),
+                        discovery::MAX_SOURCE_FILE_BYTES,
+                    ),
+                )?;
                 causes.files_too_large += 1;
                 continue;
             }
             Err(error) => {
-                eprintln!(
-                    "vitest-dedup: skipping {}: {error}",
-                    diagnostic_path(&file.path, &config.root)
-                );
+                diagnostics::write_read_error(
+                    &mut stderr,
+                    &mut read_errors,
+                    &format!(
+                        "skipping {}: {error}",
+                        display_relative(&file.path, &config.root),
+                    ),
+                )?;
                 causes.files_unreadable += 1;
                 continue;
             }
@@ -727,6 +706,8 @@ fn run() -> Result<ExitCode> {
 
     drop(seen_helper_sources);
 
+    diagnostics::write_read_omissions(&mut stderr, read_errors)?;
+
     // The worst failure this tool had: a `globals: true` project analyzed without the flag yielded
     // zero tests and an otherwise clean report, which was indistinguishable from success. Discovery
     // found test-shaped files, so extracting nothing from all of them is never a normal outcome.
@@ -751,11 +732,12 @@ fn run() -> Result<ExitCode> {
         // Deliberately not guessing a single culprit: an `include` glob matching nothing and a
         // root holding no tests produce the same observation, and the diagnostics below carry
         // anything more specific discovery knows.
-        eprintln!(
+        writeln!(
+            stderr,
             "\nvitest-dedup: discovered no test file(s) under the analysis root.\n\
              This is not a clean result -- nothing was analyzed. The usual causes are an \
              `include` glob that matches no files, or a root that holds no tests."
-        );
+        )?;
         causes.nothing_read = true;
     } else if total_tests == 0 {
         if files_read > 0 {
@@ -769,31 +751,30 @@ fn run() -> Result<ExitCode> {
             // explanation applies to at least that file, and must not be suppressed by another
             // file's unrelated, fully-explained emptiness.
             if proven_empty_files.len() == files_read {
-                eprintln!(
+                writeln!(
+                    stderr,
                     "\nvitest-dedup: discovered {} test file(s) but extracted no tests.\n\
                      This is not a clean result -- nothing was analyzed. But this is not the \
                      usual `test.globals` failure: every declaration found is a statically \
                      empty `.each`/`.for` table (`test.each([])`, `describe.each([])`, ...), \
                      which Vitest itself runs zero times -- it reports \"No test suite found in \
-                     file\" for exactly this shape, not a clean pass. Affected file(s):\n{}",
+                     file\" for exactly this shape, not a clean pass. Affected file(s):",
                     discovered.files.len(),
-                    proven_empty_files
-                        .iter()
-                        .map(|path| format!("  {}", diagnostic_path(path, &config.root)))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
+                )?;
+                diagnostics::write_empty_files(&mut stderr, &proven_empty_files, &config.root)?;
             } else if !tests.is_empty() {
-                eprintln!(
+                writeln!(
+                    stderr,
                     "\nvitest-dedup: discovered {} test file(s) but extracted only suite \
                      containers and no executable tests.\n\
                      This is not a clean result -- nothing was analyzed. Add an executable \
                      `test`/`it`/`bench` declaration, or check why the suite's expected children \
                      were not present in the source this static analyzer reads.",
                     discovered.files.len()
-                );
+                )?;
             } else {
-                eprintln!(
+                writeln!(
+                    stderr,
                     "\nvitest-dedup: discovered {} test file(s) but extracted no tests.\n\
                      This is not a clean result -- nothing was analyzed. The analyzer extracted \
                      no tests from the files that were read. Check whether the project \
@@ -801,15 +782,16 @@ fn run() -> Result<ExitCode> {
                      build-time transform such as `unplugin-auto-import` injects Vitest APIs \
                      that are absent from the source this static analyzer reads.",
                     discovered.files.len()
-                );
+                )?;
             }
         } else {
-            eprintln!(
+            writeln!(
+                stderr,
                 "\nvitest-dedup: discovered {} test file(s) but could not read any of them.\n\
                  This is not a clean result -- nothing was analyzed. See the diagnostic(s) below \
                  for why each file could not be read.",
                 discovered.files.len()
-            );
+            )?;
         }
         causes.nothing_read = true;
     }
@@ -909,13 +891,14 @@ fn run() -> Result<ExitCode> {
             );
         }
         let update = modes::write_baseline(path, &result.findings)?;
-        eprintln!(
+        writeln!(
+            stderr,
             "vitest-dedup: wrote baseline {}: {} finding(s) recorded ({} added, {} removed).",
             Sanitized::new(&path.display().to_string()),
             update.recorded,
             update.added,
             update.removed
-        );
+        )?;
         modes::mark_all_baselined(&mut result);
     }
     let result = result;
@@ -996,136 +979,27 @@ fn run() -> Result<ExitCode> {
     // guess where its report went. Announcing paths on stdout is safe here because this branch is
     // only reached when no stdout reporter ran.
     if !written.is_empty() && !args.reporters.iter().any(|r| r.writes_to_stdout()) {
-        for path in &written {
-            // Echoed to stdout, which a caller may parse: sanitize the same way a reporter
-            // would, so a crafted `--output` value cannot forge or rewrite this line.
-            writeln!(stdout, "{}", Sanitized::new(&path.display().to_string()))?;
-        }
+        diagnostics::write_reports_written(&mut stdout, &written)?;
     }
     stdout.flush()?;
 
-    // Written to stderr, never stdout: a machine reporter owns stdout and must stay parseable.
-    // Bounded, because a corpus with thousands of degraded files would otherwise bury the report
-    // it is meant to qualify.
-    // The remaining source of `incomplete` is a test whose ambient context could not be resolved.
-    // Scattered across files, that is a property of individual tests and the actionable figure is
-    // how much of the corpus it covers -- so this line counts rather than lists. Where the
-    // exclusions are not scattered but account for EVERY test in a file, the count is no longer
-    // enough, and the block below names those files: see its comment for why the two need
-    // different treatment.
-    if unresolved_tests > 0 {
-        eprintln!(
-            "\nvitest-dedup: {unresolved_tests} of {total_tests} test(s) had an unresolved \
-             context and were excluded from comparison; absence of a finding for them proves \
-             nothing."
-        );
-    }
-
-    // Named, where the corpus-wide count above is only counted. A partially excluded file still
-    // appears in the report and its findings carry the qualification with them; a wholly excluded
-    // one produces nothing and so appears NOWHERE, which is indistinguishable from a file that was
-    // compared and came back clean. The count cannot surface that -- 620 of 24,147 reads as a
-    // rounding error until one notices it is every test in 35 particular files.
-    //
-    // Bounded like every other list this binary prints, and sorted worst-first by `analyze`, so a
-    // truncated list still names the files that cost the most coverage.
-    if !result.blind_files.is_empty() {
-        const MAX_LISTED: usize = 10;
-        let total_blind: usize = result.blind_files.iter().map(|file| file.tests).sum();
-        eprintln!(
-            "\nvitest-dedup: {} file(s) had EVERY test excluded ({total_blind} test(s) in \
-             total). They produced no findings, so they appear nowhere above -- this report has \
-             not cleared them:",
-            result.blind_files.len()
-        );
-        for file in result.blind_files.iter().take(MAX_LISTED) {
-            // Analyzed-repository text on a stream a caller may read: sanitized exactly as a
-            // reporter sanitizes a finding's path.
-            eprintln!(
-                "  {} ({} test(s))",
-                Sanitized::new(&file.path.display().to_string()),
-                file.tests
-            );
-        }
-        if let Some(remaining) = result.blind_files.len().checked_sub(MAX_LISTED) {
-            if remaining > 0 {
-                eprintln!("  ... and {remaining} more");
-            }
-        }
-    }
-
-    if let (Some(revision), Some(changed)) = (&args.changed_since, changed_files.as_ref()) {
-        // `revision` is argv, which is caller-controlled text; sanitized like every other value
-        // echoed to a stream.
-        eprintln!(
-            "\nvitest-dedup: --changed-since {} scoped this report to {} changed file(s). The \
-             whole corpus was still analyzed, so a cross-file duplicate with a twin in an \
-             unchanged file is still reported.",
-            Sanitized::new(revision),
-            changed.len()
-        );
-        if changed.is_empty() {
-            eprintln!(
-                "vitest-dedup: nothing changed since that revision, so no finding could be \
-                 reported. This is not evidence the repository is clean."
-            );
-        }
-        if result.modes.withheld_unchanged > 0 {
-            eprintln!(
-                "vitest-dedup: {} finding(s) lying entirely within unchanged files were withheld \
-                 from this report; the run is marked incomplete because of it.",
-                result.modes.withheld_unchanged
-            );
-        }
-    }
-
-    if let Some(path) = args.baseline.as_ref().filter(|_| !args.update_baseline) {
-        eprintln!(
-            "\nvitest-dedup: baseline {} accounted for {} finding(s), which are reported but do \
-             not affect the quality gate. {} finding(s) are not in it.",
-            Sanitized::new(&path.display().to_string()),
-            result.modes.baselined,
-            result.modes.new_findings
-        );
-    }
-
-    if !diagnostics.is_empty() {
-        const MAX_SHOWN: usize = 20;
-        // `diagnostics.len()` is a count of individual diagnostic messages, not of files -- one
-        // file can contribute several (a skip, plus one entry per extraction-time issue), so the
-        // two numbers disagree in general. `diagnostic_files` is the actual file count; a
-        // discovery-level traversal error contributes to the former but not the latter, since it
-        // is not attributable to one file.
-        if diagnostic_files.is_empty() {
-            eprintln!(
-                "\nvitest-dedup: {} diagnostic(s) recorded during analysis:",
-                diagnostics.len()
-            );
-        } else {
-            eprintln!(
-                "\nvitest-dedup: {} diagnostic(s) across {} file(s) could not be fully analyzed:",
-                diagnostics.len(),
-                diagnostic_files.len()
-            );
-        }
-        for diagnostic in diagnostics.iter().take(MAX_SHOWN) {
-            eprintln!("  {diagnostic}");
-        }
-        if diagnostics.len() > MAX_SHOWN {
-            eprintln!("  ... and {} more", diagnostics.len() - MAX_SHOWN);
-        }
-    }
-
-    // T1's census (backlog): `VD_CELL_CENSUS=1` histograms why every unreadable `.each` cell was
-    // refused, worst cause first. stderr and last, so it never interleaves with a machine
-    // reporter's stdout. Empty -- and free -- on every run without the variable.
     let census = frontend::take_cell_census();
-    if !census.is_empty() {
-        eprintln!("\nvitest-dedup: unreadable `.each` cell census (VD_CELL_CENSUS):");
-        for (cause, count) in &census {
-            eprintln!("  {count:6}  {cause}");
-        }
-    }
+    diagnostics::write_run(
+        &mut stderr,
+        &diagnostics::RunDiagnostics {
+            result: &result,
+            unresolved_tests,
+            total_tests,
+            changed: args
+                .changed_since
+                .as_deref()
+                .zip(changed_files.as_ref().map(BTreeSet::len)),
+            baseline: args.baseline.as_deref().filter(|_| !args.update_baseline),
+            diagnostics: &diagnostics,
+            files_with_diagnostics: diagnostic_files.len(),
+            census: &census,
+        },
+    )?;
 
     Ok(exit_code)
 }

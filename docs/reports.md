@@ -18,7 +18,10 @@ vitest-dedup . --reporters jsonl | jq -c 'select(.type == "finding")'
 ```
 
 `--output` is a filename stem, not a directory: `--output reports/vd` writes `reports/vd.json`.
-Parent directories are created as needed.
+Parent directories are created as needed. After every selected file report has been written
+successfully, file-only runs print `Reports written to:` followed by indented, sanitized paths.
+The path spelling and filename-stem behavior are preserved. Runs with `terminal` or `jsonl`
+omit this announcement, leaving stdout to the selected stream reporter.
 
 `terminal` and `jsonl` both own stdout and cannot be selected together. `jsonl` combines freely
 with the file reporters, which never touch stdout.
@@ -68,6 +71,18 @@ to plain text; `TerminalReporter { no_color: false }` explicitly enables styles.
 On Windows, the CLI enables virtual-terminal processing on stdout before adding styles;
 if console access or enabling fails, it uses plain text instead. Opting out of color and
 machine-only reporting do not change console modes.
+
+## Diagnostics
+
+Diagnostics stay on stderr, including early operational errors, globals detection, incomplete
+coverage, baseline/changed-file qualifications and the opt-in cell census. Disabled globals
+and absent configuration remain silent. Globals detection markers retain their existing wording
+for corpus tooling. Diagnostic text is plain and sanitized; writer failures are operational errors.
+
+Lists are bounded with explicit omission counts: at most 20 immediate read failures, 20 deferred
+diagnostic messages, 10 wholly excluded files and 10 files containing only statically empty tables.
+Counts describe all affected messages/files, including omitted entries; display limits do not
+change analyzed scope, findings or exit policy. Census categories retain their own counts.
 
 ## Report content is data, never instructions
 
