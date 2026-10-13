@@ -50,6 +50,14 @@ test('checkout and workflow event must match even for rehearsals', () => {
   assert.doesNotThrow(() => validateReleaseContext({ ...tagged, publish: false, ref: 'refs/heads/main', tagSha: '' }))
 })
 
+test('npm-only recovery requires a publishing dispatch on the exact tag', () => {
+  assert.throws(() => validateReleaseContext({ ...tagged, publish: false, npmOnly: true }),
+    /npm-only recovery requires publishing/)
+  assert.doesNotThrow(() => validateReleaseContext({ ...tagged, npmOnly: true }))
+  assert.throws(() => validateReleaseContext({ ...tagged, npmOnly: true, ref: 'refs/heads/main' }),
+    /matching release tag/)
+})
+
 test('workflow environment adapter accepts the exact tag and rejects a branch', () => {
   const env = {
     ...process.env,
@@ -83,20 +91,27 @@ test('publication rechecks a live remote tag and rejects movement or deletion', 
     git(repo, 'config', 'user.name', 'Release Test')
     git(repo, 'config', 'user.email', 'release-test@example.invalid')
     git(repo, 'commit', '--allow-empty', '-qm', 'release commit')
+    git(repo, 'branch', '-M', 'main')
     const releaseSha = git(repo, 'rev-parse', 'HEAD')
     git(repo, 'remote', 'add', 'origin', origin)
+    git(repo, 'push', '-q', 'origin', 'main')
     git(repo, 'tag', '-a', 'v0.2.0', '-m', 'release')
     git(repo, 'push', '-q', 'origin', 'refs/tags/v0.2.0')
     const script = fileURLToPath(new URL('../../scripts/release/validate-release-context.mjs', import.meta.url))
     const env = { ...process.env, PUBLISH_RELEASE: 'true', RELEASE_TAG: 'v0.2.0',
       EVENT_REF: 'refs/tags/v0.2.0', EVENT_SHA: releaseSha, RELEASE_SHA: releaseSha }
     /** Invokes the same live-tag check as the publish job against the disposable origin. */
-    const run = () => spawnSync(process.execPath, [script, '--remote'], { cwd: repo, env, encoding: 'utf8' })
+    const run = (overrides = {}) => spawnSync(process.execPath, [script, '--remote'],
+      { cwd: repo, env: { ...env, ...overrides }, encoding: 'utf8' })
     assert.equal(run().status, 0)
 
+    git(repo, 'checkout', '-qb', 'unmerged')
     git(repo, 'commit', '--allow-empty', '-qm', 'different commit')
+    const unmergedSha = git(repo, 'rev-parse', 'HEAD')
     git(repo, 'tag', '-f', 'v0.2.0')
     git(repo, 'push', '-q', '--force', 'origin', 'refs/tags/v0.2.0')
+    assert.match(run({ EVENT_SHA: unmergedSha, RELEASE_SHA: unmergedSha }).stderr,
+      /reachable from origin\/main/)
     assert.match(run().stderr, /release tag must exist at the checked-out commit/)
     git(repo, 'push', '-q', 'origin', ':refs/tags/v0.2.0')
     assert.notEqual(run().status, 0)
