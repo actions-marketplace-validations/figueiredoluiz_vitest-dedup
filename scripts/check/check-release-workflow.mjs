@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Guard for `.github/workflows/release.yml`, which is otherwise exercised for the first time only
-// when a tag is pushed -- the worst possible moment to discover it is broken.
+// Guard for `.github/workflows/release.yml`, whose publication path is otherwise exercised only
+// by a manual dispatch from a release tag -- the worst moment to discover it is broken.
 //
 // This checks two independent things that nothing in CI previously touched:
 //
@@ -47,6 +47,7 @@ const targetsMjsPath = join(repoRoot, 'npm', 'lib', 'targets.mjs')
 const prebuiltTargetsPath = join(repoRoot, 'npm', 'prebuilt-targets.json')
 
 const failures = []
+/** Records each workflow or target-manifest violation for one consolidated failure report. */
 const fail = (msg) => failures.push(msg)
 
 const releaseYml = readFileSync(releaseYmlPath, 'utf8')
@@ -95,6 +96,7 @@ if (payloads.length === 0) {
   console.log(`extracted ${payloads.length} 'node -e' payload(s) from release.yml`)
 }
 
+/** Executes an extracted workflow payload in its real working-directory shape. */
 function runPayload(label, invocation, cwd) {
   let stdout
   try {
