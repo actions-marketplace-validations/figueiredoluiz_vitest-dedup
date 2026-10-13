@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode as ProcessExitCode;
 use vitest_dedup::cli::{ExitCode, ParsedArgs, ReporterKind};
@@ -929,7 +929,14 @@ fn run() -> Result<ExitCode> {
     let mut written = Vec::new();
     for reporter in &args.reporters {
         match reporter {
-            ReporterKind::Terminal => TerminalReporter::new().write_report(&result, &mut stdout)?,
+            ReporterKind::Terminal => {
+                let color = terminal_color_enabled(
+                    stdout.is_terminal(),
+                    std::env::var_os("NO_COLOR").as_deref(),
+                    enable_stdout_ansi,
+                );
+                TerminalReporter { no_color: !color }.write_report(&result, &mut stdout)?;
+            }
             ReporterKind::Jsonl => jsonl_reporter.write_report(&result, &mut stdout)?,
             ReporterKind::Json | ReporterKind::Html | ReporterKind::Sarif => {
                 let extension = reporter
@@ -1165,10 +1172,69 @@ fn final_exit_code(
     analysis::exit_code(result, config)
 }
 
+/// Color requires an eligible TTY and working ANSI support; opt-outs avoid console mutation.
+fn terminal_color_enabled(
+    is_terminal: bool,
+    no_color: Option<&std::ffi::OsStr>,
+    enable_ansi: impl FnOnce() -> bool,
+) -> bool {
+    is_terminal && !no_color.is_some_and(|value| !value.is_empty()) && enable_ansi()
+}
+
+/// Enables VT on Windows stdout only, falling back to plain text on any console error.
+fn enable_stdout_ansi() -> bool {
+    #[cfg(windows)]
+    {
+        winapi_util::console::Console::stdout()
+            .and_then(|mut console| console.set_virtual_terminal_processing(true))
+            .is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use vitest_dedup::config::ConfigOverrides;
+
+    /// Every TTY/NO_COLOR combination follows the same policy as CukeDedup.
+    #[test]
+    fn terminal_color_requires_tty_and_respects_no_color() {
+        use std::ffi::OsStr;
+        for (value, allows_color) in [(None, true), (Some(""), true), (Some("0"), false)] {
+            assert_eq!(
+                terminal_color_enabled(true, value.map(OsStr::new), || true),
+                allows_color
+            );
+            assert!(!terminal_color_enabled(
+                false,
+                value.map(OsStr::new),
+                || true
+            ));
+        }
+    }
+
+    /// A console that cannot process ANSI must use plain output even when it is a TTY.
+    #[test]
+    fn terminal_color_falls_back_when_ansi_cannot_be_enabled() {
+        use std::ffi::OsStr;
+        for is_terminal in [false, true] {
+            for (value, allows_color) in [(None, true), (Some(""), true), (Some("1"), false)] {
+                for ansi_available in [false, true] {
+                    let mut attempted = false;
+                    let color = terminal_color_enabled(is_terminal, value.map(OsStr::new), || {
+                        attempted = true;
+                        ansi_available
+                    });
+                    assert_eq!(attempted, is_terminal && allows_color);
+                    assert_eq!(color, is_terminal && allows_color && ansi_available);
+                }
+            }
+        }
+    }
 
     // -- End-to-end: carrying an `includeSource` project's `globals` through to analysis -----
     //
