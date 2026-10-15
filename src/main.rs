@@ -2499,9 +2499,9 @@ mod tests {
     }
 
     /// The review-found geometry: the analysis root is a SUBDIRECTORY of the git repository.
-    /// `ls-tree` run from there lists paths relative to it, while `cat-file commit:path`
-    /// resolves from the repository root -- without the `./` form the base read silently reads
-    /// the wrong paths (or fails), and the baseline would be computed from nothing. Pinned from
+    /// `ls-tree` run from there lists paths relative to it; a read that resolved those paths from
+    /// the repository root would silently read the wrong files (or fail), and the baseline would
+    /// be computed from nothing. Blobs are now read by the object id `ls-tree` lists. Pinned from
     /// `src/`: a committed duplicate pair under a subdirectory must still be accepted from the
     /// base revision.
     #[test]
@@ -2560,6 +2560,39 @@ mod tests {
             stderr.contains("invalid --baseline-from-ref revision"),
             "{stderr}"
         );
+    }
+
+    /// Refusals keep listing order: an oversized base file listed before an unreadable entry (a
+    /// gitlink named like a test file) still gets its skip line before the run fails, as it did
+    /// when each file was read in turn.
+    #[test]
+    fn baseline_from_ref_reports_earlier_skips_before_a_later_refusal() {
+        let directory = single_file_project("c-ok.test.ts", DUPLICATE_PAIR);
+        let root = directory.path();
+        std::fs::write(root.join("a-huge.test.ts"), "x".repeat(8 * 1024 * 1024 + 1)).unwrap();
+        init_repository(root);
+        // A gitlink's commit need not exist in this repository.
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                "1234567890123456789012345678901234567890",
+                "b-vendor.test.ts",
+            ],
+        );
+        git(root, &["commit", "-qm", "gitlink"]);
+        let (code, _, stderr) = run_cli(root, &["--baseline-from-ref", "HEAD"]);
+        assert_eq!(code, Some(2), "{stderr}");
+        let skip = stderr
+            .find("skipping a-huge.test.ts in the base revision: exceeds the byte limit")
+            .unwrap_or_else(|| panic!("the earlier skip is reported: {stderr}"));
+        let refusal = stderr
+            .find("git failed while reading base file `b-vendor.test.ts`")
+            .unwrap_or_else(|| panic!("the gitlink is refused: {stderr}"));
+        assert!(skip < refusal, "skip before refusal: {stderr}");
     }
 
     #[test]
