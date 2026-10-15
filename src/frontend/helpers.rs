@@ -59,14 +59,14 @@
 //!
 //! ## Cost
 //!
-//! Each inline decision reads and parses the helper file, and the `alpha` rendering reads and
-//! parses it again (`structural` never inlines -- see `fingerprint.rs`'s
-//! `try_inline_imported_helper` for why). The test file's own imports are parsed once per file
-//! (`fingerprint.rs`'s `with_file_import_origins`); helper files are deliberately not memoized:
-//! a cache would add a staleness class (the filesystem changing under a long run) to save work
-//! that only files with imported helper calls pay at all. The worst input -- an installed package's dist file, parsed per call site -- is
-//! refused before it is read (see the guards). Nothing here is retained after a rendering
-//! returns.
+//! Each inline decision parses the helper file, and the `alpha` rendering parses it again
+//! (`structural` never inlines -- see `fingerprint.rs`'s `try_inline_imported_helper` for why).
+//! The test file's own imports are parsed once per file (`fingerprint.rs`'s
+//! `with_file_import_origins`). A helper file is read and admission-checked once per version
+//! ([`admitted_source`]): the admitted text is kept process-wide, revalidated on every lookup
+//! by length and modification time so a rewritten helper is read again, and capped in total.
+//! Parsed trees are not kept. The worst input -- an installed package's dist file -- is refused
+//! before it is read (see the guards).
 //!
 //! ## `vi.mock` interplay
 //!
@@ -428,7 +428,8 @@ fn is_dependency(path: &Path) -> bool {
         .any(|component| component.as_os_str() == "node_modules")
 }
 
-/// Reads and parses `path`, then runs `visit` on the program and its source while the arena that
+/// Parses `path`'s admitted source (read once per file version, see [`admitted_source`]), then
+/// runs `visit` on the program and its source while the arena that
 /// owns every AST node is still alive. This closure shape *is* the lifetime discipline: a
 /// `Program` cannot outlive its `Allocator`, so locate-and-use happens inside one call frame and
 /// no `Program` reference ever escapes. `None` from the read, the parse, or `visit` itself is a
@@ -447,11 +448,7 @@ pub(super) fn with_parsed_file<T>(
     if is_dependency(path) {
         return None;
     }
-    let source =
-        crate::discovery::read_bounded(path, crate::discovery::MAX_SOURCE_FILE_BYTES).ok()??;
-    if super::extract::parse_refusal(&source).is_some() {
-        return None;
-    }
+    let source = admitted_source(path)?;
     let allocator = Allocator::default();
     // Use the resolved helper extension, so .ts casts and .tsx JSX keep their own syntax.
     let parsed = Parser::new(&allocator, &source, SourceType::from_path(path).ok()?).parse();
@@ -459,6 +456,129 @@ pub(super) fn with_parsed_file<T>(
         return None;
     }
     visit(&parsed.program, &source)
+}
+
+/// Total helper source text [`admitted_source`] keeps. Past it, files are read uncached, exactly
+/// as before the cache existed.
+const MAX_CACHED_HELPER_BYTES: usize = 64 * 1024 * 1024;
+
+/// How recent a modification time must be before [`admitted_source`] stops trusting it. On a
+/// filesystem with coarse timestamps (HFS+ 1 s, FAT 2 s, some network mounts) a same-length
+/// rewrite inside one tick keeps the old stamp, so a file modified this recently is read afresh
+/// every time, the same way Git re-checks racily clean index entries.
+const RACY_MODIFICATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The metadata a cached helper entry is valid for. A file whose length or modification time
+/// differs is read again, so a rewritten helper is not served from an old copy. A same-length
+/// rewrite that also restores the old modification time is not detected; that needs a content
+/// comparison, which would cost the read this cache exists to avoid.
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+/// Admitted helper sources (or refusals) keyed by path, with the bytes they hold.
+#[derive(Default)]
+struct HelperSources {
+    entries: std::collections::HashMap<PathBuf, (FileStamp, Option<std::sync::Arc<str>>)>,
+    bytes: usize,
+}
+
+/// Process-wide, so every test file calling the same helper shares one read; a `Mutex` keeps it
+/// sound once extraction runs on several threads.
+static HELPER_SOURCES: std::sync::Mutex<Option<HelperSources>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of helper files this thread actually read.
+    static HELPER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns `path`'s source when it is admitted for parsing (readable, within the size bound and
+/// the raw syntax budget), or `None` for a refusal. Each distinct file version is read and
+/// checked once; later calls reuse the answer while the file's length and modification time are
+/// unchanged. A file without a readable modification time, or modified within
+/// [`RACY_MODIFICATION_WINDOW`], is never cached.
+fn admitted_source(path: &Path) -> Option<std::sync::Arc<str>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let settled = |modified: &std::time::SystemTime| {
+        modified
+            .elapsed()
+            .is_ok_and(|age| age > RACY_MODIFICATION_WINDOW)
+    };
+    let stamp = metadata
+        .modified()
+        .ok()
+        .filter(settled)
+        .map(|modified| FileStamp {
+            len: metadata.len(),
+            modified,
+        });
+    let lock = || {
+        HELPER_SOURCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some(stamp) = &stamp {
+        let cached = lock().as_ref().and_then(|sources| {
+            sources
+                .entries
+                .get(path)
+                .filter(|(cached, _)| cached == stamp)
+                .map(|(_, source)| source.clone())
+        });
+        if let Some(source) = cached {
+            return source;
+        }
+    }
+    // A read error is not a property of the file version (permissions, transient I/O), so it is
+    // refused without being remembered and the next lookup tries again.
+    let source = read_admitted(path).ok()?;
+    if let Some(stamp) = stamp {
+        let mut guard = lock();
+        let sources = guard.get_or_insert_with(HelperSources::default);
+        sources.remember(path, stamp, source.clone(), MAX_CACHED_HELPER_BYTES);
+    }
+    source
+}
+
+impl HelperSources {
+    /// Records `source` for `path` at `stamp` when it fits under `cap`. Any older version of the
+    /// path is dropped first: it can never be served again, so keeping it would only hold bytes.
+    fn remember(
+        &mut self,
+        path: &Path,
+        stamp: FileStamp,
+        source: Option<std::sync::Arc<str>>,
+        cap: usize,
+    ) {
+        if let Some((_, old)) = self.entries.remove(path) {
+            self.bytes -= old.map_or(0, |old| old.len());
+        }
+        let held = source.as_ref().map_or(0, |source| source.len());
+        if self.bytes + held <= cap {
+            self.bytes += held;
+            self.entries.insert(path.to_path_buf(), (stamp, source));
+        }
+    }
+}
+
+/// Reads `path` and applies the admission checks every helper parse needs: `Ok(Some)` admitted,
+/// `Ok(None)` a refusal decided by the file's content (over the size bound, over the raw syntax
+/// budget), `Err` a read that failed and says nothing about the content.
+fn read_admitted(path: &Path) -> std::io::Result<Option<std::sync::Arc<str>>> {
+    #[cfg(test)]
+    HELPER_READS.with(|reads| reads.set(reads.get() + 1));
+    let Some(source) =
+        crate::discovery::read_bounded(path, crate::discovery::MAX_SOURCE_FILE_BYTES)?
+    else {
+        return Ok(None);
+    };
+    if super::extract::parse_refusal(&source).is_some() {
+        return Ok(None);
+    }
+    Ok(Some(std::sync::Arc::from(source)))
 }
 
 /// What [`find_export`] found: either the callable declaration in this file, or one more named
@@ -665,6 +785,184 @@ fn bindable_parameters(callable: &Callable<'_>) -> Option<usize> {
 mod tests {
     use super::export_contract::{resolve_export, ExportRefusal};
     use super::*;
+
+    /// Returns how many helper files this thread has read so far.
+    fn helper_reads() -> usize {
+        HELPER_READS.with(std::cell::Cell::get)
+    }
+
+    /// Writes `text` to `path` and sets its modification time to `modified`.
+    fn write_at(path: &Path, text: &str, modified: std::time::SystemTime) {
+        std::fs::write(path, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    /// A modification time old enough for the cache to trust.
+    fn settled_time() -> std::time::SystemTime {
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600)
+    }
+
+    /// One helper file is read once however many call sites ask about it (P4): every inline
+    /// decision used to re-read and re-scan the file, which dominated helper-heavy runs.
+    #[test]
+    fn a_helper_file_is_read_once_across_repeated_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("helpers.ts");
+        write_at(
+            &helper,
+            "export function add(a, b) { return a + b; }",
+            settled_time(),
+        );
+        let before = helper_reads();
+        for _ in 0..20 {
+            assert_eq!(locate(&helper, "add"), Some(2));
+        }
+        assert_eq!(
+            helper_reads() - before,
+            1,
+            "20 lookups of one unchanged helper"
+        );
+    }
+
+    /// A helper rewritten in place is read again, even when the rewrite keeps the old
+    /// modification time: the length alone tells the versions apart.
+    #[test]
+    fn a_rewritten_helper_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("helpers.ts");
+        let modified = settled_time();
+        write_at(&helper, "export function add(a) { return a; }", modified);
+        assert_eq!(locate(&helper, "add"), Some(1));
+        write_at(
+            &helper,
+            "export function add(a, b) { return a + b; }",
+            modified,
+        );
+        assert_eq!(
+            locate(&helper, "add"),
+            Some(2),
+            "the rewritten helper's arity"
+        );
+    }
+
+    /// A recently modified file is never cached: on a coarse-timestamp filesystem a same-length
+    /// rewrite inside one tick keeps the old stamp, so only a re-read sees the new text.
+    #[test]
+    fn a_recently_modified_helper_is_read_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("helpers.ts");
+        let tick = std::time::SystemTime::now();
+        let two = "export function add(a, b) { return a + b; }";
+        let one = "export function add(a) { return a + 1001; }";
+        assert_eq!(two.len(), one.len(), "the rewrite keeps the length");
+        write_at(&helper, two, tick);
+        assert_eq!(locate(&helper, "add"), Some(2));
+        write_at(&helper, one, tick);
+        assert_eq!(
+            locate(&helper, "add"),
+            Some(1),
+            "same length, same stamp, new text"
+        );
+    }
+
+    /// A read error is not remembered: a helper that becomes readable again is admitted even
+    /// though its length and modification time never changed (`chmod` touches neither).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_error_is_retried_rather_than_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("helpers.ts");
+        write_at(
+            &helper,
+            "export function add(a, b) { return a + b; }",
+            settled_time(),
+        );
+        let set_mode = |mode| {
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o000);
+        if std::fs::read(&helper).is_ok() {
+            set_mode(0o644);
+            return; // running as root: permissions cannot make the file unreadable here
+        }
+        assert_eq!(
+            locate(&helper, "add"),
+            None,
+            "an unreadable helper is refused"
+        );
+        set_mode(0o644);
+        assert_eq!(
+            locate(&helper, "add"),
+            Some(2),
+            "and admitted once readable again"
+        );
+    }
+
+    /// The cap bounds held bytes, and a version the cap rejects also evicts the path's older,
+    /// unservable version instead of leaving it counted.
+    #[test]
+    fn the_cache_cap_evicts_a_replaced_version_it_cannot_hold() {
+        let stamp = |len| FileStamp {
+            len,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+        };
+        let text = |s: &str| Some(std::sync::Arc::<str>::from(s));
+        let mut sources = HelperSources::default();
+        let a = Path::new("/a.ts");
+        sources.remember(a, stamp(6), text("abcdef"), 10);
+        assert_eq!(sources.bytes, 6);
+        sources.remember(a, stamp(12), text("abcdefghijkl"), 10);
+        assert!(!sources.entries.contains_key(a), "the old version is gone");
+        assert_eq!(sources.bytes, 0, "and so are its bytes");
+        sources.remember(Path::new("/b.ts"), stamp(8), text("abcdefgh"), 10);
+        sources.remember(Path::new("/c.ts"), stamp(3), text("abc"), 10);
+        assert_eq!(sources.bytes, 8, "a file past the cap is not held");
+        sources.remember(Path::new("/d.ts"), stamp(1), None, 10);
+        assert!(
+            sources.entries.contains_key(Path::new("/d.ts")),
+            "refusals cost no bytes"
+        );
+    }
+
+    /// A refused helper stays refused and is not re-read while unchanged; an installed package
+    /// is never read at all.
+    #[test]
+    fn refusals_are_cached_and_dependencies_are_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = dir.path().join("refused.ts");
+        let deep = "(".repeat(9_000);
+        write_at(
+            &refused,
+            &format!("export function f(a) {{ return {deep}a; }}"),
+            settled_time(),
+        );
+        let before = helper_reads();
+        assert_eq!(locate(&refused, "f"), None);
+        assert_eq!(locate(&refused, "f"), None);
+        assert_eq!(
+            helper_reads() - before,
+            1,
+            "a refusal is decided once per file version"
+        );
+
+        let package = dir.path().join("node_modules").join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let dependency = package.join("index.ts");
+        std::fs::write(&dependency, "export function g(a) { return a; }").unwrap();
+        let before = helper_reads();
+        assert_eq!(locate(&dependency, "g"), None);
+        assert_eq!(
+            helper_reads() - before,
+            0,
+            "an installed package is never read"
+        );
+    }
 
     /// An unparseable helper file refuses the whole inline (under-match), never panics --
     /// the product's degrade-visibly rule.
