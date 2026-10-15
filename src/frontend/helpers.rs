@@ -61,11 +61,10 @@
 //!
 //! Each inline decision reads and parses the helper file, and the `alpha` rendering reads and
 //! parses it again (`structural` never inlines -- see `fingerprint.rs`'s
-//! `try_inline_imported_helper` for why). That is the same order as the pre-existing documented
-//! cost one level up -- `import_origins` re-parses the whole *test* file once per fingerprinted
-//! body -- and it is deliberately not memoized: a cache would add a staleness class (the
-//! filesystem changing under a long run) to save work that only files with imported helper calls
-//! pay at all. The worst input -- an installed package's dist file, parsed per call site -- is
+//! `try_inline_imported_helper` for why). The test file's own imports are parsed once per file
+//! (`fingerprint.rs`'s `with_file_import_origins`); helper files are deliberately not memoized:
+//! a cache would add a staleness class (the filesystem changing under a long run) to save work
+//! that only files with imported helper calls pay at all. The worst input -- an installed package's dist file, parsed per call site -- is
 //! refused before it is read (see the guards). Nothing here is retained after a rendering
 //! returns.
 //!

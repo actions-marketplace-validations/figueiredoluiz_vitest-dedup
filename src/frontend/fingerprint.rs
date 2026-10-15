@@ -457,7 +457,7 @@ pub(super) fn fingerprint(
     row_substitution: Option<&RowSubstitution>,
 ) -> BodyFingerprint {
     let trivial = is_trivial(&body);
-    let imports = import_origins(source, file);
+    let imports = file_import_origins(source, file);
     let file_key = path_key(file);
     // Resolved once, shared by all four passes below: they all walk the identical
     // `body.params()`, so re-deriving this per pass would just repeat the same work (and, worse,
@@ -1641,14 +1641,9 @@ fn expression_has_effect(expr: &Expression<'_>, depth: u32) -> bool {
 /// only `body`/`semantic`/`source`/`file`. So this re-parses `source` with its own throwaway
 /// `Allocator` to read straight off the top-level `ImportDeclaration`s, which needs no semantic
 /// analysis of its own (imports are always top-level, never nested, so a shallow scan of
-/// `program.body` is sufficient). This repeats one parse -- and, since specifiers now resolve
-/// through the filesystem, one
-/// [`resolver::resolve`] call per specifier -- per body fingerprinted in a file rather than once
-/// per file, which is a real cost the fixed signature leaves no room to avoid without a cache
-/// keyed on something outside this function; `resolver::resolve`'s own memoization (see
-/// `resolver.rs`) is what keeps the repeated call cheap rather than repeatedly re-touching the
-/// filesystem, the same way oxc's parse speed is what has kept the repeated re-parse cheap since
-/// before this module existed.
+/// `program.body` is sufficient). Extraction runs it once per file through
+/// [`with_file_import_origins`], and every body fingerprinted from that file shares the result;
+/// only helper files and callers outside an extraction scope compute it afresh.
 ///
 /// `SourceType::tsx()` is used unconditionally as the most permissive superset available (this
 /// module is never told the real file extension). A file using the legacy `<T>expr` TypeScript
@@ -1659,6 +1654,8 @@ pub(super) fn import_origins(source: &str, file: &Path) -> ImportOrigins {
     if super::extract::parse_refusal(source).is_some() {
         return HashMap::new();
     }
+    #[cfg(test)]
+    IMPORT_ORIGIN_PARSES.with(|count| count.set(count.get() + 1));
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
     if parsed.fatal_error {
@@ -1707,6 +1704,86 @@ pub(super) fn import_origins(source: &str, file: &Path) -> ImportOrigins {
         }
     }
     origins
+}
+
+/// Identifies one file's text for [`FILE_IMPORTS`]: the borrowed source's address and length plus
+/// the path. The scope that installs an entry borrows that source for its whole lifetime, so the
+/// address cannot be reused by other text while the entry is visible.
+#[derive(PartialEq, Eq)]
+struct FileKey {
+    source: usize,
+    len: usize,
+    path: PathBuf,
+}
+
+impl FileKey {
+    /// Builds the key for `source` as written at `file`.
+    fn of(source: &str, file: &Path) -> Self {
+        Self {
+            source: source.as_ptr() as usize,
+            len: source.len(),
+            path: file.to_path_buf(),
+        }
+    }
+}
+
+thread_local! {
+    /// The import origins of the file being extracted on this thread, computed once for it by
+    /// [`with_file_import_origins`]. Without this, every fingerprinted body re-parsed the whole file
+    /// and re-resolved its imports, which made a file's cost quadratic in its test count.
+    static FILE_IMPORTS: std::cell::RefCell<Option<(FileKey, std::rc::Rc<ImportOrigins>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of [`import_origins`] parses on this thread.
+    static IMPORT_ORIGIN_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns the number of [`import_origins`] parses this thread has performed.
+#[cfg(test)]
+pub(super) fn import_origin_parses() -> usize {
+    IMPORT_ORIGIN_PARSES.with(std::cell::Cell::get)
+}
+
+/// Runs `walk` with `file`'s import origins computed once and shared by every body fingerprinted
+/// from that same `source` during the walk; the previous state is restored afterwards, including
+/// on unwind.
+pub(super) fn with_file_import_origins<R>(
+    source: &str,
+    file: &Path,
+    walk: impl FnOnce() -> R,
+) -> R {
+    /// Puts back the entry that was visible before this scope.
+    struct Restore(Option<(FileKey, std::rc::Rc<ImportOrigins>)>);
+    impl Drop for Restore {
+        /// Reinstalls the saved entry when the scope ends, normally or by unwinding.
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            FILE_IMPORTS.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let entry = (
+        FileKey::of(source, file),
+        std::rc::Rc::new(import_origins(source, file)),
+    );
+    let _restore = Restore(FILE_IMPORTS.with(|slot| slot.replace(Some(entry))));
+    walk()
+}
+
+/// Returns `file`'s import origins: the shared copy when `source` is the file being walked, else a
+/// fresh computation (helper files, direct callers outside an extraction scope).
+fn file_import_origins(source: &str, file: &Path) -> std::rc::Rc<ImportOrigins> {
+    let key = FileKey::of(source, file);
+    FILE_IMPORTS
+        .with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(installed, _)| *installed == key)
+                .map(|(_, origins)| std::rc::Rc::clone(origins))
+        })
+        .unwrap_or_else(|| std::rc::Rc::new(import_origins(source, file)))
 }
 
 /// Resolves `specifier`, as written in `file`, to a fingerprint-safe identity component:
