@@ -416,10 +416,14 @@ fn run(source: &str, file: &SourceFile, globals: Globals, allow_imported: bool) 
     }
     let semantic = &semantic_return.semantic;
 
-    let mut registry = Registry::new(program, globals);
-    let mut walker = Walker::new(source, file, program, semantic, globals);
-    walker.allow_imported = allow_imported;
-    walker.walk_statements(&program.body, &mut registry);
+    // Every body fingerprinted below shares this file's import origins, computed once here.
+    let walker = super::fingerprint::with_file_import_origins(source, &file.path, || {
+        let mut registry = Registry::new(program, globals);
+        let mut walker = Walker::new(source, file, program, semantic, globals);
+        walker.allow_imported = allow_imported;
+        walker.walk_statements(&program.body, &mut registry);
+        walker
+    });
     diagnostics.extend(walker.diagnostics);
 
     let incomplete = !diagnostics.is_empty();
@@ -3454,6 +3458,53 @@ mod tests {
             module_flavor,
             config_scope: None,
             project_globals: None,
+        }
+    }
+
+    /// A file's import origins are parsed once per extraction, whatever its test count (P1).
+    ///
+    /// Every fingerprinted body used to re-parse the whole file for its imports, so a file's cost
+    /// was quadratic in its test count. The source reaches every fingerprinting caller (tests, a
+    /// hook, `.each` rows, a `vi.mock` factory, a `test.extend` fixture) and imports packages only,
+    /// so no helper file is parsed: any count above one is a per-body re-parse.
+    #[test]
+    fn import_origins_are_parsed_once_per_file_whatever_its_test_count() {
+        let source_with = |tests: usize| {
+            let mut source = String::from(concat!(
+                "import { test, expect, beforeEach, vi } from 'vitest';\n",
+                "import * as path from 'node:path';\n",
+                "vi.mock('node:os', () => ({ platform: () => 'x' }));\n",
+                "const it = test.extend({ sep: async ({}, use) => { await use(path.sep); } });\n",
+                "beforeEach(() => { path.join('a'); });\n",
+                "test.each([[1], [2]])('row %i', (n) => { expect(n).toBeTruthy(); });\n",
+                "it('fixture', ({ sep }) => { expect(sep).toBeTruthy(); });\n",
+            ));
+            for i in 0..tests {
+                source.push_str(&format!(
+                    "test('t{i}', () => {{ expect(path.basename('{i}')).toBe('{i}'); }});\n"
+                ));
+            }
+            source
+        };
+        for tests in [1, 40] {
+            let source = source_with(tests);
+            let before = crate::frontend::fingerprint::import_origin_parses();
+            let extraction = run(&source, &file("census.test.ts"), Globals::Disabled, true);
+            let parses = crate::frontend::fingerprint::import_origin_parses() - before;
+            assert_eq!(
+                extraction.tests.len(),
+                tests + 3,
+                "every declared test was extracted"
+            );
+            assert!(
+                extraction.diagnostics.is_empty(),
+                "{:?}",
+                extraction.diagnostics
+            );
+            assert_eq!(
+                parses, 1,
+                "{tests} test(s): import origins parsed {parses} times"
+            );
         }
     }
 
