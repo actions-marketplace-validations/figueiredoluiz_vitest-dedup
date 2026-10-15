@@ -532,7 +532,9 @@ fn admitted_source(path: &Path) -> Option<std::sync::Arc<str>> {
             return source;
         }
     }
-    let source = read_admitted(path);
+    // A read error is not a property of the file version (permissions, transient I/O), so it is
+    // refused without being remembered and the next lookup tries again.
+    let source = read_admitted(path).ok()?;
     if let Some(stamp) = stamp {
         let mut guard = lock();
         let sources = guard.get_or_insert_with(HelperSources::default);
@@ -562,16 +564,21 @@ impl HelperSources {
     }
 }
 
-/// Reads `path` and applies the admission checks every helper parse needs.
-fn read_admitted(path: &Path) -> Option<std::sync::Arc<str>> {
+/// Reads `path` and applies the admission checks every helper parse needs: `Ok(Some)` admitted,
+/// `Ok(None)` a refusal decided by the file's content (over the size bound, over the raw syntax
+/// budget), `Err` a read that failed and says nothing about the content.
+fn read_admitted(path: &Path) -> std::io::Result<Option<std::sync::Arc<str>>> {
     #[cfg(test)]
     HELPER_READS.with(|reads| reads.set(reads.get() + 1));
-    let source =
-        crate::discovery::read_bounded(path, crate::discovery::MAX_SOURCE_FILE_BYTES).ok()??;
+    let Some(source) =
+        crate::discovery::read_bounded(path, crate::discovery::MAX_SOURCE_FILE_BYTES)?
+    else {
+        return Ok(None);
+    };
     if super::extract::parse_refusal(&source).is_some() {
-        return None;
+        return Ok(None);
     }
-    Some(std::sync::Arc::from(source))
+    Ok(Some(std::sync::Arc::from(source)))
 }
 
 /// What [`find_export`] found: either the callable declaration in this file, or one more named
@@ -860,6 +867,40 @@ mod tests {
             locate(&helper, "add"),
             Some(1),
             "same length, same stamp, new text"
+        );
+    }
+
+    /// A read error is not remembered: a helper that becomes readable again is admitted even
+    /// though its length and modification time never changed (`chmod` touches neither).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_error_is_retried_rather_than_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("helpers.ts");
+        write_at(
+            &helper,
+            "export function add(a, b) { return a + b; }",
+            settled_time(),
+        );
+        let set_mode = |mode| {
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o000);
+        if std::fs::read(&helper).is_ok() {
+            set_mode(0o644);
+            return; // running as root: permissions cannot make the file unreadable here
+        }
+        assert_eq!(
+            locate(&helper, "add"),
+            None,
+            "an unreadable helper is refused"
+        );
+        set_mode(0o644);
+        assert_eq!(
+            locate(&helper, "add"),
+            Some(2),
+            "and admitted once readable again"
         );
     }
 
