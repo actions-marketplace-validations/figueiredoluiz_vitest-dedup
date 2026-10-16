@@ -40,6 +40,7 @@ use super::registry::{
     canonicalize_export_name, const_fold, is_ecmascript_trim_whitespace, js_number_to_string,
     js_radix_digits_value, property_key_name, resolve_callee, source_text, split_radix_prefix,
     CellValue, ChainStep, Globals, Registry, ResolvedCallee, Row, RowCells, TitleArg, TitleNumber,
+    OVER_LIMIT_TABLE,
 };
 use super::FileExtraction;
 
@@ -67,12 +68,16 @@ pub(super) fn extract_with_imports(
     let result = std::thread::scope(|scope| {
         #[cfg(test)]
         let census = super::registry::test_cell_census_snapshot();
+        #[cfg(test)]
+        let emission_limit = imported::EMISSION_LIMIT_OVERRIDE.with(std::cell::Cell::get);
         let worker = std::thread::Builder::new()
             .name("vitest-dedup-extract".to_owned())
             .stack_size(EXTRACTION_STACK_BYTES)
             .spawn_scoped(scope, move || {
                 #[cfg(test)]
                 super::registry::restore_test_cell_census(census);
+                #[cfg(test)]
+                imported::EMISSION_LIMIT_OVERRIDE.with(|limit| limit.set(emission_limit));
                 super::registry::reset_cell_census_file_scope();
                 let extraction = run(source, file, globals, allow_imported);
                 #[cfg(test)]
@@ -231,6 +236,18 @@ const MAX_HELPER_EXPANSION_DEPTH: usize = 8;
 /// Two thousand is far beyond what any hand-written test file reaches: measured, the two
 /// measured files carrying this shape spend three of it each per pass, six per file in total.
 const MAX_HELPER_EXPANSIONS: usize = 2_000;
+
+/// How many declarations (tests, `.each` rows, suite records) one file may emit.
+///
+/// Literal `for...of` unrolling and `.each` tables multiply: three nested 100-element loops around
+/// one `test` are a million declarations from a 1.4 KB file. Past this, nothing more is emitted and
+/// the file is incomplete. The largest real test file measured declares 297 tests.
+const MAX_DECLARATIONS_PER_FILE: usize = 10_000;
+
+/// How many literal `for...of` iterations one file may unroll. Bounds walks over loop bodies that
+/// declare nothing, which [`MAX_DECLARATIONS_PER_FILE`] cannot see. A loop spends its array's
+/// length before any element is folded, so an over-long array costs nothing to refuse.
+const MAX_UNROLLED_ITERATIONS: usize = 10_000;
 
 /// Estimates bracket nesting with a lexical masking heuristic, without parsing `source`.
 ///
@@ -425,6 +442,7 @@ fn run(source: &str, file: &SourceFile, globals: Globals, allow_imported: bool) 
         walker
     });
     diagnostics.extend(walker.diagnostics);
+    diagnostics.extend(walker.expansion.borrow().budget_diagnostics());
 
     let incomplete = !diagnostics.is_empty();
     // See `Walker::proven_empty_tables`'s doc: only meaningful when nothing else in this file
@@ -720,6 +738,8 @@ fn collect_mocked_modules(
         source: &str,
         file: &std::path::Path,
     ) -> Option<String> {
+        // Only the root and the last member matter here; never read a `.each` table's rows.
+        registry.limit_table_rows(0);
         let resolved = resolve_callee(&call.callee, registry, semantic, source, file)?;
         if resolved.root != "vi" {
             return None;
@@ -1160,6 +1180,7 @@ impl<'a> Walker<'a> {
         callee: &Expression<'a>,
         registry: &Registry,
     ) -> Option<ResolvedCallee> {
+        registry.limit_table_rows(self.expansion.borrow().declarations_remaining());
         resolve_callee(
             callee,
             registry,
@@ -1356,6 +1377,15 @@ impl<'a> Walker<'a> {
     /// [`Walker::push_test_case`] already marks that unresolved -- so this stays consistent with
     /// how every other dynamic title is already handled, per the item this fixes.
     fn walk_for_of_statement(&mut self, for_of: &ForOfStatement<'a>, registry: &mut Registry) {
+        if let Expression::ArrayExpression(array) = &for_of.right {
+            if !self
+                .expansion
+                .borrow_mut()
+                .admit_iterations(array.elements.len())
+            {
+                return;
+            }
+        }
         match literal_for_of_elements(for_of) {
             Some((symbol_id, values)) => {
                 for value in values {
@@ -1525,6 +1555,20 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Splits a declaration's resolved chain (see [`split_modifiers_and_each`]), or refuses the
+    /// declaration budget and returns `None` when its `.each` table was too long to read.
+    fn admitted_chain(
+        &self,
+        steps: Vec<ChainStep>,
+    ) -> Option<(Vec<Modifier>, Option<EachInfo>, bool)> {
+        let split = split_modifiers_and_each(steps);
+        if split.1.as_ref().is_some_and(|info| info.over_limit) {
+            self.expansion.borrow_mut().refuse_declarations();
+            return None;
+        }
+        Some(split)
+    }
+
     /// Emit declaration records with row-specific titles, modifiers, context and body
     /// fingerprints.
     fn emit_test(
@@ -1533,7 +1577,10 @@ impl<'a> Walker<'a> {
         kind: DeclarationKind,
         resolved: ResolvedCallee,
     ) {
-        let (own_modifiers, each, condition_unresolved) = split_modifiers_and_each(resolved.steps);
+        let Some((own_modifiers, each, condition_unresolved)) = self.admitted_chain(resolved.steps)
+        else {
+            return;
+        };
         // C1: an `.each`/`.for` table this extractor could not enumerate (hazard 5) is a fact the
         // context cannot vouch for -- distinct from a literal-but-empty table, which is fully
         // known and does not make the context unresolved.
@@ -1619,7 +1666,7 @@ impl<'a> Walker<'a> {
                         } else {
                             own_modifiers.clone()
                         };
-                        self.push_test_case(
+                        let pushed = self.push_test_case(
                             kind,
                             title,
                             combined_modifiers(row_own_modifiers),
@@ -1634,6 +1681,9 @@ impl<'a> Walker<'a> {
                             substitution,
                             row_cells_fully_observable(body_arg, row),
                         );
+                        if !pushed {
+                            break;
+                        }
                         // `push_test_case` pushed exactly this row's case last. Resolved row
                         // values, rather than shared declaration location, are what
                         // `duplicate-each-row` compares.
@@ -1697,7 +1747,10 @@ impl<'a> Walker<'a> {
         resolved: ResolvedCallee,
         registry: &mut Registry,
     ) {
-        let (own_modifiers, each, condition_unresolved) = split_modifiers_and_each(resolved.steps);
+        let Some((own_modifiers, each, condition_unresolved)) = self.admitted_chain(resolved.steps)
+        else {
+            return;
+        };
         // C1: see the identical comment in `emit_test`.
         let each_unresolved = each.as_ref().is_some_and(|info| info.rows.is_err());
         // Defect 5: see the identical comment in `emit_test`.
@@ -1764,7 +1817,7 @@ impl<'a> Walker<'a> {
             // The `describe` declaration itself is a `Suite`-kind case, distinct from the tests
             // nested inside it: its own modifiers (e.g. `describe.skip`) make it independently
             // inert without that having to propagate through every nested test's own modifiers.
-            self.push_test_case(
+            let pushed = self.push_test_case(
                 DeclarationKind::Suite,
                 title.clone(),
                 modifiers.clone(),
@@ -1781,6 +1834,11 @@ impl<'a> Walker<'a> {
                 None,
                 true,
             );
+            // A refused suite record means the declaration budget is spent: nothing inside it
+            // could be emitted either.
+            if !pushed {
+                break;
+            }
             if let Some(case) = self.tests.last_mut() {
                 case.table_row_class = table_row_class;
             }
@@ -2078,7 +2136,8 @@ impl<'a> Walker<'a> {
         bound
     }
 
-    /// Assembles one extracted [`TestCase`] from a recognized declaration call. The parameters
+    /// Assembles one extracted [`TestCase`] from a recognized declaration call, returning `false`
+    /// without assembling anything once the file's declaration budget is spent. The parameters
     /// are the extracted declaration itself; grouping them into a struct here would just rename
     /// `TestCase`'s own fields one step early.
     #[allow(clippy::too_many_arguments)]
@@ -2097,7 +2156,10 @@ impl<'a> Walker<'a> {
         // `true` unless this is a `.each` row whose callback provably drops the cells past its
         // fixed parameters; see `crate::model::TestCase::row_cells_fully_observable`.
         row_cells_fully_observable: bool,
-    ) {
+    ) -> bool {
+        if !self.expansion.borrow_mut().admit_declaration() {
+            return false;
+        }
         let has_body = body_arg.and_then(as_function_like).is_some();
         let body_fingerprint = body_arg.and_then(as_function_like).map(|function_like| {
             fingerprint(
@@ -2203,6 +2265,7 @@ impl<'a> Walker<'a> {
             body,
             has_body,
         });
+        true
     }
 
     /// Free identifiers in `function_like`'s body that resolve (via `oxc_semantic`, not name
@@ -2411,6 +2474,8 @@ fn union_option_modifiers(modifiers: &mut Vec<Modifier>, options: &ObjectExpress
 /// [`Modifier::Each`] because title rendering needs the row cells, not just their display text.
 struct EachInfo {
     rows: Result<Vec<Row>, String>,
+    /// The table was longer than the remaining declaration budget and was not read.
+    over_limit: bool,
 }
 
 /// Assigns exact-equality classes within one table without retaining each row's canonical text.
@@ -2455,7 +2520,8 @@ fn split_modifiers_and_each(steps: Vec<ChainStep>) -> (Vec<Modifier>, Option<Eac
                     is_for,
                     rows: table_rows,
                 }));
-                each = Some(EachInfo { rows });
+                let over_limit = matches!(&rows, Err(identity) if identity == OVER_LIMIT_TABLE);
+                each = Some(EachInfo { rows, over_limit });
             }
             ChainStep::SkipIf {
                 condition,
@@ -8145,3 +8211,7 @@ mod tests {
 #[cfg(test)]
 #[path = "extract/tests/imported.rs"]
 mod imported_tests;
+
+#[cfg(test)]
+#[path = "extract/tests/budget.rs"]
+mod budget_tests;
