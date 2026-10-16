@@ -41,6 +41,7 @@ vitest-dedup . --reporters json,html --output reports/dedup  # write report file
 vitest-dedup . --reporters jsonl | jq -c 'select(.type == "finding")'
 vitest-dedup . --baseline dedup-baseline.json               # gate only on findings the baseline lacks
 vitest-dedup . --changed-since origin/main                  # only findings touching changed files
+vitest-dedup . --max-memory 4096                            # raise the 2048 MiB memory budget
 ```
 
 `vitest-dedup check <path>` is the explicit form of `vitest-dedup <path>`. `--help` lists every
@@ -120,22 +121,28 @@ states how many findings were suppressed this way.
 ## GitHub Action
 
 ```yaml
-- uses: figueiredoluiz/vitest-dedup@v0.2.0
+- uses: figueiredoluiz/vitest-dedup@v0.3.0
   with:
     path: .
-    version: 0.2.0
+    version: 0.3.0
     threshold: "5"
 ```
 
-The action downloads the release binary for the runner's platform and verifies its SHA-256 against
-the published checksum before running it. `version` is required and exact, so the workflow pins
-the code it runs.
+The action downloads the release binary for the runner's platform, verifies its SHA-256 against
+the published checksum and, with `gh`, that its build provenance attestation comes from this
+repository's release workflow at the version's tag (v0.1.0, built from `main`, is checked against
+the workflow only), and only then runs it.
+`version` is required and exact, so the workflow pins the code it runs. `token` (default
+`github.token`) is passed to `gh` alone. When `gh` is missing, or has no credentials at all, the
+attestation check is skipped with a warning; a failed verification, including a rejected token,
+always fails the step.
 
 The inputs are `path`, `config`, `threshold`, `reporters`, `output`, `rule`, `globals`,
-`no-metrics`, `fail-on-incomplete`, `baseline`, `fail-on-new`, `changed-since`, and `version`. `path` is the
-positional argument, `version` selects the release binary, and each of the others maps to the
-flag of the same name. `rule` accepts several overrides separated by newlines or commas. The JSON
-reporter is always enabled so the outputs below can be read. `--update-baseline` is deliberately
+`no-metrics`, `fail-on-incomplete`, `baseline`, `fail-on-new`, `changed-since`, `max-memory`,
+`no-memory-cap`, `version`, and `token`. `path` is the positional argument, `version` selects the release binary, `token`
+authenticates the attestation check, and each of the others maps to the flag of the same name.
+`rule` accepts several overrides separated by newlines or commas. The JSON reporter is always
+enabled so the outputs below can be read. `--update-baseline` is deliberately
 not an input: rewriting a committed record of accepted debt is not a CI gate operation.
 `changed-since` needs `fetch-depth: 0` on the checkout.
 
@@ -152,6 +159,7 @@ not an input: rewriting a committed record of accepted debt is not a CI gate ope
 | `new-findings` | Findings absent from the baseline |
 | `json-report` | Path to the JSON report |
 | `html-report` | Path to the HTML report, when the html reporter was selected |
+| `attestation` | `verified`, or `unavailable` when only the checksum could be checked |
 
 ## Agent skill
 
@@ -169,8 +177,8 @@ The gate counts a class of causes, because the classes call for different respon
 `--fail-on-incomplete` or `--fail-on-incomplete=any` counts every cause. `=reads` counts only
 causes meaning the project could not be fully read: unreadable, oversized, or partially read
 files, undetermined config, and tests whose context could not be resolved. `=limits` counts only
-the analyzer's own bounded work being capped: the pair budget, the hook-scan budget, and truncated
-findings. The value needs the `=`; with a space, `reads` would be read as the path.
+the analyzer's own bounded work being capped: the pair budget, the hook-scan budget, the memory
+budget, and truncated findings. The value needs the `=`; with a space, `reads` would be read as the path.
 
 A file in which every test was excluded is a blind spot: it produced no findings, so it appears
 nowhere in the report. Blind spots are named on stderr, worst first, counted in the `blindFiles`

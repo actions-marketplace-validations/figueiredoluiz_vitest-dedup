@@ -197,8 +197,8 @@ struct RawOptions {
     /// corpus. With no value (or `=any`) every cause counts; `=reads` counts only causes that
     /// mean the analyzed project could not be fully read (unreadable/oversized/partial files,
     /// undetermined config, tests whose context could not be resolved); `=limits` counts only
-    /// this tool's own bounded work being capped (pair budget, hook-scan budget, truncated
-    /// findings). The split exists because the two classes ask for different CI responses: fix
+    /// this tool's own bounded work being capped (pair budget, hook-scan budget, memory budget,
+    /// truncated findings). The split exists because the two classes ask for different CI responses: fix
     /// the repository, or raise the limits.
     ///
     /// The value requires `=`: an optional value with a space would greedily consume the next
@@ -288,6 +288,23 @@ struct RawOptions {
     /// the run as an operational error instead of producing useful analysis.
     #[arg(long, global = true)]
     globals: bool,
+
+    /// Stop reading files once the analyzer holds more than MIB mebibytes (default 2048).
+    ///
+    /// Checked between files, so the run analyzes whole files only; the rest are reported and the
+    /// run is marked incomplete.
+    #[arg(
+        long,
+        global = true,
+        value_name = "MIB",
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with = "no_memory_cap"
+    )]
+    max_memory: Option<u64>,
+
+    /// Remove the memory budget.
+    #[arg(long, global = true)]
+    no_memory_cap: bool,
 }
 
 /// Parsed and validated command-line arguments.
@@ -333,6 +350,8 @@ pub struct ParsedArgs {
     pub fail_on_new: Option<usize>,
     /// Git revision to scope the report to (`--changed-since`).
     pub changed_since: Option<String>,
+    /// Retained-memory budget in MiB, or `None` under `--no-memory-cap`.
+    pub memory_budget_mib: Option<u64>,
 }
 
 impl ParsedArgs {
@@ -475,6 +494,11 @@ impl ParsedArgs {
             update_baseline: cli.options.update_baseline,
             fail_on_new: cli.options.fail_on_new,
             changed_since: cli.options.changed_since,
+            memory_budget_mib: (!cli.options.no_memory_cap).then(|| {
+                cli.options
+                    .max_memory
+                    .unwrap_or(crate::memory::DEFAULT_MEMORY_BUDGET_MIB)
+            }),
         })
     }
 
@@ -493,6 +517,8 @@ impl ParsedArgs {
     }
 }
 
+/// Parse RULE=SEVERITY into the rule and severity enums, returning a diagnostic for malformed
+/// or unknown values.
 fn parse_rule_override(value: &str) -> Result<(Rule, Severity), String> {
     let (id, severity) = value
         .split_once('=')
@@ -507,6 +533,7 @@ fn parse_rule_override(value: &str) -> Result<(Rule, Severity), String> {
 mod tests {
     use super::*;
 
+    /// Check CLI parsing: supports implicit and explicit check forms.
     #[test]
     fn supports_implicit_and_explicit_check_forms() {
         let implicit = ParsedArgs::parse_from(["vitest-dedup", "src"]).unwrap();
@@ -516,12 +543,14 @@ mod tests {
         assert!(ParsedArgs::parse_from(["vitest-dedup", "check"]).is_err());
     }
 
+    /// Check CLI parsing: defaults root to current directory.
     #[test]
     fn defaults_root_to_current_directory() {
         let args = ParsedArgs::parse_from(["vitest-dedup"]).unwrap();
         assert_eq!(args.root, PathBuf::from("."));
     }
 
+    /// Check CLI parsing: rejects a path placed before check.
     #[test]
     fn rejects_a_path_placed_before_check() {
         let error = ParsedArgs::parse_from(["vitest-dedup", "src", "check", "src"]).unwrap_err();
@@ -530,12 +559,14 @@ mod tests {
             .contains("do not pass a path before `check`"));
     }
 
+    /// Check CLI parsing: reporters default to terminal when omitted.
     #[test]
     fn reporters_default_to_terminal_when_omitted() {
         let args = ParsedArgs::parse_from(["vitest-dedup"]).unwrap();
         assert_eq!(args.reporters, vec![ReporterKind::Terminal]);
     }
 
+    /// Check CLI parsing: reporters accept a comma separated list and reject unknown values.
     #[test]
     fn reporters_accept_a_comma_separated_list_and_reject_unknown_values() {
         let args =
@@ -547,6 +578,7 @@ mod tests {
         assert!(ParsedArgs::parse_from(["vitest-dedup", "--reporters", "xml"]).is_err());
     }
 
+    /// Check CLI parsing: sarif is an accepted file reporter.
     #[test]
     fn sarif_is_an_accepted_file_reporter() {
         let args = ParsedArgs::parse_from(["vitest-dedup", "--reporters", "sarif"]).unwrap();
@@ -555,6 +587,7 @@ mod tests {
         assert_eq!(ReporterKind::Sarif.extension(), Some("sarif"));
     }
 
+    /// Check CLI parsing: threshold is bounded to zero through one hundred.
     #[test]
     fn threshold_is_bounded_to_zero_through_one_hundred() {
         assert_eq!(
@@ -573,6 +606,7 @@ mod tests {
         assert!(ParsedArgs::parse_from(["vitest-dedup", "--threshold", "-1"]).is_err());
     }
 
+    /// Check CLI parsing: rule overrides parse repeated flags and reject bad input.
     #[test]
     fn rule_overrides_parse_repeated_flags_and_reject_bad_input() {
         let args = ParsedArgs::parse_from([
@@ -599,6 +633,7 @@ mod tests {
         assert!(ParsedArgs::parse_from(["vitest-dedup", "--rule", "duplicate-test"]).is_err());
     }
 
+    /// Check CLI parsing: no metrics is global and off by default.
     #[test]
     fn no_metrics_is_global_and_off_by_default() {
         assert!(!ParsedArgs::parse_from(["vitest-dedup"]).unwrap().no_metrics);
@@ -613,6 +648,23 @@ mod tests {
         }
     }
 
+    /// Check CLI parsing: the memory budget defaults to 2048 MiB, takes a positive value, and is
+    /// removed only by `--no-memory-cap`, which conflicts with an explicit budget.
+    #[test]
+    fn memory_budget_defaults_and_accepts_overrides() {
+        let budget =
+            |argv: &[&str]| ParsedArgs::parse_from(argv).map(|args| args.memory_budget_mib);
+        assert_eq!(budget(&["vitest-dedup"]).unwrap(), Some(2_048));
+        assert_eq!(
+            budget(&["vitest-dedup", "--max-memory", "512"]).unwrap(),
+            Some(512)
+        );
+        assert_eq!(budget(&["vitest-dedup", "--no-memory-cap"]).unwrap(), None);
+        assert!(budget(&["vitest-dedup", "--max-memory", "0"]).is_err());
+        assert!(budget(&["vitest-dedup", "--max-memory", "512", "--no-memory-cap"]).is_err());
+    }
+
+    /// Check CLI parsing: repeated rule flag for the same rule keeps the last occurrence.
     #[test]
     fn repeated_rule_flag_for_the_same_rule_keeps_the_last_occurrence() {
         let args = ParsedArgs::parse_from([
@@ -629,6 +681,7 @@ mod tests {
         );
     }
 
+    /// Check CLI parsing: to overrides maps only config relevant fields.
     #[test]
     fn to_overrides_maps_only_config_relevant_fields() {
         let args = ParsedArgs::parse_from([
@@ -650,6 +703,7 @@ mod tests {
         );
     }
 
+    /// Check CLI parsing: globals defaults to false and is settable.
     #[test]
     fn globals_defaults_to_false_and_is_settable() {
         assert!(!ParsedArgs::parse_from(["vitest-dedup"]).unwrap().globals);
@@ -660,6 +714,7 @@ mod tests {
         );
     }
 
+    /// Check CLI parsing: fail on incomplete defaults to any and parses its classes.
     #[test]
     fn fail_on_incomplete_defaults_to_any_and_parses_its_classes() {
         use super::FailOnIncomplete;
@@ -709,6 +764,8 @@ mod tests {
         assert_eq!(space_form.root, std::path::PathBuf::from("reads"));
     }
 
+    /// Check CLI parsing: emit test fingerprints is off by default and requires the jsonl
+    /// reporter.
     #[test]
     fn emit_test_fingerprints_is_off_by_default_and_requires_the_jsonl_reporter() {
         assert!(
@@ -758,6 +815,7 @@ mod tests {
         }
     }
 
+    /// Check CLI parsing: debug memory is off by default and requires the jsonl reporter.
     #[test]
     fn debug_memory_is_off_by_default_and_requires_the_jsonl_reporter() {
         assert!(
@@ -800,6 +858,7 @@ mod tests {
         }
     }
 
+    /// Check CLI parsing: exit code values match the documented contract.
     #[test]
     fn exit_code_values_match_the_documented_contract() {
         assert_eq!(ExitCode::Success.code(), 0);

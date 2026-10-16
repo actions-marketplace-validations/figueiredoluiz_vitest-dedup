@@ -99,6 +99,7 @@ macro_rules! inline_only {
     ($($type:ty),+ $(,)?) => {
         $(
             impl HeapBytes for $type {
+                /// Inline-only values retain no separately owned heap bytes.
                 fn heap_bytes(&self) -> usize {
                     0
                 }
@@ -156,6 +157,7 @@ fn arc_str_allocation(len: usize) -> usize {
 }
 
 impl HeapBytes for Position {
+    /// Count the position fields, which contain no heap payload.
     fn heap_bytes(&self) -> usize {
         let Self { line, column } = self;
         line.heap_bytes() + column.heap_bytes()
@@ -163,6 +165,8 @@ impl HeapBytes for Position {
 }
 
 impl HeapBytes for Span {
+    /// Account for span endpoints and byte offsets without adding scalar storage to heap
+    /// totals.
     fn heap_bytes(&self) -> usize {
         let Self {
             start,
@@ -175,6 +179,7 @@ impl HeapBytes for Span {
 }
 
 impl HeapBytes for Location {
+    /// Sum retained path allocation and span heap accounting for this location.
     fn heap_bytes(&self) -> usize {
         let Self { path, span } = self;
         path.heap_bytes() + span.heap_bytes()
@@ -182,6 +187,7 @@ impl HeapBytes for Location {
 }
 
 impl HeapBytes for Title {
+    /// Count the text payload held by the active title variant.
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Static(text) | Self::Dynamic(text) | Self::Parameterized(text) => {
@@ -192,6 +198,7 @@ impl HeapBytes for Title {
 }
 
 impl HeapBytes for DeclarationKind {
+    /// Declaration kinds are payload-free and retain no heap allocation.
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Test | Self::Suite | Self::Benchmark => 0,
@@ -200,6 +207,8 @@ impl HeapBytes for DeclarationKind {
 }
 
 impl HeapBytes for Modifier {
+    /// Count condition/unknown text or each-table payloads; fixed modifier variants contribute
+    /// zero.
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Skip
@@ -218,6 +227,7 @@ impl HeapBytes for Modifier {
 }
 
 impl HeapBytes for EachTable {
+    /// Account for retained rows in the each-table representation.
     fn heap_bytes(&self) -> usize {
         let Self { is_for, rows } = self;
         is_for.heap_bytes() + rows.heap_bytes()
@@ -225,6 +235,7 @@ impl HeapBytes for EachTable {
 }
 
 impl HeapBytes for EachRows {
+    /// Count literal row storage or the unreadable table identity payload.
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Literal(rows) => rows.heap_bytes(),
@@ -234,6 +245,7 @@ impl HeapBytes for EachRows {
 }
 
 impl HeapBytes for HookKind {
+    /// Hook-kind variants contain no heap payload.
     fn heap_bytes(&self) -> usize {
         match self {
             Self::BeforeAll | Self::BeforeEach | Self::AfterEach | Self::AfterAll => 0,
@@ -242,6 +254,7 @@ impl HeapBytes for HookKind {
 }
 
 impl HeapBytes for Hook {
+    /// Sum the hook location, fingerprint and retained alpha-source heap payloads.
     fn heap_bytes(&self) -> usize {
         let Self {
             kind,
@@ -259,6 +272,8 @@ impl HeapBytes for Hook {
 }
 
 impl HeapBytes for MockFactory {
+    /// Count explicit factory source text; automock and unresolved markers allocate no heap
+    /// payload.
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Automock | Self::Unresolved => 0,
@@ -268,6 +283,7 @@ impl HeapBytes for MockFactory {
 }
 
 impl HeapBytes for MockedModule {
+    /// Sum retained mock specifier and factory payloads.
     fn heap_bytes(&self) -> usize {
         let Self { specifier, factory } = self;
         specifier.heap_bytes() + factory.heap_bytes()
@@ -275,6 +291,7 @@ impl HeapBytes for MockedModule {
 }
 
 impl HeapBytes for FixtureValue {
+    /// Count setup/literal fixture evidence, with zero heap bytes for an unresolved marker.
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Setup(text) | Self::Literal(text) => text.heap_bytes(),
@@ -284,6 +301,7 @@ impl HeapBytes for FixtureValue {
 }
 
 impl HeapBytes for FixtureBinding {
+    /// Count the fixture name and its retained body evidence.
     fn heap_bytes(&self) -> usize {
         let Self { name, body } = self;
         name.heap_bytes() + body.heap_bytes()
@@ -631,11 +649,61 @@ impl MemoryReport {
     }
 }
 
+/// The default retained-memory budget, in MiB (`--max-memory`).
+pub const DEFAULT_MEMORY_BUDGET_MIB: u64 = 2_048;
+
+/// A ceiling on what the run holds, checked at file boundaries.
+///
+/// The figure is the one [`MemoryReport::post_extraction`] reports as `retained_bytes` -- the
+/// corpus vector's spine plus each test's [`HeapBytes::heap_bytes`] -- plus any source text the run
+/// retains for its reports. Each file is charged once, when its tests are ingested, so checking
+/// costs nothing proportional to the corpus.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryRoof {
+    /// The budget in bytes, or `None` when the roof is disabled.
+    budget_bytes: Option<u64>,
+    /// Heap and retained text charged so far, excluding the corpus spine.
+    charged: u64,
+}
+
+impl MemoryRoof {
+    /// A roof of `budget_bytes`, or none.
+    #[must_use]
+    pub fn new(budget_bytes: Option<u64>) -> Self {
+        Self {
+            budget_bytes,
+            charged: 0,
+        }
+    }
+
+    /// Charges one file's tests, before they join the corpus, and the text retained for it.
+    pub fn charge(&mut self, tests: &[TestCase], retained_text: usize) {
+        let heap: usize = tests.iter().map(HeapBytes::heap_bytes).sum();
+        self.charged = self
+            .charged
+            .saturating_add(u64::try_from(heap.saturating_add(retained_text)).unwrap_or(u64::MAX));
+    }
+
+    /// Whether `corpus`, with everything charged so far, holds more than the budget.
+    ///
+    /// Takes `&Vec` for its capacity, as [`MemoryReport::post_extraction`] does.
+    #[allow(clippy::ptr_arg)]
+    #[must_use]
+    pub fn exceeded(&self, corpus: &Vec<TestCase>) -> bool {
+        let spine = corpus.capacity().saturating_mul(size_of::<TestCase>());
+        let held = self
+            .charged
+            .saturating_add(u64::try_from(spine).unwrap_or(u64::MAX));
+        self.budget_bytes.is_some_and(|budget| held > budget)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Fingerprints, Position};
 
+    /// Build a source-location fixture with a fixed one-line span and the supplied path.
     fn location(path: &str) -> Location {
         Location {
             path: PathBuf::from(path),
@@ -660,6 +728,8 @@ mod tests {
         owned
     }
 
+    /// Build a minimal executable test fixture with the supplied static title and empty
+    /// context.
     fn test_case(title: &str) -> TestCase {
         TestCase {
             registration_file: None,
@@ -1112,5 +1182,33 @@ mod tests {
             Title::Static(padded("computed name", 700)).heap_bytes(),
             cost
         );
+    }
+
+    /// The roof holds exactly its budget and stops one byte past it; without a budget it never
+    /// stops.
+    #[test]
+    fn the_roof_stops_one_byte_past_its_budget() {
+        let corpus: Vec<TestCase> = Vec::new();
+        let mut roof = MemoryRoof::new(Some(100));
+        roof.charge(&[], 100);
+        assert!(!roof.exceeded(&corpus), "equal to the budget is within it");
+        roof.charge(&[], 1);
+        assert!(roof.exceeded(&corpus));
+
+        let mut uncapped = MemoryRoof::new(None);
+        uncapped.charge(&[], usize::MAX);
+        assert!(!uncapped.exceeded(&corpus));
+    }
+
+    /// The charge is the figure `--debug-memory` reports: the corpus spine plus each test's heap.
+    #[test]
+    fn the_roof_charges_what_debug_memory_reports() {
+        let mut corpus = vec![test_case(&padded("a title", 4_000))];
+        let retained = MemoryReport::post_extraction(&corpus, 1, 1, None).retained_bytes as u64;
+        let mut roof = MemoryRoof::new(Some(retained));
+        roof.charge(&corpus, 0);
+        assert!(!roof.exceeded(&corpus));
+        corpus.reserve_exact(1);
+        assert!(roof.exceeded(&corpus), "the spine's capacity counts too");
     }
 }

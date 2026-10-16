@@ -25,12 +25,11 @@
 //! from turning the fingerprinter into something that silently gets slower or flakier as it scales:
 //!
 //! - **Memoized, not repeated.** [`resolve`] is keyed on `(importing file, specifier)` and cached
-//!   for the lifetime of the extraction worker (see [`CACHE`]). `import_origins` already re-parses each
-//!   file's imports once per test body in that file (a pre-existing, documented cost -- see its
-//!   doc comment in `fingerprint.rs`); without memoization, resolution would multiply that same
-//!   cost by a real filesystem walk per call. The cache collapses it back down to one resolution
-//!   per distinct specifier actually written in a given file, which is the bound this design
-//!   requires: resolve once per (importing file, specifier), never once per call site.
+//!   for the lifetime of the extraction worker (see [`CACHE`]). `import_origins` runs once per
+//!   extracted file and again for each helper file it inlines; without memoization, every one of
+//!   those runs would pay a real filesystem walk per specifier. The cache collapses it to one
+//!   resolution per distinct specifier actually written in a given file, which is the bound this
+//!   design requires: resolve once per (importing file, specifier), never once per call site.
 //!
 //!   The key is the importing *file*, not its directory, so two files in one directory each pay
 //!   for their own first resolution of the same specifier. Directory keying would be sound --
@@ -40,7 +39,7 @@
 //!   and the duplicate cost is one resolution per file per specifier, which the measurement in
 //!   `fingerprint`'s doc comment already accounts for.
 //! - **Never resolved mid-traversal.** [`resolve`] is only ever called from `import_origins`, which
-//!   runs once before a body's identifier walk begins. The serializer and behavior collector never
+//!   runs once per file, before any body's identifier walk begins. The serializer and behavior collector never
 //!   touch the filesystem themselves -- they consume the already-resolved [`Resolved`] value.
 //! - **A thread-local cache, not a global lock.** Extraction runs on an explicitly sized worker
 //!   stack. Each worker retains its resolver and memoized results throughout the file and all of
@@ -72,6 +71,9 @@ thread_local! {
     static CACHE: RefCell<HashMap<(PathBuf, String), Resolved>> = RefCell::new(HashMap::new());
 }
 
+/// Builds the worker resolver with parser-supported extensions, `module`/`import` conditions,
+/// `module`/`main` entry fields and automatic tsconfig discovery. Other options retain their
+/// resolver defaults.
 fn build_resolver() -> Resolver {
     Resolver::new(ResolveOptions {
         // The base `oxc_resolver` defaults only try `.js`/`.json`/`.node` -- correct for plain

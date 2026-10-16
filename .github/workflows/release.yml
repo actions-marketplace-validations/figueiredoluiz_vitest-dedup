@@ -6,7 +6,7 @@ on:
       version:
         description: Version to build, without the leading v
         required: true
-        default: 0.2.0
+        default: 0.3.0
       publish:
         description: Publish GitHub release and configured registries; false rehearses
         type: boolean
@@ -346,6 +346,7 @@ jobs:
           tag_name: v${{ needs.resolve.outputs.version }}
           target_commitish: ${{ github.sha }}
           name: v${{ needs.resolve.outputs.version }}
+          prerelease: ${{ contains(needs.resolve.outputs.version, '-') }}
           generate_release_notes: true
           files: |
             dist/*.tar.gz

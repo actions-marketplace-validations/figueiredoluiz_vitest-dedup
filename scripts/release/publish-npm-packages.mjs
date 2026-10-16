@@ -63,10 +63,14 @@ export function registryVersionState(result, expectedVersion) {
 /**
  * `--access public` because a scoped-looking name defaults to restricted; `--provenance` because
  * the whole point of publishing from the tagged workflow run is that a consumer can verify where
- * the tarball came from with `npm audit signatures`.
+ * the tarball came from with `npm audit signatures`. Stable versions explicitly select latest;
+ * prereleases select next, leaving the stable channel alone.
  */
-export function npmPublishArguments(packageDirectory) {
-  return ['publish', packageDirectory, '--access', 'public', '--provenance']
+export function npmPublishArguments(packageDirectory, version) {
+  // An explicit tag is required by npm for prereleases and versions below the registry highest.
+  // Stable releases select latest; prereleases share next without replacing the stable channel.
+  const tag = version.includes('-') ? 'next' : 'latest'
+  return ['publish', packageDirectory, '--access', 'public', '--provenance', '--tag', tag]
 }
 
 /** Directories to publish, platform packages first and the launcher last. */
@@ -77,6 +81,10 @@ export function publishOrder(targets = TARGETS) {
   ]
 }
 
+/**
+ * Publish or confirm native packages before the launcher, refusing missing optional
+ * dependencies and registry/publish failures.
+ */
 export async function publishNpmPackages({ root = defaultRoot, runNpm = runNpmCommand } = {}) {
   const confirmed = new Set()
 
@@ -110,7 +118,9 @@ export async function publishNpmPackages({ root = defaultRoot, runNpm = runNpmCo
     }
 
     console.log(`publishing ${spec}`)
-    const published = runNpm(npmPublishArguments(packageDirectory), { capture: false, root })
+    const published = runNpm(npmPublishArguments(packageDirectory, manifest.version), {
+      capture: false, root,
+    })
     if (published.error) {
       throw published.error
     }
@@ -123,6 +133,10 @@ export async function publishNpmPackages({ root = defaultRoot, runNpm = runNpmCo
   console.log(`published or confirmed ${confirmed.size} packages`)
 }
 
+/**
+ * Run npm in the requested root and return its process result, capturing output only when
+ * requested.
+ */
 export function runNpmCommand(arguments_, { capture, root }) {
   const { executable, prefixArguments } = npmInvocation()
   return spawnSync(executable, [...prefixArguments, ...arguments_], {

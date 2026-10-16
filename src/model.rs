@@ -20,6 +20,7 @@ mod arc_str {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::sync::Arc;
 
+    /// Serialize one shared string as a Serde string value.
     pub(super) fn serialize<S: Serializer>(
         value: &Arc<str>,
         serializer: S,
@@ -27,6 +28,7 @@ mod arc_str {
         serializer.serialize_str(value)
     }
 
+    /// Deserialize a string value into a shared string, propagating deserializer errors.
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Arc<str>, D::Error> {
@@ -41,6 +43,7 @@ mod arc_str_vec {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::sync::Arc;
 
+    /// Serialize shared strings as a sequence of string values.
     pub(super) fn serialize<S: Serializer>(
         value: &[Arc<str>],
         serializer: S,
@@ -52,6 +55,7 @@ mod arc_str_vec {
             .serialize(serializer)
     }
 
+    /// Deserialize a string sequence into shared-string elements.
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<Arc<str>>, D::Error> {
@@ -1255,6 +1259,7 @@ struct Sha256 {
 }
 
 impl Sha256 {
+    /// Initialize SHA-256 state with its standard constants and an empty partial block.
     fn new() -> Self {
         Self {
             state: SHA256_INIT,
@@ -1264,6 +1269,8 @@ impl Sha256 {
         }
     }
 
+    /// Buffer input bytes into the SHA-256 state, compressing each complete block and tracking
+    /// total length.
     fn update(&mut self, mut bytes: &[u8]) {
         self.length_bytes = self.length_bytes.wrapping_add(bytes.len() as u64);
         while !bytes.is_empty() {
@@ -1279,6 +1286,8 @@ impl Sha256 {
         }
     }
 
+    /// Apply one SHA-256 message-schedule/compression round sequence to the supplied 64-byte
+    /// block.
     fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
         for (index, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
@@ -1376,6 +1385,7 @@ struct DigestWriter {
 }
 
 impl DigestWriter {
+    /// Initialize the paired narrow/strong digest sink.
     fn new() -> Self {
         Self {
             narrow: FNV64_OFFSET,
@@ -1385,6 +1395,7 @@ impl DigestWriter {
 }
 
 impl std::io::Write for DigestWriter {
+    /// Feed all bytes into both digest states and report the complete buffer as consumed.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         for byte in buf {
             self.narrow ^= u64::from(*byte);
@@ -1394,6 +1405,7 @@ impl std::io::Write for DigestWriter {
         Ok(buf.len())
     }
 
+    /// Return success because the digest sink has no external output to flush.
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
@@ -1530,6 +1542,8 @@ impl HeapBytes for BehaviorTrace {
 }
 
 impl HeapBytes for Fingerprints {
+    /// Sum retained fingerprint heap payloads; scalar flags and the copy-only callback form add
+    /// no heap storage.
     fn heap_bytes(&self) -> usize {
         let Self {
             alpha,
@@ -1792,6 +1806,8 @@ pub struct IncompleteCauses {
     /// this struct exists to remove -- a reader told "the pair-comparison budget ran out" would
     /// go looking at `MAX_PAIR_COMPARISONS`, which was never reached.
     pub hook_scan_exhausted: bool,
+    /// Files left unanalyzed because the retained-memory budget (`--max-memory`) was reached.
+    pub files_over_memory_budget: usize,
     /// Findings discarded by the presentation cap.
     pub findings_truncated: usize,
     /// Findings withheld because no participant lay in a changed file.
@@ -1817,6 +1833,7 @@ impl IncompleteCauses {
             unresolved_contexts,
             pair_budget_exhausted,
             hook_scan_exhausted,
+            files_over_memory_budget,
             findings_truncated,
             withheld_unchanged,
         } = self;
@@ -1830,6 +1847,7 @@ impl IncompleteCauses {
             || *files_partially_read > 0
             || *files_globals_undetermined > 0
             || *unresolved_contexts > 0
+            || *files_over_memory_budget > 0
             || *findings_truncated > 0
             || *withheld_unchanged > 0
     }
@@ -1847,8 +1865,8 @@ impl IncompleteCauses {
     /// Every field is enumerated (the ignored ones underscore-bound), never `..`: a new cause
     /// must fail THIS destructure too, not only [`IncompleteCauses::any`]'s, so adding a field
     /// forces a class decision everywhere at compile time (Copilot review, PR #30 round 2).
-    /// Deliberately NOT counted: the two budget causes and the truncation cap (this tool's
-    /// limits, [`IncompleteCauses::hit_limits`]) and `withheld_unchanged` (a run-mode policy,
+    /// Deliberately NOT counted: the budget causes and the truncation cap (this tool's limits,
+    /// [`IncompleteCauses::hit_limits`]) and `withheld_unchanged` (a run-mode policy,
     /// countable only by the flag's default `any`).
     #[must_use]
     pub fn failed_reads(&self) -> bool {
@@ -1863,6 +1881,7 @@ impl IncompleteCauses {
             unresolved_contexts,
             pair_budget_exhausted: _pair_budget_exhausted,
             hook_scan_exhausted: _hook_scan_exhausted,
+            files_over_memory_budget: _files_over_memory_budget,
             findings_truncated: _findings_truncated,
             withheld_unchanged: _withheld_unchanged,
         } = self;
@@ -1896,17 +1915,21 @@ impl IncompleteCauses {
             unresolved_contexts: _unresolved_contexts,
             pair_budget_exhausted,
             hook_scan_exhausted,
+            files_over_memory_budget,
             findings_truncated,
             withheld_unchanged: _withheld_unchanged,
         } = self;
-        *pair_budget_exhausted || *hook_scan_exhausted || *findings_truncated > 0
+        *pair_budget_exhausted
+            || *hook_scan_exhausted
+            || *files_over_memory_budget > 0
+            || *findings_truncated > 0
     }
 
     /// The prose banner every renderer prints, one sentence per cause that fired,
     /// largest-blast-radius first.
     ///
     /// Ordered so the first line is the one most likely to explain a surprising report: nothing
-    /// analyzed at all, then a short file list, then the two hard limits (which mean the tool was
+    /// analyzed at all, then a short file list, then the hard limits (which mean the tool was
     /// genuinely undersized and the old banner claimed unconditionally), then per-file and
     /// per-test coverage gaps. Every sentence carries its own number, because "some tests could
     /// not be compared" and "1,729 tests could not be compared" prompt different actions.
@@ -1943,6 +1966,12 @@ impl IncompleteCauses {
                  inspected"
                     .to_string(),
             );
+        }
+        if self.files_over_memory_budget > 0 {
+            reasons.push(format!(
+                "{} file(s) were not analyzed because the memory budget was reached",
+                self.files_over_memory_budget
+            ));
         }
         if self.findings_truncated > 0 {
             reasons.push(format!(
@@ -2087,6 +2116,7 @@ impl AnalysisResult {
 mod tests {
     use super::*;
 
+    /// Build a model location fixture with the requested start and a five-column/byte endpoint.
     fn location(path: &str, line: u32, column: u32, start_byte: u32) -> Location {
         Location {
             path: PathBuf::from(path),
@@ -2102,6 +2132,8 @@ mod tests {
         }
     }
 
+    /// Build a model finding from participant locations/titles with default severity and no
+    /// baseline flag.
     fn finding(rule: Rule, participants: &[(&str, u32, &str)]) -> Finding {
         Finding {
             registration_files: Vec::new(),
@@ -2594,7 +2626,7 @@ mod tests {
     /// the struct and handled in `any()` but forgotten here fails this test instead of passing it.
     #[test]
     fn every_incomplete_cause_on_its_own_makes_the_run_incomplete() {
-        let flips: [(&str, CauseSetter); 12] = [
+        let flips: [(&str, CauseSetter); 13] = [
             ("discoveryFailed", |causes| causes.discovery_failed = true),
             ("projectConfigDegraded", |causes| {
                 causes.project_config_degraded = true;
@@ -2616,6 +2648,9 @@ mod tests {
             }),
             ("hookScanExhausted", |causes| {
                 causes.hook_scan_exhausted = true;
+            }),
+            ("filesOverMemoryBudget", |causes| {
+                causes.files_over_memory_budget = 1;
             }),
             ("findingsTruncated", |causes| causes.findings_truncated = 1),
             ("withheldUnchanged", |causes| causes.withheld_unchanged = 1),
@@ -2758,6 +2793,7 @@ mod tests {
         for set in [
             (|c: &mut IncompleteCauses| c.pair_budget_exhausted = true) as fn(&mut _),
             |c: &mut IncompleteCauses| c.hook_scan_exhausted = true,
+            |c: &mut IncompleteCauses| c.files_over_memory_budget = 1,
             |c: &mut IncompleteCauses| c.findings_truncated = 1,
         ] {
             assert_class(set, false);
@@ -2774,7 +2810,7 @@ mod tests {
 
     /// A reader acts on the first line. Ordering is therefore behaviour, not presentation: the
     /// causes that invalidate the most -- nothing read, then a short file list -- have to precede
-    /// the two hard limits, which in turn precede the per-file and per-test gaps. A run that
+    /// the hard limits, which in turn precede the per-file and per-test gaps. A run that
     /// analyzed nothing and also truncated its findings must not lead with the display cap.
     #[test]
     fn reasons_are_ordered_largest_blast_radius_first() {
@@ -2789,6 +2825,7 @@ mod tests {
             unresolved_contexts: 5,
             pair_budget_exhausted: true,
             hook_scan_exhausted: true,
+            files_over_memory_budget: 8,
             findings_truncated: 6,
             withheld_unchanged: 7,
         };
@@ -2802,23 +2839,30 @@ mod tests {
                     .unwrap_or(reason)
             })
             .collect();
-        assert_eq!(reasons.len(), 12, "every cause fired, so all twelve speak");
+        assert_eq!(
+            reasons.len(),
+            13,
+            "every cause fired, so all thirteen speak"
+        );
         assert!(reasons[0].starts_with("every discovered file failed to read"));
         assert!(reasons[1].starts_with("directory traversal failed"));
         assert!(reasons[2].starts_with("a Vitest project's configuration"));
         assert!(reasons[3].starts_with("the pair-comparison budget ran out"));
         assert!(reasons[4].starts_with("the `redundant-hook` scan budget"));
-        assert!(leads[5].starts_with("finding(s) were dropped by the display cap"));
-        assert!(leads[6].starts_with("test(s) were excluded from comparison"));
-        assert!(leads[7].starts_with("file(s) could not be read in full"));
-        assert!(leads[8].starts_with("file(s) were skipped because reading them failed"));
-        assert!(leads[9].starts_with("file(s) were skipped for exceeding the source-size limit"));
-        assert!(leads[10].starts_with("file(s) had an undetermined `globals` setting"));
-        assert!(leads[11].starts_with("finding(s) lying entirely within unchanged files"));
+        assert!(leads[5].starts_with("file(s) were not analyzed because the memory budget"));
+        assert!(leads[6].starts_with("finding(s) were dropped by the display cap"));
+        assert!(leads[7].starts_with("test(s) were excluded from comparison"));
+        assert!(leads[8].starts_with("file(s) could not be read in full"));
+        assert!(leads[9].starts_with("file(s) were skipped because reading them failed"));
+        assert!(leads[10].starts_with("file(s) were skipped for exceeding the source-size limit"));
+        assert!(leads[11].starts_with("file(s) had an undetermined `globals` setting"));
+        assert!(leads[12].starts_with("finding(s) lying entirely within unchanged files"));
     }
 
     // --- context equivalence -----------------------------------------------------------------
 
+    /// Build a non-idempotent hook fixture with the requested kind, alpha digest and retained
+    /// source text.
     fn hook(kind: HookKind, line: u32, alpha: &str, source: &str) -> Hook {
         Hook {
             kind,

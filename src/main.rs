@@ -72,6 +72,8 @@ mod rss {
     }
 }
 
+/// Run the CLI, preserving quality-gate exit codes and reporting operational errors with
+/// sanitized diagnostics.
 fn main() -> ProcessExitCode {
     match run() {
         Ok(code) => process_code(code),
@@ -190,6 +192,8 @@ fn relativize_extraction_paths(
 mod registration_path_tests {
     use super::*;
 
+    /// Regression fixture for CLI reporting: registration identity relativizes source caller
+    /// and hook paths for both passes.
     #[test]
     fn registration_identity_relativizes_source_caller_and_hook_paths_for_both_passes() {
         use vitest_dedup::discovery::{ModuleFlavor, SourceFile, SourceLanguage};
@@ -244,6 +248,32 @@ fn report_path(prefix: &std::path::Path, extension: &str) -> std::path::PathBuf 
 /// One analysis run end to end: parse args, load config, discover, extract, analyze, apply
 /// modes, write reports, decide the exit code. Every failure is a `bail!` with a sanitized
 /// message; the caller maps results to the process exit code.
+/// The memory roof `--max-memory`/`--no-memory-cap` selected.
+fn memory_roof(args: &ParsedArgs) -> vitest_dedup::memory::MemoryRoof {
+    vitest_dedup::memory::MemoryRoof::new(
+        args.memory_budget_mib
+            .map(|mib| mib.saturating_mul(1024 * 1024)),
+    )
+}
+
+/// Names where the memory roof stopped a pass and what to do about it.
+fn write_roof_diagnostic(
+    stderr: &mut impl Write,
+    pass: &str,
+    args: &ParsedArgs,
+    files_read: usize,
+    remaining: usize,
+) -> Result<()> {
+    writeln!(
+        stderr,
+        "\nvitest-dedup: the {pass} reached the memory budget ({} MiB) after {files_read} file(s); \
+         {remaining} remaining file(s) were not analyzed. Raise --max-memory, pass \
+         --no-memory-cap, or narrow the analyzed directory or `include`.",
+        args.memory_budget_mib.unwrap_or_default()
+    )?;
+    Ok(())
+}
+
 fn run() -> Result<ExitCode> {
     let args = ParsedArgs::parse()?;
     let mut stderr = std::io::stderr().lock();
@@ -384,30 +414,47 @@ fn run() -> Result<ExitCode> {
     // whose `globals` genuinely differed shows up as extra new findings (visible, fail-closed).
     let ref_baseline: Option<modes::Baseline> = match &args.baseline_from_ref {
         Some(revision) => {
-            let sources =
-                modes::revision_sources(&config.root, revision, &config.include, &config.exclude)?;
             let mut base_tests = Vec::new();
             let mut base_causes = IncompleteCauses::default();
-            for source in &sources {
-                let (language, module_flavor) =
-                    match discovery::classify_source_file(&source.relative) {
-                        Some(classified) => classified,
-                        None => continue,
+            let mut base_roof = memory_roof(&args);
+            let mut base_files = 0;
+            // One base file is held at a time; the roof stops the read, not only the extraction.
+            let unread = modes::revision_sources(
+                &config.root,
+                revision,
+                &config.include,
+                &config.exclude,
+                |source| {
+                    base_files += 1;
+                    let Some((language, module_flavor)) =
+                        discovery::classify_source_file(&source.relative)
+                    else {
+                        return Ok(true);
                     };
-                let base_file = discovery::SourceFile::without_project_context(
-                    config.root.join(&source.relative),
-                    language,
-                    module_flavor,
-                );
-                let mut extraction =
-                    frontend::extract_from_revision(&source.content, &base_file, resolved_globals);
-                if extraction.incomplete {
-                    base_causes.files_partially_read += 1;
-                }
-                relativize_extraction_paths(&mut extraction.tests, &config.root);
-                base_tests.extend(extraction.tests);
+                    let base_file = discovery::SourceFile::without_project_context(
+                        config.root.join(&source.relative),
+                        language,
+                        module_flavor,
+                    );
+                    let mut extraction = frontend::extract_from_revision(
+                        &source.content,
+                        &base_file,
+                        resolved_globals,
+                    );
+                    if extraction.incomplete {
+                        base_causes.files_partially_read += 1;
+                    }
+                    relativize_extraction_paths(&mut extraction.tests, &config.root);
+                    base_roof.charge(&extraction.tests, 0);
+                    base_tests.extend(extraction.tests);
+                    Ok(!base_roof.exceeded(&base_tests))
+                },
+            )?;
+            if unread > 0 {
+                base_causes.files_over_memory_budget = unread;
+                write_roof_diagnostic(&mut stderr, "base revision", &args, base_files, unread)?;
             }
-            let base_result = analysis::analyze(base_tests, &config, sources.len(), base_causes)?;
+            let base_result = analysis::analyze(base_tests, &config, base_files, base_causes)?;
             // A base run that could not see the whole tree (oversized, non-UTF-8, or skipped
             // files) produces a PARTIAL baseline: it accepts less than the base really had, so
             // the gate reports findings as new that the base would have accepted. The safe
@@ -517,7 +564,10 @@ fn run() -> Result<ExitCode> {
     let mut inline_suppressions: Vec<modes::InlineSuppression> = Vec::new();
 
     let mut seen_helper_sources = std::collections::BTreeSet::new();
-    for file in &discovered.files {
+    let mut roof = memory_roof(&args);
+    for (index, file) in discovered.files.iter().enumerate() {
+        // Source text this file adds to `retained_sources`, charged to the memory roof.
+        let mut retained_text = 0;
         // A single unreadable file must degrade this file, not the run. `read_to_string` fails on
         // any non-UTF-8 byte, and propagating that aborted the whole analysis with exit 2 and no
         // report at all -- losing every finding from every other file, and not even naming the
@@ -558,11 +608,15 @@ fn run() -> Result<ExitCode> {
         files_read += 1;
         if retain_sources {
             // Clone, not move: `extract` parses this same `source` below, and the byte spans in
-            // every `Location` it produces index into exactly these bytes.
-            retained_sources.insert(
+            // every `Location` it produces index into exactly these bytes. Charged only when new:
+            // a test file already retained as a helper's source holds one copy.
+            let previous = retained_sources.insert(
                 relativize_test_path(&file.path, &config.root),
                 source.clone(),
             );
+            if previous.is_none() {
+                retained_text += source.len();
+            }
         }
         inline_suppressions.extend(modes::scan_inline_suppressions(
             &source,
@@ -662,7 +716,10 @@ fn run() -> Result<ExitCode> {
                 relative.clone(),
             ));
             if retain_sources {
-                retained_sources.insert(relative, helper_source);
+                let length = helper_source.len();
+                if retained_sources.insert(relative, helper_source).is_none() {
+                    retained_text += length;
+                }
             }
         }
         if extraction.proven_empty {
@@ -701,7 +758,16 @@ fn run() -> Result<ExitCode> {
         // Relativizing both here, at the single point where the analysis root is known, keeps the
         // two location families from ever disagreeing about what a reported path means.
         relativize_extraction_paths(&mut extraction.tests, &config.root);
+        roof.charge(&extraction.tests, retained_text);
         tests.extend(extraction.tests);
+        // Whole files only: stopping here keeps every per-file side effect above consistent, so
+        // the run is exactly a run over the files read so far.
+        let remaining = discovered.files.len() - index - 1;
+        if remaining > 0 && roof.exceeded(&tests) {
+            causes.files_over_memory_budget = remaining;
+            write_roof_diagnostic(&mut stderr, "analysis", &args, files_read, remaining)?;
+            break;
+        }
     }
 
     drop(seen_helper_sources);
@@ -958,8 +1024,12 @@ fn run() -> Result<ExitCode> {
                         format!("creating report directory {}", parent.display())
                     })?;
                 }
-                let mut file = std::fs::File::create(&path)
-                    .with_context(|| format!("writing report {}", path.display()))?;
+                // Buffered: the serializers emit one small write per token, and an unbuffered
+                // `File` turns each into a syscall. `flush` below still surfaces write errors.
+                let mut file = std::io::BufWriter::new(
+                    std::fs::File::create(&path)
+                        .with_context(|| format!("writing report {}", path.display()))?,
+                );
                 match reporter {
                     ReporterKind::Json => JsonReporter::new().write_report(&result, &mut file)?,
                     ReporterKind::Html => {
@@ -1174,6 +1244,7 @@ mod tests {
         });
     "#;
 
+    /// Write a Vitest config and companion ordinary/in-source test fixtures beneath root.
     fn write_project(root: &std::path::Path, config_test_body: &str) {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
@@ -1216,6 +1287,8 @@ mod tests {
         (stderr, read_json_report(&root.join("report")))
     }
 
+    /// Run the CLI successfully with a JSON output prefix, then read and parse the generated
+    /// report.
     fn run_json(root: &std::path::Path, extra_args: &[&str]) -> serde_json::Value {
         let output_prefix = root.join("report");
         // The process outcome is part of what this helper verifies, not just the file it leaves
@@ -1239,6 +1312,8 @@ mod tests {
         serde_json::from_str(&report).unwrap()
     }
 
+    /// Regression fixture for CLI reporting: cell census counts files once and stays off
+    /// machine stdout.
     #[test]
     fn cell_census_counts_files_once_and_stays_off_machine_stdout() {
         let directory = tempfile::tempdir().unwrap();
@@ -1277,6 +1352,8 @@ mod tests {
             .contains("cell census"));
     }
 
+    /// Regression fixture for CLI reporting: in source file in a globals true project yields
+    /// its ambient tests.
     #[test]
     fn in_source_file_in_a_globals_true_project_yields_its_ambient_tests() {
         let directory = tempfile::tempdir().unwrap();
@@ -1295,6 +1372,8 @@ mod tests {
         assert_eq!(report["incomplete"], false);
     }
 
+    /// Regression fixture for CLI reporting: in source file in a globals false project yields
+    /// no ambient test.
     #[test]
     fn in_source_file_in_a_globals_false_project_yields_no_ambient_test() {
         // Same file, same `includeSource`, only `globals` differs: the ambient `test(...)` call
@@ -1316,6 +1395,8 @@ mod tests {
         assert_eq!(report["incomplete"], false);
     }
 
+    /// Regression fixture for CLI reporting: in source file whose projects globals is unknown
+    /// marks the run incomplete.
     #[test]
     fn in_source_file_whose_projects_globals_is_unknown_marks_the_run_incomplete() {
         // The admitting project's own `globals` cannot be read. Falling back to the
@@ -1385,6 +1466,8 @@ mod tests {
         std::fs::write(root.join("sub/companion.test.ts"), ORDINARY_TEST).unwrap();
     }
 
+    /// Regression fixture for CLI reporting: ordinary file whose projects globals is unknown
+    /// marks the run incomplete.
     #[test]
     fn ordinary_file_whose_projects_globals_is_unknown_marks_the_run_incomplete() {
         // `sub/ambient.test.ts` is governed by the `sub` project (matched via its `include`
@@ -1410,6 +1493,8 @@ mod tests {
         assert_fail_on_incomplete_is_operational_error(directory.path());
     }
 
+    /// Regression fixture for CLI reporting: file governed by no project still uses the
+    /// repository wide fallback.
     #[test]
     fn file_governed_by_no_project_still_uses_the_repository_wide_fallback() {
         // No `vitest.config.*`/`vite.config.*` at all: `resolve_projects` reports
@@ -1436,6 +1521,8 @@ mod tests {
     // -- always blaming `test.globals` -- but the guard itself must keep firing (`incomplete`     -
     // -- stays `true`), since Vitest itself refuses such a file ("No test suite found in file").  -
 
+    /// Regression fixture for CLI reporting: statically empty each table explains zero tests
+    /// without blaming globals.
     #[test]
     fn statically_empty_each_table_explains_zero_tests_without_blaming_globals() {
         // The exact reproduction from the review: `test.each([])` statically proves zero rows,
@@ -1473,6 +1560,8 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: a wholly excluded file is named on stderr and
+    /// counted in the report.
     #[test]
     fn a_wholly_excluded_file_is_named_on_stderr_and_counted_in_the_report() {
         // The deception this closes: `blind.test.ts` produces no findings, so it appears nowhere
@@ -1518,6 +1607,8 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: ordinary zero extraction names observation and
+    /// both binding sources.
     #[test]
     fn ordinary_zero_extraction_names_observation_and_both_binding_sources() {
         // Contrast with the test above: zero extraction gives no static proof of WHY no test was
@@ -1556,6 +1647,8 @@ mod tests {
         assert_eq!(report["incomplete"], true, "{report:#?}");
     }
 
+    /// Regression fixture for CLI reporting: imported but empty file is an independent
+    /// operational failure.
     #[test]
     fn imported_but_empty_file_is_an_independent_operational_failure() {
         // Kept independent of the ambient-globals fixture so this ordinary supported-import case
@@ -1742,6 +1835,7 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: a hostile filename reaches stderr sanitized.
     #[test]
     fn a_hostile_filename_reaches_stderr_sanitized() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1819,6 +1913,8 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: relativize test path strips the root for a path
+    /// beneath it.
     #[test]
     fn relativize_test_path_strips_the_root_for_a_path_beneath_it() {
         let root = std::path::Path::new("/repo/analysis-root");
@@ -1857,6 +1953,8 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: relativize test path strips an existing verbatim
+    /// prefix mismatch.
     #[cfg(windows)]
     #[test]
     fn relativize_test_path_strips_an_existing_verbatim_prefix_mismatch() {
@@ -1877,6 +1975,8 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: relativize test path keeps a missing verbatim path
+    /// unchanged.
     #[cfg(windows)]
     #[test]
     fn relativize_test_path_keeps_a_missing_verbatim_path_unchanged() {
@@ -1885,6 +1985,8 @@ mod tests {
         assert_eq!(relativize_test_path(missing, root), missing);
     }
 
+    /// Regression fixture for CLI reporting: relativize test path strips a matching unc share
+    /// root.
     #[cfg(windows)]
     #[test]
     fn relativize_test_path_strips_a_matching_unc_share_root() {
@@ -1903,6 +2005,8 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: relativize test path forwards whatever the
+    /// platform cannot strip.
     #[test]
     fn relativize_test_path_forwards_whatever_the_platform_cannot_strip() {
         // Platform-neutral statement of the contract, exercised with the Windows-shaped strings
@@ -1955,6 +2059,7 @@ mod tests {
         );
     }
 
+    /// Load a temporary fixture config with the requested threshold override.
     fn config_with_threshold(threshold: u8) -> Config {
         let directory = tempfile::tempdir().unwrap();
         Config::load(
@@ -1976,6 +2081,7 @@ mod tests {
     /// reads gate on it would send someone chasing the wrong fix.
     use vitest_dedup::cli::FailOnIncomplete;
 
+    /// Regression fixture for CLI reporting: fail on incomplete reads ignores limit causes.
     #[test]
     fn fail_on_incomplete_reads_ignores_limit_causes() {
         let config = config_with_threshold(0);
@@ -2039,6 +2145,8 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: fail on incomplete returns operational error not
+    /// quality gate failed.
     #[test]
     fn fail_on_incomplete_returns_operational_error_not_quality_gate_failed() {
         let config = config_with_threshold(0);
@@ -2056,6 +2164,7 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: a finding-free zero-test run is an operational error.
     #[test]
     fn nothing_analyzed_is_always_an_operational_error() {
         let config = config_with_threshold(0);
@@ -2066,6 +2175,8 @@ mod tests {
         );
     }
 
+    /// Regression fixture for CLI reporting: zero executable tests preserve real quality
+    /// failures.
     #[test]
     fn zero_executable_tests_preserve_real_quality_failures() {
         let strict_config = config_with_threshold(0);
@@ -2226,6 +2337,8 @@ mod tests {
         )
     }
 
+    /// Read and parse the JSON file for an output prefix, panicking with path context on
+    /// failure.
     fn read_json_report(prefix: &std::path::Path) -> serde_json::Value {
         let path = prefix.with_extension("json");
         serde_json::from_str(
@@ -2448,9 +2561,9 @@ mod tests {
     }
 
     /// The review-found geometry: the analysis root is a SUBDIRECTORY of the git repository.
-    /// `ls-tree` run from there lists paths relative to it, while `cat-file commit:path`
-    /// resolves from the repository root -- without the `./` form the base read silently reads
-    /// the wrong paths (or fails), and the baseline would be computed from nothing. Pinned from
+    /// `ls-tree` run from there lists paths relative to it; a read that resolved those paths from
+    /// the repository root would silently read the wrong files (or fail), and the baseline would
+    /// be computed from nothing. Blobs are now read by the object id `ls-tree` lists. Pinned from
     /// `src/`: a committed duplicate pair under a subdirectory must still be accepted from the
     /// base revision.
     #[test]
@@ -2509,6 +2622,39 @@ mod tests {
             stderr.contains("invalid --baseline-from-ref revision"),
             "{stderr}"
         );
+    }
+
+    /// Refusals keep listing order: an oversized base file listed before an unreadable entry (a
+    /// gitlink named like a test file) still gets its skip line before the run fails, as it did
+    /// when each file was read in turn.
+    #[test]
+    fn baseline_from_ref_reports_earlier_skips_before_a_later_refusal() {
+        let directory = single_file_project("c-ok.test.ts", DUPLICATE_PAIR);
+        let root = directory.path();
+        std::fs::write(root.join("a-huge.test.ts"), "x".repeat(8 * 1024 * 1024 + 1)).unwrap();
+        init_repository(root);
+        // A gitlink's commit need not exist in this repository.
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                "1234567890123456789012345678901234567890",
+                "b-vendor.test.ts",
+            ],
+        );
+        git(root, &["commit", "-qm", "gitlink"]);
+        let (code, _, stderr) = run_cli(root, &["--baseline-from-ref", "HEAD"]);
+        assert_eq!(code, Some(2), "{stderr}");
+        let skip = stderr
+            .find("skipping a-huge.test.ts in the base revision: exceeds the byte limit")
+            .unwrap_or_else(|| panic!("the earlier skip is reported: {stderr}"));
+        let refusal = stderr
+            .find("git failed while reading base file `b-vendor.test.ts`")
+            .unwrap_or_else(|| panic!("the gitlink is refused: {stderr}"));
+        assert!(skip < refusal, "skip before refusal: {stderr}");
     }
 
     #[test]
@@ -2574,6 +2720,7 @@ mod tests {
         assert_eq!(code, Some(1), "without a directive the pair still fires");
     }
 
+    /// Regression fixture for CLI reporting: fail on new fires only above its limit.
     #[test]
     fn fail_on_new_fires_only_above_its_limit() {
         let directory = single_file_project("math.test.ts", DUPLICATE_PAIR);
@@ -2638,6 +2785,8 @@ mod tests {
         assert_eq!(code, Some(1));
     }
 
+    /// Regression fixture for CLI reporting: update baseline refuses to record an incomplete
+    /// run.
     #[test]
     fn update_baseline_refuses_to_record_an_incomplete_run() {
         // An incomplete run does not know what it would be accepting, and a baseline written from
@@ -2668,6 +2817,8 @@ mod tests {
 
     // -- `--changed-since` ------------------------------------------------------------------
 
+    /// Run a fixture Git operation after removing inherited repository-path environment
+    /// variables.
     fn git(root: &std::path::Path, args: &[&str]) {
         let mut command = std::process::Command::new("git");
         // The same inherited-environment hazard `modes.rs` documents: when this suite runs from a
@@ -2693,6 +2844,7 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    /// Initialize and commit the fixture tree with a local test identity on main.
     fn init_repository(root: &std::path::Path) {
         git(root, &["init", "-q", "-b", "main"]);
         git(root, &["config", "user.email", "test@example.com"]);
@@ -3195,6 +3347,7 @@ mod tests {
                 assertEqual<Record<string, string>, Expected>(true);
             });"#;
 
+    /// Build a temporary type-level declaration fixture and return its all-rules JSON report.
     fn type_level_report(helpers: &str, declarations: &str) -> serde_json::Value {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -3234,12 +3387,14 @@ mod tests {
         (lines, summary)
     }
 
+    /// Create and return a temporary workspace containing the requested source file.
     fn single_file_project(file: &str, contents: &str) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join(file), contents).unwrap();
         directory
     }
 
+    /// Run the fixture CLI and parse each stdout line as an independent JSON record.
     fn run_jsonl(root: &std::path::Path, extra_args: &[&str]) -> Vec<serde_json::Value> {
         let (_, stdout, _) = run_cli(root, extra_args);
         stdout
@@ -3251,6 +3406,7 @@ mod tests {
             .collect()
     }
 
+    /// Borrow records matching the requested JSONL type.
     fn records_of<'a>(lines: &'a [serde_json::Value], kind: &str) -> Vec<&'a serde_json::Value> {
         lines
             .iter()
@@ -3800,6 +3956,7 @@ mod tests {
     // and two different hook kinds with byte-identical bodies must stay distinguishable.
     // =========================================================================================
 
+    /// Sort borrowed JSONL records by their numeric line field.
     fn sorted_by_line(records: Vec<&serde_json::Value>) -> Vec<&serde_json::Value> {
         let mut records = records;
         records.sort_by_key(|record| record["line"].as_u64().unwrap());
