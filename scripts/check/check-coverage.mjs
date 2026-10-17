@@ -125,6 +125,8 @@ const RUST_MIN_INSTRUMENTED_LINES = 12_000 // 15,261 today.
 
 const RUST_MODULES = {
   'src/analysis.rs': 84,
+  // Atomic publication: measured at 95.45% (21/22 instrumented lines).
+  'src/atomic_write.rs': 95,
   'src/analysis/pairs.rs': 100,
   'src/cli.rs': 98,
   'src/config.rs': 98,
@@ -251,6 +253,8 @@ const JS_MIN_TESTS = 100 // 235 today across the 15 enumerated suite files.
 
 const JS_MODULES = {
   'scripts/dev/verify.mjs': 100,
+  // Action pin gate measured 67/67 lines with owned YAML cases.
+  'scripts/check/check-action-pins.mjs': 100,
   'scripts/check/check-docstrings.mjs': 100,
   // Both were in JS_NOT_MEASURED as "reached only through a gate that needs a release binary".
   // `lib/fixture-directives.test.mjs` (2026-09-27) made that false for the parser, and pulled
