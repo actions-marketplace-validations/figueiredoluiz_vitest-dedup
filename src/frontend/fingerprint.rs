@@ -3936,6 +3936,75 @@ impl<'a, 'b, 's, 'm> Serializer<'a, 'b, 's, 'm> {
 // behavior events
 // ---------------------------------------------------------------------------------------------
 
+/// Accept import/global constructor paths through erased wrappers, without local aliases.
+fn external_constructor(callee: &Expression<'_>, semantic: &Semantic<'_>, depth: u32) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    match callee {
+        Expression::Identifier(ident) => ident.reference_id.get().is_some_and(|id| {
+            semantic
+                .scoping()
+                .get_reference(id)
+                .symbol_id()
+                .is_none_or(|id| semantic.scoping().symbol_flags(id).is_import())
+        }),
+        Expression::StaticMemberExpression(member) => {
+            external_constructor(&member.object, semantic, depth + 1)
+        }
+        Expression::ParenthesizedExpression(wrapper) => {
+            external_constructor(&wrapper.expression, semantic, depth + 1)
+        }
+        Expression::TSAsExpression(wrapper) => {
+            external_constructor(&wrapper.expression, semantic, depth + 1)
+        }
+        Expression::TSSatisfiesExpression(wrapper) => {
+            external_constructor(&wrapper.expression, semantic, depth + 1)
+        }
+        Expression::TSNonNullExpression(wrapper) => {
+            external_constructor(&wrapper.expression, semantic, depth + 1)
+        }
+        Expression::TSTypeAssertion(wrapper) => {
+            external_constructor(&wrapper.expression, semantic, depth + 1)
+        }
+        _ => false,
+    }
+}
+
+/// Veto the whole callback if a nested or earlier local construction could enter a new event.
+struct ConstructorScope<'s, 'a> {
+    semantic: &'s Semantic<'a>,
+    supported: bool,
+    depth: u32,
+}
+impl<'a> Visit<'a> for ConstructorScope<'_, 'a> {
+    /// Bound recursive expressions and check constructors even inside atomic assertions.
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.supported || self.depth >= MAX_DEPTH {
+            self.supported = false;
+            return;
+        }
+        self.depth += 1;
+        if let Expression::NewExpression(new) = expression {
+            self.supported = external_constructor(&new.callee, self.semantic, 0);
+        }
+        if self.supported {
+            walk::walk_expression(self, expression);
+        }
+        self.depth -= 1;
+    }
+    /// Bound statement nesting as well as expression nesting.
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.supported || self.depth >= MAX_DEPTH {
+            self.supported = false;
+            return;
+        }
+        self.depth += 1;
+        walk::walk_statement(self, statement);
+        self.depth -= 1;
+    }
+}
+
 /// Collects the ordered behavior signature: canonical callee paths, assertions, awaits, and
 /// control-flow markers, in source order.
 struct BehaviorCollector<'a, 'b, 's, 'm> {
@@ -3943,6 +4012,7 @@ struct BehaviorCollector<'a, 'b, 's, 'm> {
     /// see [`FingerprintContext`].
     ctx: FingerprintContext<'a, 'b, 's, 'm>,
     events: Vec<String>,
+    constructor_events: bool,
 }
 
 impl<'a, 'b, 's, 'm> BehaviorCollector<'a, 'b, 's, 'm> {
@@ -3951,11 +4021,24 @@ impl<'a, 'b, 's, 'm> BehaviorCollector<'a, 'b, 's, 'm> {
         Self {
             ctx,
             events: Vec::new(),
+            constructor_events: false,
         }
     }
 
     /// Collect ordered behavior events from a callable body or concise arrow expression.
     fn run(mut self, body: &FunctionLike<'a, '_>) -> Vec<String> {
+        let mut scope = ConstructorScope {
+            semantic: self.ctx.semantic,
+            supported: true,
+            depth: 0,
+        };
+        match body {
+            FunctionLike::Arrow(arrow) => scope.visit_arrow_function_expression(arrow),
+            FunctionLike::Function(function) => {
+                scope.visit_function(function, oxc_syntax::scope::ScopeFlags::empty())
+            }
+        }
+        self.constructor_events = scope.supported;
         match body {
             FunctionLike::Arrow(arrow) => match &arrow.body {
                 ArrowFunctionBody::FunctionBody(function_body) => {
@@ -4072,7 +4155,10 @@ impl<'a, 'b, 's, 'm> BehaviorCollector<'a, 'b, 's, 'm> {
     }
 
     /// Append a behavior event, prefixing it when its execution is deferred.
-    fn push(&mut self, deferred: bool, event: String) {
+    fn push(&mut self, deferred: bool, mut event: String) {
+        if !self.constructor_events {
+            event.push_str("|unmodeled-constructor-scope");
+        }
         self.events.push(if deferred {
             format!("deferred-{event}")
         } else {
@@ -4123,6 +4209,17 @@ impl<'a, 'b, 's, 'm> BehaviorCollector<'a, 'b, 's, 'm> {
                 }
             }
             Statement::ForStatement(for_statement) => {
+                if let Some(init) = &for_statement.init {
+                    if let ForStatementInit::VariableDeclaration(declaration) = init {
+                        for declarator in &declaration.declarations {
+                            if let Some(value) = &declarator.init {
+                                self.walk_expr(value, deferred, depth + 1);
+                            }
+                        }
+                    } else if let Some(expression) = init.as_expression() {
+                        self.walk_expr(expression, deferred, depth + 1);
+                    }
+                }
                 self.push(deferred, "loop".to_owned());
                 if let Some(test) = &for_statement.test {
                     self.walk_expr(test, deferred, depth + 1);
@@ -4226,6 +4323,18 @@ impl<'a, 'b, 's, 'm> BehaviorCollector<'a, 'b, 's, 'm> {
         }
         match expr {
             Expression::CallExpression(call) => self.walk_call(call, deferred, depth + 1),
+            Expression::NewExpression(new) if self.constructor_events => {
+                let shape = self.shape(expr, Mode::Alpha, depth + 1);
+                self.push(deferred, format!("new:{shape}"));
+                self.walk_under_members(&new.callee, deferred, depth + 1);
+                for argument in &new.arguments {
+                    if let Some(inner) = argument.as_expression() {
+                        self.walk_expr(inner, deferred, depth + 1);
+                    } else if let Argument::SpreadElement(spread) = argument {
+                        self.walk_expr(&spread.argument, deferred, depth + 1);
+                    }
+                }
+            }
             Expression::AwaitExpression(await_expression) => {
                 self.push(deferred, "await".to_owned());
                 self.walk_expr(&await_expression.argument, deferred, depth + 1);
@@ -4308,6 +4417,11 @@ impl<'a, 'b, 's, 'm> BehaviorCollector<'a, 'b, 's, 'm> {
             Expression::SequenceExpression(sequence) => {
                 for inner in &sequence.expressions {
                     self.walk_expr(inner, deferred, depth + 1);
+                }
+            }
+            Expression::TemplateLiteral(template) => {
+                for expression in &template.expressions {
+                    self.walk_expr(expression, deferred, depth + 1);
                 }
             }
             Expression::ArrayExpression(array) => {
@@ -7886,7 +8000,7 @@ test('x', () => { const w = 1; f(w); });"#;
         let inside = MAX_DEPTH as usize;
         assert_eq!(
             events(nest(inside, "if(1);", false)),
-            vec!["if".to_owned()],
+            vec!["if|unmodeled-constructor-scope".to_owned()],
             "`walk_stmt` at depth MAX_DEPTH exactly must still record"
         );
         assert!(
@@ -7898,7 +8012,7 @@ test('x', () => { const w = 1; f(w); });"#;
         let inside = (MAX_DEPTH - 1) as usize;
         assert_eq!(
             events(nest(inside, "await f();", true)),
-            vec!["await".to_owned()],
+            vec!["await|unmodeled-constructor-scope".to_owned()],
             "`walk_expr` at depth MAX_DEPTH exactly must still record"
         );
         assert!(
@@ -10079,6 +10193,349 @@ test('t', () => { g(r); });",
             event.contains("subject=id:L0:prop:a"),
             "a read inside a branch is not safe to rewrite as member access, but its property \
              identity must survive: {event}"
+        );
+    }
+
+    /// Check final rule outcomes with explicit extraction and completeness controls.
+    fn constructor_rules(first: &str, second: &str) -> Vec<crate::model::Rule> {
+        use crate::discovery::{ModuleFlavor, SourceFile, SourceLanguage};
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join(".vitest-dedup.json");
+        std::fs::write(&settings, r#"{"rules":{"subsumed-test":"warning"}}"#).unwrap();
+        let config = crate::config::Config::load(directory.path(), Default::default()).unwrap();
+        let source = format!("import {{test,expect}} from 'vitest';import {{Store,Cart}} from './store.js';class Local{{constructor(){{trace.push(2)}}}}test('first',()=>{first});test('second',()=>{second});");
+        let file = SourceFile::without_project_context(
+            directory.path().join("case.test.ts"),
+            SourceLanguage::TypeScript,
+            ModuleFlavor::ForcedEsm,
+        );
+        let extracted =
+            crate::frontend::extract(&source, &file, crate::frontend::Globals::Disabled);
+        assert_eq!(extracted.tests.len(), 2);
+        assert!(!extracted.incomplete);
+        let run =
+            crate::analysis::analyze(extracted.tests, &config, 1, Default::default()).unwrap();
+        assert_eq!(run.unresolved_tests, 0);
+        assert!(!run.incomplete());
+        run.findings.into_iter().map(|f| f.rule).collect()
+    }
+
+    /// Constructor evidence rejects changed work and retains equivalent and strict-superset cases.
+    #[test]
+    fn external_constructor_outcomes() {
+        use crate::model::Rule::*;
+        for (first, second) in [
+            ("new Store(loadA())", "new Cart(loadA())"),
+            ("new Store(loadA())", "new Store(loadB())"),
+            ("new Store<string>(1)", "new Store<number>(1)"),
+            ("new Store(...a)", "new Store(...b)"),
+            ("new Store(1)", "Store(1)"),
+            (
+                "class Local{constructor(){trace.push(2)}}new Store(1);new Local()",
+                "new Store(1)",
+            ),
+        ] {
+            let rules = constructor_rules(
+                &format!("{{{first};tick();expect(trace).toEqual([1])}}"),
+                &format!("{{{second};tick();expect(trace).toEqual([1])}}"),
+            );
+            assert!(
+                !rules.contains(&NearDuplicateTest) && !rules.contains(&SubsumedTest),
+                "{first}: {rules:?}"
+            );
+        }
+        for (first, second, rule) in [
+            ("new Store(1);", "new Store(1);", DuplicateTest),
+            ("new Store(1);", "void 0;new Store(1);", NearDuplicateTest),
+            ("new Store(1);", "new Store(2);", ParameterizationCandidate),
+            ("new Store(1);", "new Store(1);tick();", SubsumedTest),
+            (
+                "class C{};new C();tick();",
+                "class C{};void 0;new C();tick();",
+                NearDuplicateTest,
+            ),
+        ] {
+            assert!(constructor_rules(
+                &format!("{{{first}expect(trace).toEqual([1])}}"),
+                &format!("{{{second}expect(trace).toEqual([1])}}")
+            )
+            .contains(&rule));
+        }
+    }
+
+    /// Local/dynamic constructors veto outer events without changing the existing behavior trace.
+    #[test]
+    fn external_constructor_scope_and_order() {
+        for body in [
+            "class C{};new C();",
+            "const C=Store;new C();",
+            "new (factory())();",
+            "new ns[pick()]();",
+            "new Store(new Local());class Local{}",
+            "class Local{};const x=new Local();new Store(x);",
+            "new Store();expect(new Local()).toBeDefined();class Local{}",
+        ] {
+            assert!(
+                !behavior_of(body)
+                    .iter()
+                    .any(|event| event.starts_with("new:")),
+                "{body}"
+            );
+        }
+        let rules = constructor_rules(
+            "load().then(()=>{new Store(1);new Local();tick();expect(trace).toEqual([1])})",
+            "load().then(()=>{new Store(1);tick();expect(trace).toEqual([1])})",
+        );
+        assert!(
+            !rules.contains(&crate::model::Rule::SubsumedTest),
+            "{rules:?}"
+        );
+        let events = behavior_of("new Store(first(), ...second());");
+        assert!(events[0].starts_with("new:"));
+        assert!(
+            events[1].contains("first") && events[2].contains("second"),
+            "{events:?}"
+        );
+        assert!(behavior_of("function f(){new Store()}f();")
+            .iter()
+            .any(|event| event.starts_with("deferred-new:")));
+    }
+
+    /// Newly visited constructor positions distinguish subjects without silencing valid matches.
+    #[test]
+    fn constructor_traversal_outcomes() {
+        use crate::model::Rule::*;
+        for (first, second) in [
+            ("for(new Store();false;){}", "for(new Cart();false;){}"),
+            (
+                "for(const value=new Store();false;){}",
+                "for(const value=new Cart();false;){}",
+            ),
+            ("`${new Store()}`;", "`${new Cart()}`;"),
+            (
+                "for(const value=seedA();false;){}",
+                "for(const value=seedB();false;){}",
+            ),
+            ("`${seedA()}`;", "`${seedB()}`;"),
+            ("`${`${new Store()}`}`;", "`${`${new Cart()}`}`;"),
+        ] {
+            let rules = constructor_rules(
+                &format!("{{{first}tick();expect(trace).toEqual([1])}}"),
+                &format!("{{{second}tick();expect(trace).toEqual([1])}}"),
+            );
+            assert!(rules.is_empty(), "{first}: {rules:?}");
+        }
+        for (first, second, rule) in [
+            (
+                "for(new Store(1);false;){}",
+                "for(new Store(1);false;){}",
+                DuplicateTest,
+            ),
+            (
+                "for(const v=new Store(1);false;){}",
+                "void 0;for(const v=new Store(1);false;){}",
+                NearDuplicateTest,
+            ),
+            (
+                "`${new Store(1)}`;",
+                "`${new Store(2)}`;",
+                ParameterizationCandidate,
+            ),
+            (
+                "`${new Store(1)}`;",
+                "`${new Store(1)}`;extra();",
+                SubsumedTest,
+            ),
+            ("`${seed()}`;", "`${seed()}`;extra();", SubsumedTest),
+            (
+                "class C{};for(new C();false;){}",
+                "class C{};void 0;for(new C();false;){}",
+                NearDuplicateTest,
+            ),
+        ] {
+            assert!(
+                constructor_rules(
+                    &format!("{{{first}tick();expect(trace).toEqual([1])}}"),
+                    &format!("{{{second}tick();expect(trace).toEqual([1])}}")
+                )
+                .contains(&rule),
+                "{first}: expected {rule:?}"
+            );
+        }
+    }
+
+    /// Erased callee wrappers preserve constructor identity, effects and valid findings.
+    #[test]
+    fn constructor_wrapper_outcomes() {
+        use crate::model::Rule::*;
+        for wrapper in [
+            "({})",
+            "({} as any)",
+            "({} satisfies any)",
+            "{}!",
+            "(<any>{})",
+            "(({} as any)!)",
+        ] {
+            let store = wrapper.replace("{}", "Store");
+            let cart = wrapper.replace("{}", "Cart");
+            let first = format!("{{new {store}();tick();expect(trace).toEqual([1])}}");
+            let second = format!("{{new {cart}();tick();expect(trace).toEqual([1])}}");
+            assert!(constructor_rules(&first, &second).is_empty(), "{wrapper}");
+            for (first, second, rule) in [
+                (
+                    format!("new {store}(1);"),
+                    format!("new {store}(1);"),
+                    DuplicateTest,
+                ),
+                (
+                    "new Store(1);".into(),
+                    format!("void 0;new {store}(1);"),
+                    NearDuplicateTest,
+                ),
+                (
+                    format!("new {store}(1);"),
+                    format!("new {store}(2);"),
+                    ParameterizationCandidate,
+                ),
+                (
+                    format!("new {store}(1);"),
+                    format!("new {store}(1);extra();"),
+                    SubsumedTest,
+                ),
+            ] {
+                assert!(
+                    constructor_rules(
+                        &format!("{{{first}tick();expect(trace).toEqual([1])}}"),
+                        &format!("{{{second}tick();expect(trace).toEqual([1])}}"),
+                    )
+                    .contains(&rule),
+                    "{wrapper}: expected {rule:?}"
+                );
+            }
+        }
+        for (first, second) in [
+            ("new (Store as any)(loadA())", "new (Store as any)(loadB())"),
+            (
+                "new (Store as any)<string>()",
+                "new (Store as any)<number>()",
+            ),
+            (
+                "new (Store as any)(first(),second())",
+                "new (Store as any)(second(),first())",
+            ),
+            (
+                "new ((Store as any).Builder)()",
+                "new ((Store as any).Other)()",
+            ),
+            ("new (Store as any)()", "(Store as any)()"),
+        ] {
+            assert!(
+                constructor_rules(
+                    &format!("{{{first};tick();expect(trace).toEqual([1])}}"),
+                    &format!("{{{second};tick();expect(trace).toEqual([1])}}"),
+                )
+                .is_empty(),
+                "{first}"
+            );
+        }
+        assert!(constructor_rules(
+            "{new Store.Builder();tick();expect(trace).toEqual([1])}",
+            "{void 0;new ((Store satisfies any).Builder)();tick();expect(trace).toEqual([1])}",
+        )
+        .contains(&NearDuplicateTest));
+    }
+
+    /// Wrappers cannot turn local or dynamic roots into supported constructor evidence.
+    #[test]
+    fn constructor_wrapper_scope() {
+        for body in [
+            "class C{};new (C as any)();",
+            "const C=Store;new (C satisfies any)();",
+            "const Store=class{};new Store!();",
+            "new ((factory()) as any)();",
+            "new (ns[pick()] as any)();",
+            "new Store();expect(new (Local as any)()).toBeDefined();class Local{}",
+            "function f(){class C{};new (C as any)();}new Store();",
+            "new (Store<string>)();",
+        ] {
+            let events = behavior_of(&format!("{body}tick();"));
+            assert!(!events.is_empty(), "{body}");
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e.ends_with("|unmodeled-constructor-scope")),
+                "{body}: {events:?}"
+            );
+        }
+        assert!(constructor_rules(
+            "{new (<any>Local)();tick();expect(trace).toEqual([1])}",
+            "{new Store();tick();expect(trace).toEqual([1])}",
+        )
+        .is_empty());
+        let events = behavior_of("new ((Store as any) satisfies any)!(first(),...second());");
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(events[0].starts_with("new:"), "{events:?}");
+        assert!(
+            events[1].contains("first") && events[2].contains("second"),
+            "{events:?}"
+        );
+        assert_eq!(
+            behavior_of("function f(){new (Store as any)()}"),
+            behavior_of("function f(){new Store()}"),
+        );
+        let callee = format!(
+            "{}Store{}",
+            "(".repeat(MAX_DEPTH as usize + 1),
+            ")".repeat(MAX_DEPTH as usize + 1)
+        );
+        let events = behavior_of(&format!("new {callee}();tick();"));
+        assert!(
+            events
+                .iter()
+                .all(|e| e.ends_with("|unmodeled-constructor-scope")),
+            "{events:?}"
+        );
+    }
+
+    /// Initializers/interpolations retain source order, deferred scope and single-use inlining.
+    #[test]
+    fn constructor_traversal_order_and_deferred() {
+        let events =
+            behavior_of("for(const a=first(),b=new Store(second());condition();update()){body()}");
+        assert!(events[0].starts_with("call:global:first"), "{events:?}");
+        assert!(
+            events[1].starts_with("new:") && events[2].starts_with("call:global:second"),
+            "{events:?}"
+        );
+        assert_eq!(events[3], "loop");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("new:"))
+                .count(),
+            1
+        );
+        let events = behavior_of("`${first()}${new Store(second())}${third()}`;");
+        assert_eq!(events.len(), 4, "{events:?}");
+        for (event, prefix) in events.iter().zip([
+            "call:global:first",
+            "new:",
+            "call:global:second",
+            "call:global:third",
+        ]) {
+            assert!(event.starts_with(prefix), "{events:?}");
+        }
+        let events = behavior_of("function build(){for(new Store();false;){} `${new Store()}`;}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("deferred-new:"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            behavior_of("const value=`${new Store(1)}`;consume(value);"),
+            behavior_of("consume(`${new Store(1)}`);")
         );
     }
 }
