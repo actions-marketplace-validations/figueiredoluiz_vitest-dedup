@@ -151,6 +151,8 @@ const RUST_MODULES = {
   // production lines covered, not more tests: a table-driven test adds mostly uninstrumented
   // data lines, so volume alone moves this figure by hundredths.
   'src/frontend/fingerprint.rs': 98,
+  // Owned class normalization/state histories: measured at 83.82% (1259/1502 lines).
+  'src/frontend/fingerprint/classes.rs': 83,
   // Raised 2026-09-25 from 97.6, measured 97.88% (2309/2359). Production-only coverage is 98.45%
   // -- 13 of its 841 production lines uncovered, enumerated rather than excluded:
   //
@@ -177,6 +179,8 @@ const RUST_MODULES = {
   'src/frontend/registry.rs': 97,
   'src/frontend/resolver.rs': 100,
   'src/main.rs': 97,
+  // Native memory readers: measured 41/44 instrumented lines (93.18%) on macOS.
+  'src/rss.rs': 93,
   // New in this PR (commit a84a42d) and initially landed with no floor at all, which is what
   // caught it: the module added functions the tests did not reach, and `rust total functions`
   // dropped to 95.10%, below the 95.4% floor. Raised by testing what each `HeapBytes` impl

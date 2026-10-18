@@ -80,6 +80,32 @@ import { runAnalyzerJsonl } from './run-analyzer.mjs'
  */
 export const DIMENSIONS = new Map([
   [
+    'object-property',
+    {
+      summary: 'an object property differs in accessor, method or prototype-setter semantics',
+      equal: ['contextKey', 'modifierKey'],
+      differ: ['alpha', 'structural'],
+      why:
+        'Accessors, concise methods, data properties and prototype setters have different ' +
+        'runtime descriptor semantics. That distinction must survive exact and structural ' +
+        'serialization even when their callable bodies or initializer values are identical.',
+    },
+  ],
+  [
+    'for-await',
+    {
+      summary: 'a for-of loop differs in whether it awaits each element (for await vs for)',
+      equal: ['contextKey', 'modifierKey'],
+      differ: ['alpha', 'structural', 'behavior'],
+      why:
+        '`for await` selects the async iterator protocol, falling back to a wrapped sync ' +
+        'iterator that awaits Promise-valued elements. Ordinary `for` selects the sync ' +
+        'protocol. This difference must survive exact, structural, and behavior comparison ' +
+        'to prevent false duplicate and near-duplicate findings; both callbacks are async ' +
+        'so callback asyncness cannot carry the distinction.',
+    },
+  ],
+  [
     'literal',
     {
       summary: 'literal VALUES differ, of the same kind; nothing else does',
