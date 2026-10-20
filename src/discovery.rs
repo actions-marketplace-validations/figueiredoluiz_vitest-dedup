@@ -630,7 +630,14 @@ pub fn discover(config: &Config, project_set: Option<&ProjectSet>) -> Result<Dis
 
         match classify_source_file(&path) {
             Some((language, module_flavor)) => {
-                let config_scope = nearest_config_scope(&path, &config.root, &mut config_scopes);
+                let mut refusals = Vec::new();
+                let config_scope =
+                    nearest_config_scope(&path, &config.root, &mut config_scopes, &mut refusals);
+                if !refusals.is_empty() {
+                    result.incomplete = true;
+                    result.project_config_degraded = true;
+                    result.errors.extend(refusals);
+                }
                 result.files.push(SourceFile {
                     path,
                     language,
@@ -892,10 +899,14 @@ fn prepare_in_source_channel<'a>(
 /// Walks up from the file's own directory and stops AT the analysis root: the root's own config
 /// is already applied to every file by the ordinary path, so including it here would say nothing
 /// and would make every file in a flat repository carry the same redundant scope.
+///
+/// A config that cannot be read is pushed to `refusals` once, when it is first read, so the reason
+/// is reported whether or not any file under it goes on to emit a test.
 fn nearest_config_scope(
     path: &Path,
     root: &Path,
     cache: &mut HashMap<PathBuf, Option<Result<String, String>>>,
+    refusals: &mut Vec<String>,
 ) -> Option<Result<String, String>> {
     let mut dir = path.parent()?;
     loop {
@@ -907,14 +918,27 @@ fn nearest_config_scope(
                 return cached.clone();
             }
         } else {
-            let found = crate::vitest_config::find_project_config(dir)
-                .map(|config| crate::vitest_projects::resolved_config_test_scope(&config));
+            let found = crate::vitest_config::find_project_config(dir).map(|config| {
+                if matches!(
+                    crate::confine::confine(root, &config),
+                    crate::confine::Confinement::Outside
+                ) {
+                    return Err(format!(
+                        "{} resolves outside the analysis root and was not read",
+                        crate::vitest_config::display_path(&config, root)
+                    ));
+                }
+                crate::vitest_projects::resolved_config_test_scope_within(root, &config)
+            });
             // A config with no `test` object says nothing about how tests run, so it is not a
             // scope -- keep walking up rather than stopping at it.
             let scope = match found {
                 Some(Ok(None)) | None => None,
                 Some(Ok(Some(text))) => Some(Ok(text)),
-                Some(Err(reason)) => Some(Err(reason)),
+                Some(Err(reason)) => {
+                    refusals.push(reason.clone());
+                    Some(Err(reason))
+                }
             };
             cache.insert(dir.to_path_buf(), scope.clone());
             if scope.is_some() {
@@ -1120,6 +1144,52 @@ mod tests {
             matches!(scope, Some(Err(_))),
             "a config whose `export default` this scan cannot recognize must fail closed, not read \
              as though no config governed the file: {scope:?}"
+        );
+    }
+
+    /// A per-directory config that is a symlink out of the analysis root is refused as unreadable;
+    /// one that links to a file inside the root is read. Skipped (visibly) without symlinks.
+    #[test]
+    fn a_symlinked_directory_config_is_judged_by_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        let scope_config = "export default { test: { environment: 'node' } }";
+        for sub in ["escape", "within"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+            fs::write(root.join(sub).join("a.test.ts"), "test('t', () => {});").unwrap();
+        }
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("vitest.config.ts"), scope_config).unwrap();
+        fs::write(root.join("shared.config.ts"), scope_config).unwrap();
+        if !crate::confine::try_symlink(
+            &outside.join("vitest.config.ts"),
+            &root.join("escape/vitest.config.ts"),
+        ) {
+            return;
+        }
+        assert!(crate::confine::try_symlink(
+            &root.join("shared.config.ts"),
+            &root.join("within/vitest.config.ts")
+        ));
+
+        let discovered = discover(&load(&root), None).unwrap();
+        let scope_of = |sub: &str| {
+            discovered
+                .files
+                .iter()
+                .find(|file| in_directory(file, sub))
+                .unwrap_or_else(|| panic!("{sub}/a.test.ts must be discovered"))
+                .config_scope
+                .clone()
+        };
+        assert!(
+            matches!(scope_of("escape"), Some(Err(reason)) if reason.contains("outside the analysis root")),
+            "a config outside the root must not be read"
+        );
+        assert!(
+            matches!(scope_of("within"), Some(Ok(_))),
+            "a config linked within the root is read"
         );
     }
 
