@@ -27,6 +27,20 @@ itself. Running it against a hostile repository does not run that repository's c
 Configuration that only a running JavaScript engine could resolve, such as a project list built by
 a function call or a dynamic import, is reported as undetermined rather than evaluated.
 
+## Configuration cannot reach outside the analyzed tree
+
+Paths named by Vitest or TypeScript configuration, such as project entries, `extends`, `mergeConfig`
+imports, a project's `root` or `dir`, and tsconfig `paths`, are resolved before use, and one that
+leaves the analyzed directory is refused: the file is not opened, a diagnostic names the path, and
+the run is incomplete. Symlinks and `..` segments are judged by where they land. Imports written
+in test source, and the tsconfig `extends` chain and `references` themselves, are not confined, so a
+relative import or an `extends` can still lead the analyzer to parse a file outside the tree, and a
+tsconfig `references` entry can lead the import resolver to read a configuration outside it. The
+import resolver checks where a tsconfig `paths` entry lands, not what it touches on the way: it may
+read a `package.json` under a mapped directory outside the tree, and a `main` that points back
+inside is followed. For the path kinds listed above, no file outside the tree is parsed as source or
+configuration.
+
 ## Analyzed content is untrusted input
 
 Test titles and file paths come from the analyzed repository and reach reports verbatim. Each output

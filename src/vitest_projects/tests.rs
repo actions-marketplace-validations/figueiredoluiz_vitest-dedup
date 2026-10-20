@@ -3356,13 +3356,13 @@ fn a_dot_slash_in_a_non_initial_segment_is_not_stripped() {
 
     // The literal directory entry and the glob entry, bare: both must find the project
     // config, or the forms below prove nothing about normalization.
-    let literal = expand_project_path(root, "configs", &mut budget);
+    let literal = expand_project_path(root, "configs", &mut budget).paths;
     assert_eq!(
         literal.len(),
         1,
         "the bare literal entry finds the project config"
     );
-    let globbed = expand_project_path(root, "configs/*.ts", &mut budget);
+    let globbed = expand_project_path(root, "configs/*.ts", &mut budget).paths;
     assert_eq!(
         globbed.len(),
         1,
@@ -3371,7 +3371,7 @@ fn a_dot_slash_in_a_non_initial_segment_is_not_stripped() {
 
     // A LEADING ./ is the one form that must normalize away (the S1 site this guards).
     for pattern in ["./configs", "./configs/*.ts"] {
-        let expanded = expand_project_path(root, pattern, &mut budget);
+        let expanded = expand_project_path(root, pattern, &mut budget).paths;
         assert_eq!(expanded.len(), 1, "`{pattern}` must match its bare form");
     }
 
@@ -3381,7 +3381,7 @@ fn a_dot_slash_in_a_non_initial_segment_is_not_stripped() {
     // mid-path `./` is filesystem-transparent here, which is path resolution, not a
     // normalization this guard has an opinion about.)
     for pattern in [".//configs/*.ts", "../configs/*.ts"] {
-        let expanded = expand_project_path(root, pattern, &mut budget);
+        let expanded = expand_project_path(root, pattern, &mut budget).paths;
         assert!(
             expanded.is_empty(),
             "`{pattern}` folds to the bare pattern and stops being its own pattern: {expanded:?}"
@@ -3612,10 +3612,11 @@ fn project_path_stars_do_not_consume_directory_separators() {
         root,
         "packages/**/pkg-*/vitest.config.ts",
         &mut Budget::default(),
-    );
+    )
+    .paths;
     assert_eq!(direct, vec![root.join("packages/pkg-a/vitest.config.ts")]);
     let recursive =
-        expand_project_path(root, "packages/**/vitest.config.ts", &mut Budget::default());
+        expand_project_path(root, "packages/**/vitest.config.ts", &mut Budget::default()).paths;
     assert_eq!(recursive.len(), 2);
 }
 
@@ -3658,4 +3659,703 @@ fn typecheck_globs_keep_single_wildcards_inside_one_component() {
         FileMatch::Yes,
         "direct exclusion does not erase nested positive",
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Confinement of configuration-derived paths to the analysis root.
+// ---------------------------------------------------------------------------------------------
+
+/// An analysis root with a sibling directory outside it, under one temporary directory.
+struct Escape {
+    _guard: tempfile::TempDir,
+    /// The canonical root, as `Config::load` hands it to `resolve_projects`.
+    root: PathBuf,
+    /// The canonical sibling outside the root.
+    outside: PathBuf,
+    /// The root and sibling spelled as the temporary directory reports them (no verbatim prefix
+    /// on Windows), for absolute paths written into a config.
+    root_spelled: PathBuf,
+    outside_spelled: PathBuf,
+}
+
+/// Builds the [`Escape`] layout; `outside` holds a project config reading `globals: true`, the
+/// observable a leaked read would add to the result.
+fn escape_fixture() -> Escape {
+    let guard = tempfile::tempdir().unwrap();
+    let root_spelled = guard.path().join("root");
+    let outside_spelled = guard.path().join("outside");
+    fs::create_dir_all(&root_spelled).unwrap();
+    write(
+        &outside_spelled,
+        "vitest.config.ts",
+        "export default { test: { globals: true, name: 'outside' } };",
+    );
+    Escape {
+        root: root_spelled.canonicalize().unwrap(),
+        outside: outside_spelled.canonicalize().unwrap(),
+        root_spelled,
+        outside_spelled,
+        _guard: guard,
+    }
+}
+
+/// `path` as a forward-slash string safe to embed in a JavaScript string literal.
+fn js_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Asserts the entry was refused for leaving the root: nothing resolved, the set says it is
+/// incomplete, and the diagnostic names the reason.
+fn assert_refused_outside(set: &ProjectSet, why: &str) {
+    assert!(set.projects.is_empty(), "{why}: {:?}", set.projects);
+    assert!(set.has_unresolved_entries, "{why}: {set:?}");
+    assert!(
+        set.diagnostics
+            .iter()
+            .any(|note| note.contains("outside the analysis root")),
+        "{why}: {:?}",
+        set.diagnostics
+    );
+}
+
+/// The reason a project's `globals` is `Unknown`, asserting that it is.
+fn unknown_globals_reason(project: &Project) -> &str {
+    match &project.globals {
+        GlobalsDetection::Unknown { reason } => reason,
+        other => panic!("expected Unknown globals, got {other:?}"),
+    }
+}
+
+/// A `test.projects` string entry that leaves the root is refused whether it is written with `..`,
+/// as an absolute path, as a glob, or as an explicit config file, and the outside config is not
+/// read (its `globals: true` never reaches the result).
+#[test]
+fn projects_entry_outside_the_root_is_refused() {
+    let fixture = escape_fixture();
+    let absolute = js_path(&fixture.outside_spelled);
+    let patterns = [
+        "../outside".to_owned(),
+        "./../outside".to_owned(),
+        absolute.clone(),
+        "../out*".to_owned(),
+        "../outside/vitest.config.ts".to_owned(),
+        format!("{absolute}/vitest.config.ts"),
+        "../missing".to_owned(),
+    ];
+    for pattern in patterns {
+        write(
+            &fixture.root,
+            "vitest.config.ts",
+            &format!("export default {{ test: {{ projects: ['{pattern}'] }} }};"),
+        );
+        assert_refused_outside(&resolve_projects(&fixture.root), &pattern);
+    }
+}
+
+/// Retention control for the refusal: entries that stay inside the root, including a glob and a
+/// literal directory, still resolve, and an escaping entry beside them leaves them intact.
+#[test]
+fn projects_entry_inside_the_root_still_resolves() {
+    let fixture = escape_fixture();
+    write(
+        &fixture.root,
+        "pkg/vitest.config.ts",
+        "export default { test: { globals: true } };",
+    );
+    write(
+        &fixture.root,
+        "more/one/vitest.config.ts",
+        "export default { test: { globals: true } };",
+    );
+    for pattern in ["pkg", "./pkg", "more/*", "pkg/vitest.config.ts"] {
+        write(
+            &fixture.root,
+            "vitest.config.ts",
+            &format!("export default {{ test: {{ projects: ['{pattern}'] }} }};"),
+        );
+        let set = resolve_projects(&fixture.root);
+        assert!(
+            !set.has_unresolved_entries,
+            "{pattern}: {:?}",
+            set.diagnostics
+        );
+        assert_eq!(set.projects.len(), 1, "{pattern}");
+        assert!(matches!(
+            set.projects[0].globals,
+            GlobalsDetection::Enabled { .. }
+        ));
+    }
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        "export default { test: { projects: ['pkg', '../outside'] } };",
+    );
+    let set = resolve_projects(&fixture.root);
+    assert_eq!(set.projects.len(), 1, "the inside entry survives");
+    assert!(set.has_unresolved_entries, "the outside entry is flagged");
+    assert!(set
+        .diagnostics
+        .iter()
+        .any(|note| note.contains("`../outside`") && note.contains("outside the analysis root")));
+}
+
+/// A symlinked project directory or config file that leaves the root is refused; one that stays
+/// inside resolves. Skipped (visibly) where symlinks cannot be created.
+#[test]
+fn projects_entry_through_a_symlink_is_judged_by_its_target() {
+    let fixture = escape_fixture();
+    write(
+        &fixture.root,
+        "real/vitest.config.ts",
+        "export default { test: { globals: true } };",
+    );
+    fs::create_dir_all(fixture.root.join("holder")).unwrap();
+    if !crate::confine::try_symlink(&fixture.outside, &fixture.root.join("escape")) {
+        return;
+    }
+    assert!(crate::confine::try_symlink(
+        &fixture.outside.join("vitest.config.ts"),
+        &fixture.root.join("holder/vitest.config.ts")
+    ));
+    assert!(crate::confine::try_symlink(
+        &fixture.root.join("real"),
+        &fixture.root.join("alias")
+    ));
+    for pattern in ["escape", "holder", "hold*"] {
+        write(
+            &fixture.root,
+            "vitest.config.ts",
+            &format!("export default {{ test: {{ projects: ['{pattern}'] }} }};"),
+        );
+        assert_refused_outside(&resolve_projects(&fixture.root), pattern);
+    }
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        "export default { test: { projects: ['alias'] } };",
+    );
+    let set = resolve_projects(&fixture.root);
+    assert!(!set.has_unresolved_entries, "{:?}", set.diagnostics);
+    assert_eq!(set.projects.len(), 1);
+}
+
+/// A root that is itself reached through a symlink resolves an entry spelled either way.
+#[test]
+fn projects_entry_resolves_when_the_root_is_reached_through_a_symlink() {
+    let guard = tempfile::tempdir().unwrap();
+    let real = guard.path().join("real-root");
+    let alias = guard.path().join("alias-root");
+    write(
+        &real,
+        "pkg/vitest.config.ts",
+        "export default { test: { globals: true } };",
+    );
+    if !crate::confine::try_symlink(&real, &alias) {
+        return;
+    }
+    for (root, entry) in [
+        (&alias, "pkg".to_owned()),
+        (&real, "pkg".to_owned()),
+        (&alias, js_path(&real.join("pkg"))),
+        (&real, js_path(&alias.join("pkg"))),
+    ] {
+        write(
+            root,
+            "vitest.config.ts",
+            &format!("export default {{ test: {{ projects: ['{entry}'] }} }};"),
+        );
+        let set = resolve_projects(root);
+        assert!(
+            !set.has_unresolved_entries,
+            "{entry}: {:?}",
+            set.diagnostics
+        );
+        assert_eq!(set.projects.len(), 1, "{entry}");
+    }
+}
+
+/// The `glob.sync('<literal>')` project list is confined like a string entry.
+#[test]
+fn glob_sync_project_list_outside_the_root_is_refused() {
+    let fixture = escape_fixture();
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        "import { glob } from 'glob'\nexport default { test: { projects: glob.sync('../outside') } };",
+    );
+    assert_refused_outside(&resolve_projects(&fixture.root), "glob.sync");
+    write(
+        &fixture.root,
+        "pkg/vitest.config.ts",
+        "export default { test: { globals: true } };",
+    );
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        "import { glob } from 'glob'\nexport default { test: { projects: glob.sync('./*/vitest.config.ts') } };",
+    );
+    let set = resolve_projects(&fixture.root);
+    assert!(!set.has_unresolved_entries, "{:?}", set.diagnostics);
+    assert_eq!(set.projects.len(), 1);
+}
+
+/// A legacy workspace file's entries are confined like a `test.projects` array.
+#[test]
+fn workspace_file_entry_outside_the_root_is_refused() {
+    let fixture = escape_fixture();
+    write(
+        &fixture.root,
+        "vitest.workspace.ts",
+        "export default ['../outside']",
+    );
+    assert_refused_outside(&resolve_projects(&fixture.root), "workspace file");
+}
+
+/// An inline project's string `extends` that leaves the root is not read; the project degrades to
+/// an unresolvable base. Spellings that fold back inside, or reach a package under the root,
+/// still load.
+#[test]
+fn extends_outside_the_root_is_refused_and_inside_is_kept() {
+    let fixture = escape_fixture();
+    write(
+        &fixture.outside,
+        "base.ts",
+        "export default { test: { globals: true } };",
+    );
+    write(
+        &fixture.root,
+        "shared/base.ts",
+        "export default { test: { globals: true } };",
+    );
+    write(
+        &fixture.root,
+        "node_modules/@scope/preset/vitest.config.ts",
+        "export default { test: { globals: true } };",
+    );
+    let absolute = js_path(&fixture.outside_spelled.join("base.ts"));
+    for target in [
+        "../outside/base.ts".to_owned(),
+        "../outside/vitest.config.ts".to_owned(),
+        absolute,
+    ] {
+        write(
+            &fixture.root,
+            "vitest.config.ts",
+            &format!(
+                "export default {{ test: {{ projects: [{{ extends: '{target}', test: {{ name: 'x' }} }}] }} }};"
+            ),
+        );
+        let set = resolve_projects(&fixture.root);
+        let project = single_project(&set);
+        let reason = unknown_globals_reason(project);
+        assert!(
+            reason.contains("resolves outside the analysis root and was not read"),
+            "{target}: {reason}"
+        );
+    }
+    for target in [
+        "./shared/base.ts",
+        "./shared/../shared/base.ts",
+        "./node_modules/@scope/preset/vitest.config.ts",
+    ] {
+        write(
+            &fixture.root,
+            "vitest.config.ts",
+            &format!(
+                "export default {{ test: {{ projects: [{{ extends: '{target}', test: {{ name: 'x' }} }}] }} }};"
+            ),
+        );
+        let set = resolve_projects(&fixture.root);
+        assert_single_named_enabled(&set, "x");
+    }
+}
+
+/// A symlinked `extends` target is judged by where it lands.
+#[test]
+fn extends_through_a_symlink_is_judged_by_its_target() {
+    let fixture = escape_fixture();
+    write(
+        &fixture.root,
+        "shared/base.ts",
+        "export default { test: { globals: true } };",
+    );
+    if !crate::confine::try_symlink(
+        &fixture.outside.join("vitest.config.ts"),
+        &fixture.root.join("escape.ts"),
+    ) {
+        return;
+    }
+    assert!(crate::confine::try_symlink(
+        &fixture.root.join("shared/base.ts"),
+        &fixture.root.join("inside.ts")
+    ));
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        "export default { test: { projects: [{ extends: './escape.ts', test: { name: 'x' } }] } };",
+    );
+    let set = resolve_projects(&fixture.root);
+    assert!(unknown_globals_reason(single_project(&set)).contains("outside the analysis root"));
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        "export default { test: { projects: [{ extends: './inside.ts', test: { name: 'x' } }] } };",
+    );
+    assert_single_named_enabled(&resolve_projects(&fixture.root), "x");
+}
+
+/// A `mergeConfig` base imported from outside the root is not read: the root config's project
+/// carries an unresolvable base, never the outside file's fields. The same chain inside the root,
+/// written with a `..` that folds back, merges as before.
+#[test]
+fn merge_config_import_outside_the_root_is_refused_and_inside_is_kept() {
+    let fixture = escape_fixture();
+    write(
+        &fixture.outside,
+        "base.ts",
+        "export default { test: { globals: true } };",
+    );
+    write(
+        &fixture.root,
+        "shared/base.ts",
+        "export default { test: { globals: true } };",
+    );
+    let merged = |specifier: &str| {
+        format!(
+            "import {{ mergeConfig }} from 'vitest/config';\nimport base from '{specifier}';\nexport default mergeConfig(base, {{ test: {{ name: 'merged' }} }});"
+        )
+    };
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        &merged("../outside/base"),
+    );
+    let set = resolve_projects(&fixture.root);
+    let reason = unknown_globals_reason(single_project(&set));
+    assert!(
+        reason.contains("mergeConfig base `../outside/base` resolves outside the analysis root"),
+        "{reason}"
+    );
+    assert!(!reason.contains(&js_path(&fixture.root)), "{reason}");
+
+    for specifier in [
+        "./shared/base",
+        "./shared/../shared/base",
+        "./shared/base.ts",
+    ] {
+        write(&fixture.root, "vitest.config.ts", &merged(specifier));
+        let set = resolve_projects(&fixture.root);
+        assert_single_named_enabled(&set, "merged");
+    }
+}
+
+/// The per-directory scope chain applies the same confinement to its `mergeConfig` bases.
+#[test]
+fn config_scope_merge_base_outside_the_root_is_an_error() {
+    let fixture = escape_fixture();
+    write(
+        &fixture.outside,
+        "base.ts",
+        "export default { test: { environment: 'node' } };",
+    );
+    write(
+        &fixture.root,
+        "shared/base.ts",
+        "export default { test: { environment: 'node' } };",
+    );
+    let merged = |specifier: &str| {
+        format!(
+            "import {{ mergeConfig }} from 'vitest/config';\nimport base from '{specifier}';\nexport default mergeConfig(base, {{ test: {{ name: 'merged' }} }});"
+        )
+    };
+    let config = fixture.root.join("pkg/vitest.config.ts");
+    write(
+        &fixture.root,
+        "pkg/vitest.config.ts",
+        &merged("../../outside/base"),
+    );
+    let outcome = resolved_config_test_scope_within(&fixture.root, &config);
+    assert!(
+        outcome
+            .as_ref()
+            .is_err_and(|reason| reason.contains("outside the analysis root")),
+        "{outcome:?}"
+    );
+    write(
+        &fixture.root,
+        "pkg/vitest.config.ts",
+        &merged("../shared/../shared/base"),
+    );
+    let outcome = resolved_config_test_scope_within(&fixture.root, &config);
+    assert!(outcome.is_ok_and(|scope| scope.is_some()));
+}
+
+/// An inline project's `root`/`dir` that leaves the root is refused as an unreadable project; one
+/// that folds back inside, or is absolute but inside, scopes the project as before.
+#[test]
+fn project_root_or_dir_outside_the_root_is_refused_and_inside_is_kept() {
+    let fixture = escape_fixture();
+    write(&fixture.root, "pkg/src/a.test.ts", "");
+    let absolute_outside = js_path(&fixture.outside_spelled);
+    let absolute_inside = js_path(&fixture.root_spelled.join("pkg"));
+    for key in ["root", "dir"] {
+        for declared in [
+            "../outside".to_owned(),
+            absolute_outside.clone(),
+            "./pkg/../../outside".to_owned(),
+            "../missing".to_owned(),
+        ] {
+            write(
+                &fixture.root,
+                "vitest.config.ts",
+                &format!(
+                    "export default {{ test: {{ projects: [{{ test: {{ name: 'p', {key}: '{declared}' }} }}] }} }};"
+                ),
+            );
+            let set = resolve_projects(&fixture.root);
+            let project = single_project(&set);
+            assert!(
+                unknown_globals_reason(project).contains("outside the analysis root"),
+                "{key}: {declared}"
+            );
+            assert!(matches!(project.include, GlobPatterns::Unknown { .. }));
+        }
+        for declared in ["./pkg", "./pkg/../pkg", absolute_inside.as_str()] {
+            write(
+                &fixture.root,
+                "vitest.config.ts",
+                &format!(
+                    "export default {{ test: {{ projects: [{{ test: {{ name: 'p', {key}: '{declared}', include: ['src/*.test.ts'] }} }}] }} }};"
+                ),
+            );
+            let set = resolve_projects(&fixture.root);
+            let project = single_project(&set);
+            assert_file_match(
+                project,
+                &fixture.root.join("pkg/src/a.test.ts"),
+                FileMatch::Yes,
+                "an inside directory scopes the project",
+            );
+        }
+    }
+}
+
+/// A `root` through a symlink is judged by its target.
+#[test]
+fn project_root_through_a_symlink_is_judged_by_its_target() {
+    let fixture = escape_fixture();
+    write(&fixture.root, "pkg/src/a.test.ts", "");
+    if !crate::confine::try_symlink(&fixture.outside, &fixture.root.join("escape")) {
+        return;
+    }
+    assert!(crate::confine::try_symlink(
+        &fixture.root.join("pkg"),
+        &fixture.root.join("alias")
+    ));
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        "export default { test: { projects: [{ test: { name: 'p', root: './escape' } }] } };",
+    );
+    let set = resolve_projects(&fixture.root);
+    assert!(unknown_globals_reason(single_project(&set)).contains("outside the analysis root"));
+    write(
+        &fixture.root,
+        "vitest.config.ts",
+        "export default { test: { projects: [{ test: { name: 'p', root: './alias', include: ['src/*.test.ts'] } }] } };",
+    );
+    let set = resolve_projects(&fixture.root);
+    assert_file_match(
+        single_project(&set),
+        &fixture.root.join("pkg/src/a.test.ts"),
+        FileMatch::Yes,
+        "an inside symlink resolves to its target",
+    );
+}
+
+/// The alternatives a brace pattern stands for, or `None` when it is not enumerated.
+fn listed(pattern: &str) -> Option<Vec<String>> {
+    match brace_alternatives(pattern) {
+        BraceAlternatives::Listed(all) => Some(all),
+        BraceAlternatives::None | BraceAlternatives::TooMany => None,
+    }
+}
+
+/// Only a comma alternation with a closing brace is enumerated; nested groups multiply out and
+/// an excess is reported as too many rather than cut short.
+#[test]
+fn brace_alternatives_enumerates_only_comma_groups_within_the_limit() {
+    assert!(matches!(
+        brace_alternatives("pkg/*"),
+        BraceAlternatives::None
+    ));
+    assert!(matches!(
+        brace_alternatives("{pkg,other"),
+        BraceAlternatives::None
+    ));
+    assert!(matches!(
+        brace_alternatives("pkg/{1..3}"),
+        BraceAlternatives::None
+    ));
+    assert_eq!(
+        listed("a/{b,c}/d").unwrap(),
+        ["a/b/d", "a/c/d"],
+        "one group"
+    );
+    assert_eq!(
+        listed("{a,b}/{c,d}").unwrap(),
+        ["a/c", "a/d", "b/c", "b/d"],
+        "groups multiply"
+    );
+    let wide = format!("{{{}}}/{{x,y}}", "p,".repeat(40) + "q");
+    assert!(
+        matches!(brace_alternatives(&wide), BraceAlternatives::TooMany),
+        "41 x 2 alternatives exceed the limit through a nested group"
+    );
+    let flat = format!("{{{}q}}", "p,".repeat(70));
+    assert!(matches!(
+        brace_alternatives(&flat),
+        BraceAlternatives::TooMany
+    ));
+}
+
+/// Without an analysis root the unreadable base is named by its path rather than relative to it.
+#[test]
+fn an_unreadable_merge_base_is_recorded_without_a_root() {
+    let directory = tempfile::tempdir().unwrap();
+    write(directory.path(), "base.ts", "export default makeConfig();");
+    write(
+        directory.path(),
+        "merged.ts",
+        "import { mergeConfig } from 'vitest/config'\nimport base from './base'\nexport default mergeConfig(base, { test: { globals: true } });",
+    );
+    let mut refused = false;
+    let fields = resolve_standalone_config_bounded(
+        None,
+        &directory.path().join("merged.ts"),
+        None,
+        &mut Vec::new(),
+        &mut refused,
+    )
+    .unwrap();
+    let reason = fields.refusal.expect("the unreadable base is recorded");
+    assert!(reason.contains("could not be read"), "{reason}");
+}
+
+/// A group nested inside one that is within the limit can itself exceed it.
+#[test]
+fn a_nested_brace_group_over_the_limit_is_too_many() {
+    let nested = format!("{{a,{{{}q}}}}", "p,".repeat(70));
+    assert!(matches!(
+        brace_alternatives(&nested),
+        BraceAlternatives::TooMany
+    ));
+}
+
+/// The comparison scope of a config whose `mergeConfig` base cannot be read is an error, so the
+/// file is not compared as if the base were absent.
+#[test]
+fn a_scope_through_an_unreadable_merge_base_is_an_error() {
+    let directory = tempfile::tempdir().unwrap();
+    write(directory.path(), "base.ts", "export default makeConfig();");
+    write(
+        directory.path(),
+        "merged.ts",
+        "import { mergeConfig } from 'vitest/config'\nimport base from './base'\nexport default mergeConfig(base, { test: { globals: true } });",
+    );
+    assert!(resolved_config_test_scope(&directory.path().join("merged.ts")).is_err());
+}
+
+/// A declared `root` that does not exist yet is kept as written rather than refused.
+#[test]
+fn a_declared_project_root_that_does_not_exist_is_kept_as_written() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        directory.path(),
+        "vitest.config.ts",
+        "export default { test: { projects: [{ test: { name: 'p', root: './later' } }] } };",
+    );
+    let set = resolve_projects(directory.path());
+    assert_eq!(set.projects.len(), 1, "{set:?}");
+    assert!(
+        set.projects[0].base_dir.ends_with("later"),
+        "{:?}",
+        set.projects[0].base_dir
+    );
+    assert!(!set.has_unresolved_entries, "{set:?}");
+}
+
+/// Two configs that merge each other have no resolvable chain: the scope is an error and the
+/// root config's project set is unresolved rather than built from half a chain.
+#[test]
+fn a_cyclic_merge_chain_is_refused_for_scope_and_for_projects() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        directory.path(),
+        "vitest.config.ts",
+        "import { mergeConfig } from 'vitest/config'\nimport other from './other'\nexport default mergeConfig(other, { test: { globals: true } });",
+    );
+    write(
+        directory.path(),
+        "other.ts",
+        "import { mergeConfig } from 'vitest/config'\nimport back from './vitest.config'\nexport default mergeConfig(back, { test: { globals: false } });",
+    );
+    let error = resolved_config_test_scope(&directory.path().join("vitest.config.ts"))
+        .expect_err("a cycle has no scope");
+    assert!(error.contains("cyclic"), "{error}");
+    let set = resolve_projects(directory.path());
+    assert_unresolved_with_diagnostic(&set, "merged default export could not be resolved");
+}
+
+/// A named import whose export is not a readable literal makes the scope an error.
+#[test]
+fn a_named_merge_base_that_is_not_a_literal_is_an_error_for_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    write(directory.path(), "base.ts", "export const other = {};");
+    write(
+        directory.path(),
+        "merged.ts",
+        "import { mergeConfig } from 'vitest/config'\nimport { base } from './base'\nexport default mergeConfig(base, { test: { globals: true } });",
+    );
+    let error = resolved_config_test_scope(&directory.path().join("merged.ts"))
+        .expect_err("the named export is missing");
+    assert!(error.contains("export cannot be read"), "{error}");
+}
+
+/// An entry left unresolved is a set-level diagnostic and an unresolved entry, not only `Unknown`
+/// fields on its project: those are ignored once a later project governs the same files.
+#[test]
+fn an_unresolved_entry_is_recorded_on_the_set() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        directory.path(),
+        "pkg/vitest.config.ts",
+        "export default makeConfig();",
+    );
+    for (entry, needle) in [
+        (
+            "{ test: { name: 'a', root: '../outside' } }",
+            "resolves outside",
+        ),
+        ("{ test: someTests }", "sets `test` to something"),
+        (
+            "'./pkg/vitest.config.ts'",
+            "could not be read as a standalone",
+        ),
+    ] {
+        write(
+            directory.path(),
+            "vitest.config.ts",
+            &format!(
+                "export default {{ test: {{ projects: [{entry}, {{ test: {{ name: 'b' }} }}] }} }};"
+            ),
+        );
+        let set = resolve_projects(directory.path());
+        assert!(set.has_unresolved_entries, "{entry}: {set:?}");
+        assert!(
+            set.diagnostics.iter().any(|note| note.contains(needle)),
+            "{entry}: {:?}",
+            set.diagnostics
+        );
+    }
 }

@@ -99,6 +99,7 @@
 //!   for every extglob form Vitest accepts.
 
 use crate::config::compile_glob_set;
+use crate::confine::{confine, Confinement};
 use crate::discovery::{
     DEFAULT_BENCHMARK_EXCLUDE_GLOBS, DEFAULT_BENCHMARK_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS,
     DEFAULT_INCLUDE_GLOBS, DEFAULT_TYPECHECK_INCLUDE_GLOBS,
@@ -750,9 +751,11 @@ pub fn resolve_projects(root: &Path) -> ProjectSet {
     let is_merge = find_export_default_value_start(&masked).is_some_and(|value_start| {
         merge_config_overrides_literal(&masked, &original, value_start).is_some()
     });
-    let merged_fields = is_merge
-        .then(|| resolve_standalone_config(&config_path))
+    let merged = is_merge
+        .then(|| resolve_standalone_config_within(root, &config_path))
         .flatten();
+    let base_refusal = merged.as_ref().and_then(|fields| fields.refusal.clone());
+    let merged_fields = merged.map(|fields| (fields.name, fields.effective));
     if is_merge && merged_fields.is_none() {
         return unresolved_set(
             root,
@@ -764,7 +767,7 @@ pub fn resolve_projects(root: &Path) -> ProjectSet {
         );
     }
 
-    match locate_test_object(&masked, config_object.0 + 1..config_object.1) {
+    let mut set = match locate_test_object(&masked, config_object.0 + 1..config_object.1) {
         TestObject::Absent => match merged_fields {
             Some((name, effective)) => {
                 single_project_set_from_effective(root, &config_path, name, effective)
@@ -797,7 +800,14 @@ pub fn resolve_projects(root: &Path) -> ProjectSet {
                 single_project_set(root, &config_path, &masked, &original, Some(body))
             }
         }
+    };
+    // Recorded here rather than left in the merged fields: an inline project that sets
+    // everything itself, or `extends: false`, discards them and the refusal would vanish.
+    if let Some(reason) = base_refusal {
+        set.diagnostics.push(reason);
+        set.has_unresolved_entries = true;
     }
+    set
 }
 
 /// Reads `path` and returns `(masked, original)` character vectors for the scanners, or the one
@@ -809,6 +819,13 @@ pub fn resolve_projects(root: &Path) -> ProjectSet {
 /// position in the file is suspect and no depth-tracking scan over it means anything. Stating that
 /// pair once is what keeps a new entry point from accepting a file the existing ones reject.
 fn read_masked_source(path: &Path, root: &Path) -> Result<(Vec<char>, Vec<char>), String> {
+    // The analysis root's own configuration file can be a symlink out of the tree too.
+    if matches!(confine(root, path), Confinement::Outside) {
+        return Err(format!(
+            "{} resolves outside the analysis root and was not read",
+            display_path(path, root)
+        ));
+    }
     let source = read_bounded(path)?;
     let Some(masked) = mask_non_code(&source) else {
         return Err(format!(
@@ -1929,26 +1946,142 @@ fn note_unresolved_position(position: &mut Option<usize>, declared_at: usize) {
     *position = Some(position.map_or(declared_at, |current| current.max(declared_at)));
 }
 
+/// What a comma alternation in a pattern stands for.
+enum BraceAlternatives {
+    /// No alternation to expand.
+    None,
+    /// The patterns it stands for.
+    Listed(Vec<String>),
+    /// More than the enumeration limit.
+    TooMany,
+}
+
+/// The patterns a comma alternation in `pattern` stands for.
+fn brace_alternatives(pattern: &str) -> BraceAlternatives {
+    const MAX_ALTERNATIVES: usize = 64;
+    let Some(open) = pattern.find('{') else {
+        return BraceAlternatives::None;
+    };
+    let mut depth = 0usize;
+    let mut close = None;
+    let mut cuts = vec![open];
+    for (offset, ch) in pattern[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            ',' if depth == 1 => cuts.push(open + offset),
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return BraceAlternatives::None;
+    };
+    if cuts.len() < 2 {
+        return BraceAlternatives::None;
+    }
+    cuts.push(close);
+    let (head, tail) = (&pattern[..open], &pattern[close + 1..]);
+    let mut all = Vec::new();
+    for pair in cuts.windows(2) {
+        let candidate = format!("{head}{}{tail}", &pattern[pair[0] + 1..pair[1]]);
+        match brace_alternatives(&candidate) {
+            BraceAlternatives::Listed(nested) => all.extend(nested),
+            BraceAlternatives::None => all.push(candidate),
+            BraceAlternatives::TooMany => return BraceAlternatives::TooMany,
+        }
+        if all.len() > MAX_ALTERNATIVES {
+            return BraceAlternatives::TooMany;
+        }
+    }
+    BraceAlternatives::Listed(all)
+}
+
+/// Whether `pattern` names a location outside its own directory without consulting the
+/// filesystem: an absolute path or a `..` segment.
+fn leaves_the_tree_lexically(pattern: &str) -> bool {
+    Path::new(pattern).is_absolute()
+        || pattern.starts_with('/')
+        || pattern.split('/').any(|segment| segment == "..")
+}
+
 /// Recognize path segments containing a supported glob metacharacter.
 fn looks_like_glob(segment: &str) -> bool {
     segment.contains(['*', '?', '[', '{'])
 }
 
+/// What one `test.projects` string entry expanded to.
+struct ExpandedProjectPaths {
+    /// Concrete project configuration files under the analysis root, sorted.
+    paths: Vec<PathBuf>,
+    /// Matches (or a glob's own start directory) that resolve outside the analysis root. None of
+    /// them was read or walked.
+    outside: usize,
+}
+
 /// Resolves one `test.projects` string entry (a directory glob, an explicit config-file glob, or a
 /// literal path) into concrete project configuration file paths, sorted for determinism regardless
 /// of filesystem traversal order.
-fn expand_project_path(root: &Path, pattern: &str, budget: &mut Budget) -> Vec<PathBuf> {
+///
+/// Every path is confined to `root` after canonicalization: a `..` segment, an absolute path or a
+/// symlink that leaves the tree is counted in [`ExpandedProjectPaths::outside`] and never read.
+fn expand_project_path(root: &Path, pattern: &str, budget: &mut Budget) -> ExpandedProjectPaths {
+    let mut expanded = ExpandedProjectPaths {
+        paths: Vec::new(),
+        outside: 0,
+    };
     let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+
+    // The walk starts from the pattern's literal prefix, so an alternative like `{pkg,../other}`
+    // that leaves the tree would never be visited, let alone judged. An alternation holding one
+    // is split into its alternatives, each expanded and confined on its own.
+    match brace_alternatives(pattern) {
+        BraceAlternatives::Listed(all) if all.iter().any(|one| leaves_the_tree_lexically(one)) => {
+            let mut paths = BTreeSet::new();
+            for alternative in all {
+                let part = expand_project_path(root, &alternative, budget);
+                expanded.outside += part.outside;
+                paths.extend(part.paths);
+            }
+            expanded.paths = paths.into_iter().collect();
+            return expanded;
+        }
+        // Too many to judge one by one. A `..` anywhere in the pattern could be one of them, so
+        // it is refused rather than guessed at.
+        BraceAlternatives::TooMany if pattern.contains("..") => {
+            expanded.outside += 1;
+            return expanded;
+        }
+        _ => {}
+    }
 
     if !looks_like_glob(pattern) {
         let candidate = root.join(pattern);
-        if candidate.is_file() {
-            return vec![candidate];
+        if matches!(confine(root, &candidate), Confinement::Outside) {
+            expanded.outside += 1;
+            return expanded;
         }
-        if candidate.is_dir() {
-            return find_project_config(&candidate).into_iter().collect();
+        let config = if candidate.is_file() {
+            Some(candidate)
+        } else if candidate.is_dir() {
+            find_project_config(&candidate)
+        } else {
+            None
+        };
+        // A directory's config can itself be a symlink out of the tree.
+        match config {
+            Some(config) if matches!(confine(root, &config), Confinement::Outside) => {
+                expanded.outside += 1;
+            }
+            Some(config) => expanded.paths.push(config),
+            None => {}
         }
-        return Vec::new();
+        return expanded;
     }
 
     let Ok(matcher) = GlobBuilder::new(pattern)
@@ -1956,16 +2089,34 @@ fn expand_project_path(root: &Path, pattern: &str, budget: &mut Budget) -> Vec<P
         .build()
         .map(|glob| glob.compile_matcher())
     else {
-        return Vec::new();
+        return expanded;
     };
 
     let prefix_segments: Vec<&str> = pattern
         .split('/')
         .take_while(|segment| !looks_like_glob(segment))
         .collect();
+    // The walk does not follow links, so a symlinked directory in the middle of the pattern is
+    // never entered. Vitest follows it, and it may hold a project; these match the directory
+    // prefixes of the pattern so such a link is still counted when it leaves the tree.
+    let directory_matchers: Vec<_> = (1..pattern.split('/').count())
+        .filter_map(|keep| {
+            let prefix = pattern.split('/').take(keep).collect::<Vec<_>>().join("/");
+            GlobBuilder::new(&prefix)
+                .literal_separator(true)
+                .build()
+                .ok()
+                .map(|glob| glob.compile_matcher())
+        })
+        .collect();
     let start_dir = root.join(prefix_segments.join("/"));
+    if matches!(confine(root, &start_dir), Confinement::Outside) {
+        // Not even listed: enumerating a directory outside the tree is itself a read.
+        expanded.outside += 1;
+        return expanded;
+    }
     if !start_dir.is_dir() {
-        return Vec::new();
+        return expanded;
     }
 
     let mut builder = WalkBuilder::new(&start_dir);
@@ -1994,21 +2145,40 @@ fn expand_project_path(root: &Path, pattern: &str, budget: &mut Budget) -> Vec<P
         let relative = path.strip_prefix(root).unwrap_or(path);
         let relative = relative.to_string_lossy().replace('\\', "/");
         if !matcher.is_match(&relative) {
+            if entry.file_type().is_some_and(|kind| kind.is_symlink())
+                && directory_matchers.iter().any(|dir| dir.is_match(&relative))
+                && path.is_dir()
+                && matches!(confine(root, path), Confinement::Outside)
+            {
+                expanded.outside += 1;
+            }
             continue;
         }
-        match entry.file_type() {
-            Some(file_type) if file_type.is_file() => {
-                matches.insert(path.to_path_buf());
-            }
-            Some(file_type) if file_type.is_dir() => {
-                if let Some(config) = find_project_config(path) {
-                    matches.insert(config);
+        let config = match entry.file_type() {
+            Some(file_type) if file_type.is_file() => Some(path.to_path_buf()),
+            Some(file_type) if file_type.is_dir() => find_project_config(path),
+            // Links are not followed, so a link inside the tree is not a second project. One that
+            // leaves it is still reported, so a refused entry is never silent.
+            Some(file_type) if file_type.is_symlink() => {
+                if matches!(confine(root, path), Confinement::Outside) {
+                    expanded.outside += 1;
                 }
+                None
             }
-            _ => {}
+            _ => None,
+        };
+        match config {
+            Some(config) if matches!(confine(root, &config), Confinement::Outside) => {
+                expanded.outside += 1;
+            }
+            Some(config) => {
+                matches.insert(config);
+            }
+            None => {}
         }
     }
-    matches.into_iter().collect()
+    expanded.paths = matches.into_iter().collect();
+    expanded
 }
 
 /// Locates a standalone config without following nested `test.projects` or string `extends`.
@@ -2202,11 +2372,15 @@ fn imported_config_binding(clause: &str, local_name: &str) -> Option<Option<Stri
 
 /// Resolve the imported base of a verified mergeConfig export, retaining any selected named
 /// export.
+///
+/// With a `root`, a base file that resolves outside it is refused: `Some(Err(reason))`, never
+/// read. `None` keeps its meaning of "no statically resolvable base".
 fn merge_config_base_path(
+    root: Option<&Path>,
     masked: &[char],
     original: &[char],
     config_path: &Path,
-) -> Option<ImportedConfigBase> {
+) -> Option<Result<ImportedConfigBase, String>> {
     let value_start = find_export_default_value_start(masked)?;
     merge_config_overrides_literal(masked, original, value_start)?;
     let callee_start = skip_trivia(original, value_start, original.len());
@@ -2256,8 +2430,31 @@ fn merge_config_base_path(
     for candidate in candidates {
         let path = base_dir.join(&candidate);
         if path.is_file() {
-            return Some(ImportedConfigBase { path, named_export });
+            if let Some(root) =
+                root.filter(|root| matches!(confine(root, &path), Confinement::Outside))
+            {
+                return Some(Err(format!(
+                    "{}'s mergeConfig base `{literal}` resolves outside the analysis root and \
+                     was not read",
+                    display_path(config_path, root)
+                )));
+            }
+            return Some(Ok(ImportedConfigBase { path, named_export }));
         }
+    }
+    // No candidate exists, but a base spelled outside the tree is refused all the same, as an
+    // `extends` is: nothing was read, and the base's contributions are unknown.
+    if let Some(root) = root.filter(|root| {
+        matches!(
+            confine(root, &base_dir.join(&literal)),
+            Confinement::Outside
+        )
+    }) {
+        return Some(Err(format!(
+            "{}'s mergeConfig base `{literal}` resolves outside the analysis root and was not \
+             read",
+            display_path(config_path, root)
+        )));
     }
     None
 }
@@ -2268,6 +2465,10 @@ struct StandaloneConfigFields {
     name: Option<String>,
     effective: EffectiveTestFields,
     specified: RawTestFields,
+    /// Why a `mergeConfig` base in the chain was refused as outside the analysis root. Carried
+    /// beside `effective` because a consumer that sets every field itself discards the `Unknown`
+    /// values that record it there.
+    refusal: Option<String>,
 }
 
 /// Recognize a direct nullish property value, refusing a potentially shadowed undefined
@@ -2512,11 +2713,20 @@ fn named_config_literal(masked: &[char], original: &[char], name: &str) -> Optio
     None
 }
 
-/// Resolve a standalone config to its optional project name and effective fields, returning
-/// None when resolution fails.
+/// Resolve a standalone config to its project name, effective fields and any refused
+/// `mergeConfig` base, returning None when resolution fails. Every file the `mergeConfig` chain
+/// reads must lie under `root`.
+fn resolve_standalone_config_within(root: &Path, path: &Path) -> Option<StandaloneConfigFields> {
+    let mut refused = false;
+    resolve_standalone_config_bounded(Some(root), path, None, &mut Vec::new(), &mut refused)
+}
+
+/// [`resolve_standalone_config_within`] without a root to confine the chain to.
+#[cfg(test)]
 fn resolve_standalone_config(path: &Path) -> Option<(Option<String>, EffectiveTestFields)> {
     let mut refused = false;
-    let fields = resolve_standalone_config_bounded(path, None, &mut Vec::new(), &mut refused)?;
+    let fields =
+        resolve_standalone_config_bounded(None, path, None, &mut Vec::new(), &mut refused)?;
     Some((fields.name, fields.effective))
 }
 
@@ -2527,13 +2737,25 @@ fn resolve_standalone_config(path: &Path) -> Option<(Option<String>, EffectiveTe
 /// raw `test` object text participate in the identity. That deliberately over-separates
 /// formatting-only differences, but it cannot merge two configurations that differ in a field
 /// this analyzer does not otherwise model.
+///
+/// Every file the `mergeConfig` chain reads must lie under `root`; one that does not is an `Err`.
+pub(crate) fn resolved_config_test_scope_within(
+    root: &Path,
+    path: &Path,
+) -> Result<Option<String>, String> {
+    resolve_config_test_scope_bounded(Some(root), path, None, &mut Vec::new())
+}
+
+/// [`resolved_config_test_scope_within`] without a root to confine the chain to.
+#[cfg(test)]
 pub(crate) fn resolved_config_test_scope(path: &Path) -> Result<Option<String>, String> {
-    resolve_config_test_scope_bounded(path, None, &mut Vec::new())
+    resolve_config_test_scope_bounded(None, path, None, &mut Vec::new())
 }
 
 /// Resolve comparison scope while tracking canonical config paths; return an error for cycles,
 /// excess depth or unresolved paths.
 fn resolve_config_test_scope_bounded(
+    root: Option<&Path>,
     path: &Path,
     export: Option<&str>,
     active: &mut Vec<PathBuf>,
@@ -2548,7 +2770,7 @@ fn resolve_config_test_scope_bounded(
         ));
     }
     active.push(canonical);
-    let result = resolve_config_test_scope_inner(path, export, active);
+    let result = resolve_config_test_scope_inner(root, path, export, active);
     active.pop();
     result
 }
@@ -2556,6 +2778,7 @@ fn resolve_config_test_scope_bounded(
 /// Read a bounded config and derive its comparison scope, following supported mergeConfig bases
 /// and reporting unsupported forms.
 fn resolve_config_test_scope_inner(
+    root: Option<&Path>,
     path: &Path,
     export: Option<&str>,
     active: &mut Vec<PathBuf>,
@@ -2598,7 +2821,7 @@ fn resolve_config_test_scope_inner(
             }
         };
         let merge_base = is_merge
-            .then(|| merge_config_base_path(&masked, &original, path))
+            .then(|| merge_config_base_path(root, &masked, &original, path))
             .flatten();
         (object, is_merge, merge_base)
     };
@@ -2625,9 +2848,9 @@ fn resolve_config_test_scope_inner(
         return Ok(own_scope);
     }
     let base = merge_base
-        .ok_or_else(|| format!("{}'s mergeConfig base cannot be resolved", path.display()))?;
+        .ok_or_else(|| format!("{}'s mergeConfig base cannot be resolved", path.display()))??;
     let base_scope =
-        resolve_config_test_scope_bounded(&base.path, base.named_export.as_deref(), active)?;
+        resolve_config_test_scope_bounded(root, &base.path, base.named_export.as_deref(), active)?;
     if base_scope.is_none() && own_scope.is_none() {
         return Ok(None);
     }
@@ -2643,6 +2866,7 @@ fn resolve_config_test_scope_inner(
 /// Resolve config fields with canonical-path cycle/depth guards, marking the refusal flag when
 /// either guard is reached.
 fn resolve_standalone_config_bounded(
+    root: Option<&Path>,
     path: &Path,
     export: Option<&str>,
     active: &mut Vec<PathBuf>,
@@ -2654,7 +2878,7 @@ fn resolve_standalone_config_bounded(
         return None;
     }
     active.push(canonical);
-    let result = resolve_standalone_config_inner(path, export, active, refused);
+    let result = resolve_standalone_config_inner(root, path, export, active, refused);
     active.pop();
     result
 }
@@ -2662,6 +2886,7 @@ fn resolve_standalone_config_bounded(
 /// Read and resolve supported standalone config fields and inheritance without executing the
 /// config.
 fn resolve_standalone_config_inner(
+    root: Option<&Path>,
     path: &Path,
     export: Option<&str>,
     active: &mut Vec<PathBuf>,
@@ -2684,7 +2909,7 @@ fn resolve_standalone_config_inner(
         (
             config_object,
             merge_config_overrides_literal(&masked, &original, value_start).is_some(),
-            merge_config_base_path(&masked, &original, path),
+            merge_config_base_path(root, &masked, &original, path),
         )
     };
     let body = config_object.0 + 1..config_object.1;
@@ -2714,19 +2939,40 @@ fn resolve_standalone_config_inner(
         if let Some(body) = &test_body {
             normalize_merge_fields(&mut fields, &masked, &original, body.clone(), true);
         }
-        let resolved_base = if let Some(base) = merge_base {
-            let resolved = resolve_standalone_config_bounded(
-                &base.path,
-                base.named_export.as_deref(),
-                active,
-                refused,
-            );
-            if resolved.is_none() && (*refused || base.named_export.is_some()) {
-                return None;
+        let mut base_refusal = None;
+        let resolved_base = match merge_base {
+            Some(Ok(base)) => {
+                let resolved = resolve_standalone_config_bounded(
+                    root,
+                    &base.path,
+                    base.named_export.as_deref(),
+                    active,
+                    refused,
+                );
+                if resolved.is_none() && (*refused || base.named_export.is_some()) {
+                    return None;
+                }
+                // A base that exists and cannot be read contributes unknown fields. Left only in
+                // those fields, it vanishes when a project sets them itself or `extends: false`.
+                if resolved.is_none() {
+                    base_refusal = root.map_or_else(
+                        || Some(format!("{} could not be read", base.path.display())),
+                        |root| {
+                            Some(format!(
+                                "{}, the mergeConfig base of {}, could not be read",
+                                display_path(&base.path, root),
+                                display_path(path, root)
+                            ))
+                        },
+                    );
+                }
+                resolved
             }
-            resolved
-        } else {
-            None
+            Some(Err(reason)) => {
+                base_refusal = Some(reason);
+                None
+            }
+            None => None,
         };
         if let Some(base) = resolved_base {
             let name = if name_present {
@@ -2741,18 +2987,19 @@ fn resolve_standalone_config_inner(
                 name,
                 effective,
                 specified: fields,
+                refusal: base.refusal,
             });
         }
         merge_config_arrays(&mut fields, RawTestFields::empty(), true);
-        let mode = ExtendsMode::Unresolvable(format!(
-            "mergeConfig base in {} cannot be resolved",
-            path.display()
-        ));
+        let mode = ExtendsMode::Unresolvable(base_refusal.clone().unwrap_or_else(|| {
+            format!("mergeConfig base in {} cannot be resolved", path.display())
+        }));
         let effective = resolve_effective(&fields, &mode, None, path);
         return Some(StandaloneConfigFields {
             name: fields.name.clone(),
             effective,
             specified: fields,
+            refusal: base_refusal,
         });
     }
     if let Some(body) = &test_body {
@@ -2785,6 +3032,7 @@ fn resolve_standalone_config_inner(
         name: fields.name.clone(),
         effective,
         specified: fields,
+        refusal: None,
     })
 }
 
@@ -2843,23 +3091,36 @@ fn unresolved_project(
 
 /// Build a project from a config file, retaining unknown effective fields when static
 /// resolution fails.
-fn build_file_project(root: &Path, path: &Path, defined_in: &Path, declared_at: usize) -> Project {
+///
+/// A refused `mergeConfig` base, or a file that cannot be read, is recorded in `refusal`, as for
+/// [`build_inline_project`].
+fn build_file_project(
+    root: &Path,
+    path: &Path,
+    defined_in: &Path,
+    declared_at: usize,
+    refusal: &mut Option<String>,
+) -> Project {
     let base_dir = path.parent().unwrap_or(root).to_path_buf();
-    match resolve_standalone_config(path) {
-        Some((name, effective)) => Project::from_effective(
-            name,
-            base_dir,
-            Some(path.to_path_buf()),
-            defined_in,
-            effective,
-            declared_at,
-        ),
+    match resolve_standalone_config_within(root, path) {
+        Some(fields) => {
+            *refusal = fields.refusal;
+            Project::from_effective(
+                fields.name,
+                base_dir,
+                Some(path.to_path_buf()),
+                defined_in,
+                fields.effective,
+                declared_at,
+            )
+        }
         None => {
             let reason = format!(
                 "{} could not be read as a standalone project configuration (unreadable, \
                  malformed, or its `test` value is not an object literal)",
                 path.display()
             );
+            *refusal = Some(reason.clone());
             unresolved_project(
                 base_dir,
                 Some(path.to_path_buf()),
@@ -2873,8 +3134,8 @@ fn build_file_project(root: &Path, path: &Path, defined_in: &Path, declared_at: 
 
 /// Resolves the base an `extends: '<path>'` string points at, other than the common
 /// self-referencing case the caller already handles directly.
-fn resolve_extends_target(candidate: &Path) -> Option<EffectiveTestFields> {
-    resolve_standalone_config(candidate).map(|(_, effective)| effective)
+fn resolve_extends_target(root: &Path, candidate: &Path) -> Option<StandaloneConfigFields> {
+    resolve_standalone_config_within(root, candidate)
 }
 
 /// Return the canonical path when available, otherwise preserve the supplied path.
@@ -2882,8 +3143,15 @@ fn canonical_or_self(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+// Every parameter is a distinct piece of context with no natural grouping, as for
+// `resolve_project_entry` below.
 /// Builds one [`Project`] from an inline `test.projects`/workspace-array object entry
 /// (`{ extends?, test: { ... } }`).
+///
+/// Whatever leaves the entry unresolved is recorded in `refusal`, besides reaching the project's
+/// fields: an `extends` that is refused, cannot be loaded, or is not a boolean or string literal;
+/// a `root`/`dir` outside the analysis root; a `test` value that cannot be read.
+#[allow(clippy::too_many_arguments)]
 fn build_inline_project(
     root: &Path,
     defining_config: &Path,
@@ -2892,6 +3160,7 @@ fn build_inline_project(
     object_interior: Range<usize>,
     default_base: &EffectiveTestFields,
     declared_at: usize,
+    refusal: &mut Option<String>,
 ) -> Project {
     let extends_pos =
         find_direct_key_value_starts_precise(masked, original, object_interior.clone(), "extends")
@@ -2911,28 +3180,41 @@ fn build_inline_project(
                         let candidate = canonical_or_self(&defining_dir.join(&target));
                         if candidate == canonical_or_self(defining_config) {
                             (ExtendsMode::Inherit, default_base.clone())
+                        } else if matches!(confine(root, &candidate), Confinement::Outside) {
+                            let reason = format!(
+                                "{} extends `{target}`, which resolves outside the analysis \
+                                 root and was not read",
+                                display_path(defining_config, root)
+                            );
+                            *refusal = Some(reason.clone());
+                            (ExtendsMode::Unresolvable(reason), default_base.clone())
                         } else {
-                            match resolve_extends_target(&candidate) {
-                                Some(effective) => (ExtendsMode::Inherit, effective),
-                                None => (
-                                    ExtendsMode::Unresolvable(format!(
+                            match resolve_extends_target(root, &candidate) {
+                                Some(fields) => {
+                                    *refusal = fields.refusal;
+                                    (ExtendsMode::Inherit, fields.effective)
+                                }
+                                None => {
+                                    let reason = format!(
                                         "{} extends `{target}`, which this scan could not load \
                                          and parse as a base configuration",
                                         display_path(defining_config, root)
-                                    )),
-                                    default_base.clone(),
-                                ),
+                                    );
+                                    *refusal = Some(reason.clone());
+                                    (ExtendsMode::Unresolvable(reason), default_base.clone())
+                                }
                             }
                         }
                     }
-                    None => (
-                        ExtendsMode::Unresolvable(format!(
+                    None => {
+                        let reason = format!(
                             "{} sets `extends` to something other than a boolean or a string \
                              literal",
                             display_path(defining_config, root)
-                        )),
-                        default_base.clone(),
-                    ),
+                        );
+                        *refusal = Some(reason.clone());
+                        (ExtendsMode::Unresolvable(reason), default_base.clone())
+                    }
                 },
             }
         }
@@ -2946,6 +3228,7 @@ fn build_inline_project(
                 "a `test.projects` entry in {} sets `test` to something this scan cannot read",
                 display_path(defining_config, root)
             );
+            *refusal = Some(reason.clone());
             return unresolved_project(
                 root.to_path_buf(),
                 None,
@@ -2997,7 +3280,25 @@ fn build_inline_project(
     let base_dir = match own_fields.base.as_deref() {
         Some(declared) => {
             let joined = root.join(declared.strip_prefix("./").unwrap_or(declared));
-            std::fs::canonicalize(&joined).unwrap_or(joined)
+            match confine(root, &joined) {
+                Confinement::Inside(canonical) => canonical,
+                Confinement::Missing(_) => joined,
+                Confinement::Outside => {
+                    let reason = format!(
+                        "a `test.projects` entry in {} declares `root`/`dir` `{declared}`, which \
+                         resolves outside the analysis root",
+                        display_path(defining_config, root)
+                    );
+                    *refusal = Some(reason.clone());
+                    return unresolved_project(
+                        root.to_path_buf(),
+                        None,
+                        defining_config,
+                        declared_at,
+                        reason,
+                    );
+                }
+            }
         }
         None => root.to_path_buf(),
     };
@@ -3038,6 +3339,7 @@ fn resolve_project_entry(
     if masked[i] == '{' || is_ident_char(masked[i]) {
         match locate_object_literal_or_call_argument(masked, i) {
             ConfigObject::Found(open, close) => {
+                let mut refusal = None;
                 projects.push(build_inline_project(
                     root,
                     defining_config,
@@ -3046,7 +3348,13 @@ fn resolve_project_entry(
                     open + 1..close,
                     base,
                     declared_at,
+                    &mut refusal,
                 ));
+                if let Some(reason) = refusal {
+                    diagnostics.push(reason);
+                    *has_unresolved = true;
+                    note_unresolved_position(max_unresolved_position, declared_at);
+                }
                 return;
             }
             ConfigObject::Malformed => {
@@ -3076,8 +3384,21 @@ fn resolve_project_entry(
             note_unresolved_position(max_unresolved_position, declared_at);
             return;
         }
-        let resolved = expand_project_path(root, &path_str, budget);
+        let expanded = expand_project_path(root, &path_str, budget);
+        if expanded.outside > 0 {
+            diagnostics.push(format!(
+                "a `test.projects` entry in {} (`{path_str}`) resolves outside the analysis \
+                 root and was not read",
+                display_path(defining_config, root)
+            ));
+            *has_unresolved = true;
+            note_unresolved_position(max_unresolved_position, declared_at);
+        }
+        let resolved = expanded.paths;
         if resolved.is_empty() {
+            if expanded.outside > 0 {
+                return;
+            }
             diagnostics.push(format!(
                 "a `test.projects` entry in {} (`{path_str}`) matched no project configuration \
                  file",
@@ -3107,12 +3428,19 @@ fn resolve_project_entry(
                 note_unresolved_position(max_unresolved_position, declared_at);
                 return;
             }
+            let mut refusal = None;
             projects.push(build_file_project(
                 root,
                 &path,
                 defining_config,
                 declared_at,
+                &mut refusal,
             ));
+            if let Some(reason) = refusal {
+                diagnostics.push(reason);
+                *has_unresolved = true;
+                note_unresolved_position(max_unresolved_position, declared_at);
+            }
         }
         return;
     }
@@ -3293,13 +3621,25 @@ fn resolve_projects_array(
             original,
             value_extent(masked, value_start, test_body.end),
         ) {
-            let resolved = expand_project_path(root, &pattern, budget);
-            if resolved.is_empty() {
+            let expanded = expand_project_path(root, &pattern, budget);
+            let outside = expanded.outside > 0;
+            let mut refused = false;
+            if outside {
                 diagnostics.push(format!(
-                    "{} sets `test.projects` to `glob.sync('{pattern}')`, which matched no \
-                     project configuration file",
+                    "{} sets `test.projects` to `glob.sync('{pattern}')`, which resolves \
+                     outside the analysis root and was not read",
                     display_path(config_path, root)
                 ));
+            }
+            let resolved = expanded.paths;
+            if resolved.is_empty() {
+                if !outside {
+                    diagnostics.push(format!(
+                        "{} sets `test.projects` to `glob.sync('{pattern}')`, which matched no \
+                         project configuration file",
+                        display_path(config_path, root)
+                    ));
+                }
                 let mut set = unresolved_set(root, diagnostics, true);
                 set.truncated = budget.exhausted();
                 return set;
@@ -3318,7 +3658,18 @@ fn resolve_projects_array(
                     set.config_found = true;
                     return set;
                 }
-                projects.push(build_file_project(root, &path, config_path, 0));
+                let mut refusal = None;
+                projects.push(build_file_project(
+                    root,
+                    &path,
+                    config_path,
+                    0,
+                    &mut refusal,
+                ));
+                if let Some(reason) = refusal {
+                    diagnostics.push(reason);
+                    refused = true;
+                }
             }
             // All matches originate at entry 0. An incomplete dynamic list can hide a later
             // matching project, so its unresolved position must out-rank every retained match.
@@ -3333,9 +3684,9 @@ fn resolve_projects_array(
                 root,
                 projects,
                 diagnostics,
+                exhausted || outside || refused,
                 exhausted,
-                exhausted,
-                exhausted.then_some(1),
+                (exhausted || outside || refused).then_some(1),
             );
             set.config_found = true;
             return set;
