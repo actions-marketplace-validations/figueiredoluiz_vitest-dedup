@@ -153,4 +153,53 @@ gets routed around, after which the number it guards is worse than unmeasured. `
 records the destination. The corpus currently detects every one of its 123 desired findings, so
 both measured recall and the enforced floor are 100%, with `knownMissBaseline: 0`.
 
+## Evaluating a binary
+
+`npm run evaluate:corpus` runs every case against the release binary and reports, per rule, what
+each expectation resolved to instead of stopping at the first failure:
+
+```bash
+node scripts/check/evaluate-corpus.mjs ./target/release/vitest-dedup --json report.json
+```
+
+For each rule it prints expected findings satisfied, forbidden findings held, known misses and known
+false positives still in place, findings nobody labelled, and extraction counts that differ from the
+case. Every ratio shows its denominator, and an empty population prints `n/a` rather than a
+percentage. For each held `expectedAbsent` entry it also says whether the pair was eligible for
+comparison: `eligible` lists the keys that differ (a pair whose keys are equal is counted apart,
+because the analyzer keeps one representative per equality group and the silence is that, not
+distinctness), `not compared` means a participant was set aside, the rule was off for the case by
+default, by its `.vitest-dedup.json` or by `--rule`, or the pair spans two files for a rule that groups by file, and `unresolved`
+means the entry names a suite or a row, or hooks whose chain the records do not show. `eligible` is
+necessary, not sufficient: the records cannot show
+whether `.each` rows belong to one declaration, or which hooks share a chain. Pending cases are
+listed apart and left out of the per-rule figures.
+
+A violation is data and exits 0; `--fail-on-violation` turns it into exit 1. A run that did not
+measure the corpus (a case that cannot run, no summary record, a malformed record, zero extracted
+tests, a binary that emits no test records) always fails. The evaluator is not part of
+`npm run check`; the recall gate remains the enforced contract.
+
+### Comparing two binaries
+
+`--baseline-binary FILE` runs the same corpus through an older binary and classes every expectation
+by what changed: `retained`, `newly-satisfied` (a wanted finding gained), `corrected` (a forbidden
+or known false-positive finding gone), `regressed` (a wanted finding lost), `new-forbidden` (a
+forbidden finding gained) or `still-unmet`. Findings nobody labelled are compared the same way. A
+case the baseline cannot be run or read on (a crash, an old report schema, no extracted tests) is
+`unavailable` with the reason; it is never read as zero findings, and a baseline that ran on no case
+is an error. The baseline is not asked for `--emit-test-fingerprints`, since it may predate it.
+Classes follow the labels as written: a known false positive whose `expectCount` the candidate no
+longer meets leaves its overlapping `expectedAbsent` entry violated, and is reported as such.
+
+`--baseline-ref REF` names the commit the baseline was built from. Cases that are new there, whose
+expectations differ, or whose files or governing configuration (the nearest `.vitest-dedup.json`,
+or the one `--config` names) differ are totalled apart, because a difference on them is not a
+detector change. A case is taken to be self-contained: a change confined to a file it imports from
+outside its own directory is not seen. The baseline tree is extracted with `git archive`, so `git`
+and `tar` are needed. `--json` carries the whole comparison and a run record: both binaries by
+sha256 and `--version`, the corpus by sha256, the checkout and baseline commits, and the arguments
+each case ran with. `--fail-on-regression` exits 1 on a regression, a new unclaimed finding, a case that no longer
+extracts what its labels say, or an unavailable case; a baseline that cannot run a case new or changed since it was built stays data.
+
 The fixtures are synthetic and contain no third-party source.
