@@ -24,11 +24,37 @@ is a blind spot; see [Blind spots](#blind-spots).
 for different responses.
 
 - `=reads` counts only causes meaning the project could not be fully read: unreadable, oversized or
-  partially read files, undetermined config, and tests whose context could not be resolved.
+  partially read files, undetermined config, tests whose context could not be resolved, and
+  [missing prerequisites](#missing-prerequisites).
 - `=limits` counts only the analyzer's own bounded work being capped: the pair budget, the hook-scan
   budget, the memory budget, and truncated findings.
 
 The value needs the `=`; with a space, `reads` would be read as the path.
+
+### Missing prerequisites
+
+Imports are resolved on disk. When a file or directory the project needs for that is absent, the run
+is incomplete and says which one, instead of leaving imports unresolved without a word. Each entry
+of `incompleteCauses.missingPrerequisites` (`json`, `jsonl`, `sarif`, `html`) has a `kind`, a `path`,
+a `fix` and `unresolvedImports`, and the terminal and HTML banners print it as a sentence:
+
+| `kind` | Reported when | `fix` |
+| --- | --- | --- |
+| `tsconfig-extends` | A tsconfig's `extends` target does not exist. Nothing under that tsconfig then resolves, relative imports included. | `nuxt prepare` for a path under `.nuxt` in a project with a `nuxt.config.*` or a `nuxt` dependency; the install command for a package target; otherwise `generate or restore this file`. |
+| `tsconfig-unreadable` | The target exists but is not valid JSON. An empty file or one holding only comments loads as an empty config and is not reported; neither is a root tsconfig that cannot be read at all, which the resolver skips. | `generate or restore this file`. |
+| `node-modules` | `package.json` lists dependencies, `node_modules` is missing or empty here and in every parent directory, and an import of a package could not be resolved. `vitest`, `node:` and Node core module imports do not count, nor do imports spelled as something other than a package (relative and absolute paths, `#` imports, `~/` and `@/` aliases, URLs, drive paths). An alias written like a package (`@app/missing`) cannot be told apart by its spelling and does count. | `pnpm install`, `bun install`, `yarn install` or `npm ci` for the nearest `pnpm-lock.yaml`, `bun.lock`/`bun.lockb`, `yarn.lock` or `package-lock.json`; otherwise `install the dependencies`. |
+
+`unresolvedImports` counts the import resolutions that failed for that reason, once per analyzed
+file and specifier. The `package.json` consulted is the nearest one at or above the analyzed directory. A project that never needed the file is not told about it: no `extends`, no
+listed dependencies, or only relative imports produce nothing. Only resolution failures are
+reported, so a tsconfig that is merely unusual is silent.
+
+Limits: detection relies on what the resolver reports. A target that cannot be read because of an
+I/O error (invalid UTF-8, no read permission) is swallowed by the resolver during discovery and is not
+reported. On Windows a tsconfig is not found from a canonical importer path at all, so the two
+`tsconfig-*` kinds are not detected there (the same gap that keeps `paths` aliases from applying); the
+`node-modules` kind does not depend on tsconfig discovery. The failures are collected process-wide and
+drained once per run, so the reports describe one analysis per process.
 
 ### Blind spots
 
