@@ -385,6 +385,10 @@ fn historical_callers_do_not_read_present_day_imported_bodies() {
     assert!(extraction.incomplete && extraction.tests[0].context.unresolved);
     assert!(extraction.helper_sources.is_empty());
     assert!(extraction.diagnostics[0].contains("historical helper sources"));
+    assert_eq!(
+        extraction.reasons,
+        vec![ExclusionReason::HelperSourcesUnavailable]
+    );
 }
 
 #[test]
@@ -716,7 +720,10 @@ fn repeated_refusals_scan_existing_declarations_once_and_keep_the_diagnostic() {
     assert_eq!(walker.tests.len(), 300);
     assert!(walker.tests.iter().all(|case| !case.context.unresolved));
     for _ in 0..MAX_HELPER_EXPANSIONS {
-        walker.refuse_helper_expansion("this file's helper-expansion budget is spent");
+        walker.refuse_helper_expansion(refusal(
+            ExclusionReason::HelperLimit,
+            "this file's helper-expansion budget is spent",
+        ));
     }
     assert!(
         walker.helper_refusal_taint_visits <= 300,
@@ -728,6 +735,45 @@ fn repeated_refusals_scan_existing_declarations_once_and_keep_the_diagnostic() {
     walker.walk_statement(&parsed.program.body[1], &mut registry);
     assert_eq!(walker.tests.len(), 301);
     assert!(walker.tests[300].context.unresolved);
+}
+
+/// The nested refusal's code and the "further refusals" bookkeeping come from the helper
+/// refusals alone: another reason the walker holds (here an unsupported statement recorded first)
+/// is neither mistaken for the helper's cause nor allowed to hide a later helper refusal that
+/// happens to share its code.
+#[test]
+fn helper_refusal_reasons_are_tracked_apart_from_other_walker_reasons() {
+    let source = "import { test } from 'vitest'; test('t', () => {});";
+    let case = RunnerCase::new("", "");
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program);
+    let mut walker = Walker::new(
+        source,
+        &case.file,
+        &parsed.program,
+        &semantic.semantic,
+        Globals::Disabled,
+    );
+    walker.reasons.push(ExclusionReason::UnsupportedStatement);
+    walker.refuse_helper_expansion(refusal(ExclusionReason::HelperLimit, "budget"));
+    assert_eq!(
+        walker.helper_refusal_reasons,
+        vec![ExclusionReason::HelperLimit]
+    );
+    walker.refuse_helper_expansion(refusal(ExclusionReason::UnsupportedStatement, "same code"));
+    walker.refuse_helper_expansion(refusal(ExclusionReason::UnsupportedStatement, "again"));
+    assert_eq!(
+        walker
+            .further_refusals
+            .iter()
+            .map(|(reason, _)| *reason)
+            .collect::<Vec<_>>(),
+        vec![ExclusionReason::UnsupportedStatement],
+        "a code already held for another reason still records its first helper refusal, once"
+    );
 }
 
 const GLOBAL_HOOK_RUNNER: &str = r#"import { beforeEach, test, expect } from 'vitest';
@@ -1371,4 +1417,18 @@ fn imported_but_uncalled_modules_with_setup_effects_taint_the_file() {
             "{effects}"
         );
     }
+}
+
+#[test]
+/// A recovered worker failure carries its own code, and a nested runner refusal keeps its own.
+fn recovered_and_nested_refusals_carry_their_own_codes() {
+    let recovered = recovered_extraction("worker failed".to_owned());
+    assert_eq!(recovered.reasons, vec![ExclusionReason::ExtractionFailed]);
+    assert_eq!(recovered.diagnostics, vec!["worker failed".to_owned()]);
+    let case = RunnerCase::new(
+        "import { test, expect } from 'vitest'; export function run() { run(); test('x', () => { expect(1).toBe(1); }); }",
+        "run();",
+    );
+    let extraction = case.extract(Globals::Disabled);
+    assert_eq!(extraction.reasons, vec![ExclusionReason::HelperLimit]);
 }
