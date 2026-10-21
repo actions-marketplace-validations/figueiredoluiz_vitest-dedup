@@ -63,8 +63,191 @@
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 use oxc_span::VALID_EXTENSIONS;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// A tsconfig the resolver could not use, as the resolver itself reported it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TsconfigGap {
+    /// The file does not exist (an absolute path, or a package specifier as written).
+    Absent(PathBuf),
+    /// The file exists and could not be loaded.
+    Unreadable(PathBuf),
+}
+
+/// Resolutions that failed because something the run needs is absent, collected across workers
+/// and drained once per run. See [`take_resolution_gaps`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResolutionGaps {
+    /// Failed resolutions per unusable tsconfig. A tsconfig that cannot be loaded fails every
+    /// resolution under it, relative specifiers included.
+    pub tsconfig: BTreeMap<TsconfigGap, usize>,
+    /// Package-style specifiers (not relative, absolute, `vitest` or `node:`) that were not found.
+    pub packages_not_found: usize,
+}
+
+/// Process-wide on purpose: extraction runs on worker threads and the run drains the total once.
+/// One analysis per process, as the binary is; an embedder running several concurrently would see
+/// their gaps mixed.
+static GAPS: Mutex<ResolutionGaps> = Mutex::new(ResolutionGaps {
+    tsconfig: BTreeMap::new(),
+    packages_not_found: 0,
+});
+
+/// Takes and clears the gaps recorded since the last call.
+pub fn take_resolution_gaps() -> ResolutionGaps {
+    std::mem::take(
+        &mut *GAPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Node core module specifiers that are imported without the `node:` prefix and are never installed:
+/// `module.builtinModules` of Node 26 without its prefixed entries, plus the `_stream_*` names that
+/// earlier versions still list. Matched exactly, subpaths included, so `fs/promises` is a builtin
+/// and `fs/not-real` is a package lookup.
+const NODE_BUILTINS: &[&str] = &[
+    "_http_agent",
+    "_http_client",
+    "_http_common",
+    "_http_incoming",
+    "_http_outgoing",
+    "_http_server",
+    "_tls_common",
+    "_stream_duplex",
+    "_stream_passthrough",
+    "_stream_readable",
+    "_stream_transform",
+    "_stream_wrap",
+    "_stream_writable",
+    "_tls_wrap",
+    "assert",
+    "assert/strict",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "dns/promises",
+    "domain",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "inspector/promises",
+    "module",
+    "net",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "readline/promises",
+    "repl",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "sys",
+    "timers",
+    "timers/promises",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "util/types",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// Whether `specifier` is spelled like a request for an installed package rather than as something
+/// that is plainly not one: a relative, absolute or `#`-internal path, a `~`, `~~`, `@@` or `@/` alias, a URI
+/// scheme or drive path (a colon in the first segment, `npm:` and `jsr:` included), a backslash
+/// path, a package name with whitespace, or a scope with no name. Only the package part is judged: a
+/// subpath or a `?query` suffix may contain anything, and legacy names are accepted, because
+/// refusing a real package would hide a missing install. An alias written like a package
+/// (`@app/missing`) cannot be told apart by its spelling.
+fn has_package_syntax(specifier: &str) -> bool {
+    let head = specifier.split(['?', '#']).next().unwrap_or_default();
+    if head.is_empty()
+        || head.starts_with(['.', '/'])
+        || ["~", "~~", "@@"].contains(&head)
+        || ["~/", "~~/", "@@/"]
+            .iter()
+            .any(|alias| head.starts_with(alias))
+        || head.contains('\\')
+    {
+        return false;
+    }
+    let mut parts = head.split('/');
+    let first = parts.next().unwrap_or_default();
+    let plain = |segment: &str| !segment.contains(':') && !segment.contains(char::is_whitespace);
+    match first.strip_prefix('@') {
+        Some(scope) => {
+            let name = parts.next().unwrap_or_default();
+            !scope.is_empty() && !name.is_empty() && plain(scope) && plain(name)
+        }
+        None => plain(first),
+    }
+}
+
+/// Whether `specifier` names an installable package the analyzer does not resolve by name.
+///
+/// Node's prefix-only modules (`node:sqlite`, `node:sea`, `node:test`) are not in the builtin list:
+/// without the prefix those names are ordinary packages, and `test` is a real one.
+fn is_package_specifier(specifier: &str) -> bool {
+    has_package_syntax(specifier)
+        && !(specifier.starts_with("node:")
+            || NODE_BUILTINS.contains(&specifier)
+            || specifier == "vitest"
+            || specifier.starts_with("vitest/")
+            || specifier.starts_with("@vitest/"))
+}
+
+/// Records why a resolution failed when the cause is an absent prerequisite.
+fn record_failure(specifier: &str, error: &oxc_resolver::ResolveError) {
+    use oxc_resolver::ResolveError;
+    let gap = match error {
+        ResolveError::TsconfigNotFound(target) => Some(TsconfigGap::Absent(target.clone())),
+        ResolveError::TsconfigLoadFailed { path, .. } if !path.exists() => {
+            Some(TsconfigGap::Absent(path.clone()))
+        }
+        ResolveError::TsconfigLoadFailed { path, .. } => {
+            Some(TsconfigGap::Unreadable(path.clone()))
+        }
+        _ => None,
+    };
+    let mut gaps = GAPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match gap {
+        Some(gap) => *gaps.tsconfig.entry(gap).or_insert(0) += 1,
+        None if matches!(error, ResolveError::NotFound(_)) && is_package_specifier(specifier) => {
+            gaps.packages_not_found += 1;
+        }
+        None => {}
+    }
+}
 
 thread_local! {
     /// One resolver per worker, built lazily and reused until that extraction completes.
@@ -159,7 +342,10 @@ pub(super) fn resolve(importing_file: &Path, specifier: &str) -> Resolved {
         RESOLVER.with(
             |resolver| match resolver.resolve_file(importing_file, specifier) {
                 Ok(resolution) => Resolved::Module(resolution.into_path_buf()),
-                Err(_) => Resolved::Unresolved,
+                Err(error) => {
+                    record_failure(specifier, &error);
+                    Resolved::Unresolved
+                }
             },
         );
     let resolved = confine_resolution(importing_file, specifier, resolved);
@@ -283,6 +469,134 @@ mod tests {
         fs::write(&importer, "// importer").unwrap();
 
         assert_eq!(resolve(&importer, "./does-not-exist"), Resolved::Unresolved);
+    }
+
+    /// Only the modules Node accepts without a prefix are builtins; the prefix-only ones are
+    /// builtins solely with `node:`, and the bare names are packages that can be missing.
+    #[test]
+    fn only_package_shaped_specifiers_are_counted_as_packages() {
+        for package in [
+            "left-pad",
+            "lodash/fp",
+            "@scope/pkg",
+            "@scope/pkg/sub/path",
+            "test",
+            "a.b",
+            "pkg_x",
+            "@scope/_private",
+            "@_scope/pkg",
+            "old!pkg",
+            "pkg?query",
+            "@scope/pkg?x",
+            "pkg#fragment",
+            "Pkg-Upper",
+            "pkg/sub:file",
+            "pkg?a=b:c",
+            "@scope/pkg?x=a:b",
+            "pkg/sub file",
+            "pkg?x=a b",
+            "~pkg",
+        ] {
+            assert!(is_package_specifier(package), "{package}");
+        }
+        for other in [
+            "~/x",
+            "~",
+            "~~/x",
+            "@@/y",
+            "@@",
+            "@/y",
+            "@scope",
+            "@scope/",
+            "https://example.com/z.js",
+            "data:text/javascript,1",
+            "file:///x",
+            "C:/w/v",
+            "C:\\w\\v",
+            "\\\\host\\share",
+            "./x",
+            "../x",
+            "/x",
+            "#internal",
+            "",
+            ".hidden",
+            " ",
+            "a b",
+            "npm:left-pad",
+            "jsr:@std/path",
+        ] {
+            assert!(!is_package_specifier(other), "{other:?}");
+        }
+    }
+
+    /// Only the modules Node accepts without a prefix are builtins; the prefix-only ones are
+    /// builtins solely with `node:`, and the bare names are packages that can be missing.
+    #[test]
+    fn prefix_only_node_modules_are_packages_without_the_prefix() {
+        for package in [
+            "test",
+            "sqlite",
+            "sea",
+            "test/reporters",
+            "left-pad",
+            "@scope/pkg",
+            "fs/not-real",
+            "path/nope",
+        ] {
+            assert!(is_package_specifier(package), "{package}");
+        }
+        for other in [
+            "node:test",
+            "node:sqlite",
+            "node:sea",
+            "fs",
+            "fs/promises",
+            "path",
+            "path/posix",
+            "assert/strict",
+            "stream/consumers",
+            "_http_agent",
+            "_tls_wrap",
+            "_stream_readable",
+            ".",
+            "./x",
+            "/x",
+            "#alias",
+            "vitest",
+            "vitest/config",
+            "@vitest/ui",
+        ] {
+            assert!(!is_package_specifier(other), "{other}");
+        }
+    }
+
+    /// A tsconfig that fails to load is a gap whether the resolver reports the file as missing
+    /// (`TsconfigNotFound`) or wraps a load failure for a path that is not there: both are
+    /// "absent". A load failure for a file that exists is "unreadable". Other errors record
+    /// nothing. Matched on unique paths because the accumulator is shared by the whole process.
+    #[test]
+    fn tsconfig_failures_are_classified_as_absent_or_unreadable() {
+        use oxc_resolver::ResolveError;
+        let dir = tempfile::tempdir().unwrap();
+        let missing_a = dir.path().join("unique-classification-a/tsconfig.json");
+        let missing_b = dir.path().join("unique-classification-b/tsconfig.json");
+        let present = dir.path().join("unique-classification-c.json");
+        fs::write(&present, "{").unwrap();
+        let load_failed = |path: &Path| ResolveError::TsconfigLoadFailed {
+            path: path.to_path_buf(),
+            source: Box::new(ResolveError::TsconfigNotFound(path.to_path_buf())),
+        };
+        record_failure("./x", &ResolveError::TsconfigNotFound(missing_a.clone()));
+        record_failure("./x", &load_failed(&missing_b));
+        record_failure("./x", &load_failed(&present));
+        record_failure("./x", &ResolveError::Ignored(missing_a.clone()));
+        let gaps = take_resolution_gaps();
+        assert_eq!(gaps.tsconfig.get(&TsconfigGap::Absent(missing_a)), Some(&1));
+        assert_eq!(gaps.tsconfig.get(&TsconfigGap::Absent(missing_b)), Some(&1));
+        assert_eq!(
+            gaps.tsconfig.get(&TsconfigGap::Unreadable(present)),
+            Some(&1)
+        );
     }
 
     /// A `tsconfig.json` `paths` alias and the equivalent relative import must resolve to the same
