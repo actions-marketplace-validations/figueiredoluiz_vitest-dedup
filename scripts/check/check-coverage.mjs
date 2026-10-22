@@ -142,6 +142,10 @@ const RUST_MODULES = {
   'src/frontend/extract.rs': 98,
   // First-party imported registration frames: first measured at 93.01% (399/429 lines).
   'src/frontend/extract/imported.rs': 93,
+  'src/frontend/extract/registration_free.rs': 93,
+  'src/frontend/extract/setup_identity.rs': 93,
+  'src/frontend/auto_imports.rs': 97,
+  'src/frontend/package_manifests.rs': 98,
   // Formerly the weakest module at 71.3%, and the one the last four adjudicated false positives
   // lived in. Raised after a survivor-driven pass over the 466 depth-guard and 135 deleted-arm
   // mutants; the documented-unreachable lines (a Windows-only path component, `should not happen`
@@ -207,6 +211,7 @@ const RUST_MODULES = {
   'src/main.rs': 97,
   // Native memory readers: measured 41/44 instrumented lines (93.18%) on macOS.
   'src/rss.rs': 93,
+  'src/stdout.rs': 100,
   // New in this PR (commit a84a42d) and initially landed with no floor at all, which is what
   // caught it: the module added functions the tests did not reach, and `rust total functions`
   // dropped to 95.10%, below the 95.4% floor. Raised by testing what each `HeapBytes` impl
@@ -297,6 +302,7 @@ const JS_MODULES = {
   'scripts/check/lib/isolation.mjs': 48,
   '.github/actions/vitest-dedup/index.js': 85,
   'npm/lib/launcher.mjs': 98,
+  'npm/bin/vitest-dedup.js': 100,
   'npm/lib/targets.mjs': 100,
   // The two memory gates are entry points that need a release binary, so most of each file is a
   // measurement path no unit test can reach. What IS covered is the part that runs before the
@@ -377,7 +383,6 @@ const JS_MODULES = {
  * A file that is neither here nor in `JS_MODULES` fails the gate.
  */
 const JS_NOT_MEASURED = {
-  'npm/bin/vitest-dedup.js': 'six-line shim; exercised only as a spawned process by the install simulation',
   'scripts/check/check-agent-skills.mjs': 'gate entry point, run as a process by CI and never imported',
   'scripts/check/check-coverage.mjs': 'this file',
   'scripts/check/check-duplicates-corpus.mjs': 'gate entry point; needs a release binary',

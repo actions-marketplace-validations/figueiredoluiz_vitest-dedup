@@ -35,13 +35,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod imported;
+mod registration_free;
+mod setup_identity;
 
 use super::fingerprint::{fingerprint, FunctionLike, RowSubstitution};
 use super::registry::{
     canonicalize_export_name, const_fold, is_ecmascript_trim_whitespace, js_number_to_string,
-    js_radix_digits_value, property_key_name, resolve_callee, source_text, split_radix_prefix,
-    CellValue, ChainStep, Globals, Registry, ResolvedCallee, Row, RowCells, TitleArg, TitleNumber,
-    OVER_LIMIT_TABLE,
+    js_radix_digits_value, property_key_name, render_js_to_string, resolve_callee, source_text,
+    split_radix_prefix, CellValue, ChainStep, Globals, Registry, ResolvedCallee, Row, RowCells,
+    TitleArg, TitleNumber, OVER_LIMIT_TABLE,
 };
 use super::FileExtraction;
 
@@ -117,6 +119,7 @@ fn extract_confined(
                 imported::EMISSION_LIMIT_OVERRIDE.with(|limit| limit.set(emission_limit));
                 super::registry::reset_cell_census_file_scope();
                 super::resolver::begin_file(root);
+                registration_free::begin_file(globals == Globals::Enabled);
                 let extraction = run(source, file, globals, allow_imported);
                 #[cfg(test)]
                 let extraction = (extraction, super::registry::test_cell_census_snapshot());
@@ -492,6 +495,13 @@ fn run(source: &str, file: &SourceFile, globals: Globals, allow_imported: bool) 
         let mut walker = Walker::new(source, file, program, semantic, globals);
         walker.allow_imported = allow_imported;
         walker.walk_statements(&program.body, &mut registry);
+        if !walker.helper_setup.is_empty() {
+            for case in &mut walker.tests {
+                case.context
+                    .module_setup
+                    .extend(walker.helper_setup.iter().cloned());
+            }
+        }
         walker
     });
     reasons.extend(walker.reasons);
@@ -562,7 +572,7 @@ fn collect_module_setup(
     semantic: &Semantic,
     import_specifiers: &HashMap<SymbolId, Arc<str>>,
     exported_as: &HashMap<SymbolId, String>,
-) -> Vec<String> {
+) -> Vec<(u32, String)> {
     let mut calls = Vec::new();
     for statement in &program.body {
         let Statement::ExpressionStatement(statement) = statement else {
@@ -593,7 +603,7 @@ fn collect_module_setup(
         // two different things. Raw text over-separates instead — reformatting an awaited setup
         // call changes its key and suppresses a finding — which is the safe direction for a field
         // whose whole job is to stop two files being called equal.
-        calls.push(source_text(source, span).to_owned());
+        calls.push((span.start, source_text(source, span).to_owned()));
     }
     calls
 }
@@ -722,6 +732,47 @@ fn collect_import_specifiers(
     (map, exported_as)
 }
 
+/// The local bindings of `mockNuxtImport` imported from `@nuxt/test-utils`.
+fn nuxt_mock_import_symbols(program: &Program) -> HashSet<SymbolId> {
+    let mut symbols = HashSet::new();
+    for import in super::fingerprint::value_import_declarations(program) {
+        if import.source.value.as_str() != "@nuxt/test-utils/runtime" {
+            continue;
+        }
+        for specifier in import.specifiers.iter().flatten() {
+            if let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier {
+                if specifier.imported.name() == "mockNuxtImport"
+                    && !matches!(
+                        specifier.import_kind,
+                        oxc_ast::ast::ImportOrExportKind::Type
+                    )
+                {
+                    if let Some(symbol) = specifier.local.symbol_id.get() {
+                        symbols.insert(symbol);
+                    }
+                }
+            }
+        }
+    }
+    symbols
+}
+
+/// Whether `call` invokes one of the `mockNuxtImport` bindings.
+fn is_nuxt_mock_call(
+    call: &CallExpression,
+    semantic: &Semantic,
+    symbols: &HashSet<SymbolId>,
+) -> bool {
+    let Expression::Identifier(callee) = &call.callee else {
+        return false;
+    };
+    callee
+        .reference_id
+        .get()
+        .and_then(|reference| semantic.scoping().get_reference(reference).symbol_id())
+        .is_some_and(|symbol| symbols.contains(&symbol))
+}
+
 /// Reads the `vi` module-mocking family and folds the statically safe subset of it into the
 /// file-wide mocked-module set.
 ///
@@ -791,6 +842,18 @@ fn collect_mocked_modules(
         Unmock(String),
     }
 
+    /// A mock factory argument as its fingerprint, or `None` when it cannot be read: not an inline
+    /// function, or a body whose class-dependent parts cannot be compared.
+    fn read_factory(
+        argument: &Argument<'_>,
+        semantic: &Semantic<'_>,
+        source: &str,
+        file: &std::path::Path,
+    ) -> Option<MockFactory> {
+        let body = fingerprint(as_function_like(argument)?, semantic, source, file, None);
+        (!body.class_unresolved).then(|| MockFactory::Factory(body.into_alpha_source()))
+    }
+
     /// The member name of a `vi.<mock|unmock|doMock|doUnmock>(...)` call, or `None` for any other
     /// call. Shared by both passes so "is this a mocking call" is decided in exactly one place --
     /// a second, subtly different predicate in the nesting pass would let a call be modelled by
@@ -842,23 +905,13 @@ fn collect_mocked_modules(
                     let factory = match call.arguments.get(1) {
                         // No second argument at all: a real automock.
                         None => MockFactory::Automock,
-                        Some(argument) => match as_function_like(argument) {
-                            Some(function_like) => {
-                                let body = fingerprint(function_like, semantic, source, file, None);
-                                if body.class_unresolved {
-                                    unresolved = true;
-                                    MockFactory::Unresolved
-                                } else {
-                                    MockFactory::Factory(body.into_alpha_source())
-                                }
-                            }
-                            // A4: an imported or computed factory (identifier, call, member
-                            // expression, ...) is not automock and must never be treated as one.
-                            None => {
+                        // A4: an imported or computed factory (identifier, call, member
+                        // expression, ...) is not automock and must never be treated as one.
+                        Some(argument) => read_factory(argument, semantic, source, file)
+                            .unwrap_or_else(|| {
                                 unresolved = true;
                                 MockFactory::Unresolved
-                            }
-                        },
+                            }),
                     };
                     // The sixth instance of "unique in one scope, wrong in a wider one":
                     // `literal.value` is file-relative exactly like an `import` specifier is
@@ -901,12 +954,57 @@ fn collect_mocked_modules(
         }
     }
 
+    // `mockNuxtImport(name, factory)` from `@nuxt/test-utils`: a hoisted, module-top-level mock of
+    // one auto-imported binding, the Nuxt counterpart of `vi.mock`. The mocked thing is the
+    // binding, so it is keyed `nuxt-import:<name>`; the factory is read exactly as a `vi.mock`
+    // factory is. Anywhere but a direct top-level statement the transform does not apply, which
+    // the nesting pass below taints like a nested `vi.mock`.
+    let nuxt_mock_symbols = nuxt_mock_import_symbols(program);
+    for statement in &program.body {
+        let Statement::ExpressionStatement(expression_statement) = statement else {
+            continue;
+        };
+        let Expression::CallExpression(call) = &expression_statement.expression else {
+            continue;
+        };
+        if !is_nuxt_mock_call(call, semantic, &nuxt_mock_symbols) {
+            continue;
+        }
+        read_at_top_level.insert((call.span.start, call.span.end));
+        match (call.arguments.first(), call.arguments.get(1)) {
+            (Some(Argument::StringLiteral(name)), Some(factory)) if call.arguments.len() == 2 => {
+                // The replacement runs wherever the auto-import is called, so a factory that could
+                // register something taints every proof that reached the name.
+                let harmless =
+                    crate::frontend::extract::registration_free::arguments_register_nothing(
+                        program,
+                        semantic,
+                        &registration_free::written_bindings(program, semantic),
+                        file,
+                        &call.arguments,
+                    )
+                    .is_some();
+                match read_factory(factory, semantic, source, file).filter(|_| harmless) {
+                    Some(factory) => events.push(MockEvent::Mock(MockedModule {
+                        specifier: std::sync::Arc::from(
+                            format!("nuxt-import:{}", name.value).as_str(),
+                        ),
+                        factory,
+                    })),
+                    None => unresolved = true,
+                }
+            }
+            _ => unresolved = true,
+        }
+    }
+
     struct NestedMockScan<'r, 'a> {
         registry: &'r Registry,
         semantic: &'r Semantic<'a>,
         source: &'r str,
         file: &'r std::path::Path,
         read_at_top_level: &'r HashSet<(u32, u32)>,
+        nuxt_mock_symbols: &'r HashSet<SymbolId>,
         found: bool,
     }
     impl<'a> Visit<'a> for NestedMockScan<'_, 'a> {
@@ -916,8 +1014,9 @@ fn collect_mocked_modules(
             if !self
                 .read_at_top_level
                 .contains(&(it.span.start, it.span.end))
-                && mocking_member(it, self.registry, self.semantic, self.source, self.file)
+                && (mocking_member(it, self.registry, self.semantic, self.source, self.file)
                     .is_some()
+                    || is_nuxt_mock_call(it, self.semantic, self.nuxt_mock_symbols))
             {
                 self.found = true;
             }
@@ -930,6 +1029,7 @@ fn collect_mocked_modules(
         source,
         file,
         read_at_top_level: &read_at_top_level,
+        nuxt_mock_symbols: &nuxt_mock_symbols,
         found: false,
     };
     nested.visit_program(program);
@@ -958,6 +1058,23 @@ fn collect_mocked_modules(
     (found, unresolved)
 }
 
+/// One statically known binding value, as its two consumers need it.
+///
+/// `canonical` is the value's fold (`const_fold`): proof the extractor knows WHAT is bound, and
+/// the text a knowability check wants. `title` is the same value's `ToString` text, when
+/// JavaScript's coercion is provable -- `None` for a composite whose coercion is interceptable
+/// (`toString`, `valueOf`, `__proto__`, a computed key), which is still a perfectly known VALUE
+/// (`Object.keys` observes it) but has no title text anyone can spell. Splitting the two is what
+/// keeps loop unrolling and helper-parameter binding -- which need only knowability -- working
+/// for such composites, while titles that interpolate them degrade to [`Title::Dynamic`]
+/// instead of guessing.
+struct BindingValue {
+    /// The bound value's canonical fold: proof of knowability.
+    canonical: String,
+    /// The bound value's `ToString` text, or `None` when coercion is not provable.
+    title: Option<String>,
+}
+
 /// One open helper-body expansion (S11), pushed on [`Walker::helper_frames`] for the duration of
 /// the inlined walk and popped by [`Walker::end_helper_expansion`].
 #[derive(Clone, Copy)]
@@ -982,6 +1099,7 @@ struct ScopeHooks {
 /// blocks: the enclosing suite titles, the stack of hook scopes, and the tests found so far.
 struct Walker<'a> {
     source: &'a str,
+    program: &'a Program<'a>,
     semantic: &'a Semantic<'a>,
     file: &'a SourceFile,
     line_index: LineIndex<'a>,
@@ -989,6 +1107,18 @@ struct Walker<'a> {
     /// Module-scope awaited calls, file-wide like `mocked_modules`; see
     /// [`crate::model::Context::module_setup`].
     module_setup: Vec<String>,
+    /// Where each of `module_setup` starts, so a helper call can say how many came before it.
+    module_setup_starts: Vec<u32>,
+    /// Registration-time calls to imported helpers proved to register nothing, one entry per
+    /// distinct call. They are setup every test in the file inherits wherever the call sits, so
+    /// they join each test's `module_setup` once the file is walked.
+    helper_setup: Vec<String>,
+    /// How many enclosing local-helper expansions were themselves called under control flow.
+    conditional_helper_depth: usize,
+    /// Where the outermost local-helper call being expanded stands, if one is.
+    setup_site: Option<u32>,
+    /// The bindings of this file written after they are declared, computed on first use.
+    written: std::cell::OnceCell<HashSet<SymbolId>>,
     /// Module-scope ambient-state calls, file-wide like `mocked_modules`; see
     /// Set when some hoisted mocking call in this file could not be fully read (A3/A4), when the
     /// file contains a non-hoisted `vi.doMock`/`vi.doUnmock` at all, or when any mocking call
@@ -1042,12 +1172,12 @@ struct Walker<'a> {
     suite_modifiers: Vec<Modifier>,
     /// Loop variable bindings currently in scope, from innermost to outermost: the symbol a
     /// `for...of` loop over a literal array bound its element to, paired with that element's
-    /// const-folded display text for the iteration currently being walked. See
-    /// [`Walker::walk_for_of_statement`] and [`Walker::fold_expr`].
-    loop_bindings: Vec<(SymbolId, String)>,
+    /// [`BindingValue`] for the iteration currently being walked. See
+    /// [`Walker::walk_for_of_statement`] and [`Walker::fold_title_text`].
+    loop_bindings: Vec<(SymbolId, BindingValue)>,
     /// S11: parameter bindings of every helper frame currently open, innermost last: the symbol a
     /// helper's formal parameter declares, paired with the const-folded text of the argument
-    /// *this* call site passed for it. Consulted by [`Walker::fold_expr`] exactly like
+    /// *this* call site passed for it. Consulted by [`Walker::fold_title_text`] exactly like
     /// [`Walker::loop_bindings`] is, and for the same reason -- a value the extractor can prove
     /// from source resolves, everything else falls through to the ordinary unresolved path.
     ///
@@ -1056,7 +1186,7 @@ struct Walker<'a> {
     /// through the existing [`Walker::extract_title`] fallthrough rather than being rendered from
     /// a value nobody proved. Keyed by [`SymbolId`], so a shadowing binding inside the helper's
     /// own body resolves to itself, never to the parameter.
-    param_bindings: Vec<(SymbolId, String)>,
+    param_bindings: Vec<(SymbolId, BindingValue)>,
     /// Local AST/parameter frames. The shared expansion state guards cycles by canonical
     /// source path and callable span, so symbols from different parser frames cannot collide.
     helper_frames: Vec<HelperFrame<'a>>,
@@ -1093,6 +1223,13 @@ struct Walker<'a> {
 
 impl<'a> Walker<'a> {
     /// Initializes a walker from this file's own semantic frame, imports and module effects.
+    /// The bindings of this file written after they are declared; see
+    /// [`registration_free::written_bindings`].
+    fn written_bindings(&self) -> &HashSet<SymbolId> {
+        self.written
+            .get_or_init(|| registration_free::written_bindings(self.program, self.semantic))
+    }
+
     fn new(
         source: &'a str,
         file: &'a SourceFile,
@@ -1104,16 +1241,24 @@ impl<'a> Walker<'a> {
         let registry = Registry::new(program, globals);
         let (mocked_modules, mocks_unresolved) =
             collect_mocked_modules(program, &registry, semantic, source, &file.path);
-        let module_setup =
-            collect_module_setup(program, source, semantic, &import_specifiers, &exported_as);
+        let (module_setup_starts, module_setup): (Vec<u32>, Vec<String>) =
+            collect_module_setup(program, source, semantic, &import_specifiers, &exported_as)
+                .into_iter()
+                .unzip();
         Self {
             source,
+            program,
             semantic,
             file,
             line_index: LineIndex::new(source),
             mocked_modules,
             mocks_unresolved,
             module_setup,
+            module_setup_starts,
+            helper_setup: Vec::new(),
+            conditional_helper_depth: 0,
+            setup_site: None,
+            written: std::cell::OnceCell::new(),
             import_specifiers,
             exported_as,
             suite_path: Vec::new(),
@@ -1475,38 +1620,64 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Folds `expr` to a display string it can prove statically, consulting the current
-    /// `for...of` loop bindings first (an identifier bound by an enclosing unrolled loop resolves
-    /// to *this* iteration's element, by symbol identity rather than name -- the same
+    /// Folds `expr` to the title text JavaScript's `ToString` would produce, consulting the
+    /// current `for...of` loop bindings first (an identifier bound by an enclosing unrolled loop
+    /// resolves to *this* iteration's element, by symbol identity rather than name -- the same
     /// binding-identity discipline `registry.rs` uses everywhere else) before falling back to
-    /// ordinary constant folding.
-    fn fold_expr(&self, expr: &Expression) -> Option<String> {
-        if let Expression::Identifier(ident) = expr {
-            if let Some(reference_id) = ident.reference_id.get() {
-                if let Some(symbol_id) = self
-                    .semantic
-                    .scoping()
-                    .get_reference(reference_id)
-                    .symbol_id()
-                {
-                    // Innermost binding first, and both stacks are keyed by symbol identity, so
-                    // which list a binding came from cannot change the answer: a symbol appears
-                    // on at most one of them. S11's `param_bindings` is consulted on exactly the
-                    // same terms as the loop bindings above it.
-                    for (bound_symbol, value) in self
-                        .loop_bindings
-                        .iter()
-                        .rev()
-                        .chain(self.param_bindings.iter().rev())
-                    {
-                        if *bound_symbol == symbol_id {
-                            return Some(value.clone());
-                        }
-                    }
-                }
-            }
-        }
-        const_fold(expr, None)
+    /// the coercion folder.
+    ///
+    /// A title is a *string* at runtime, so a composite substitution must coerce the way
+    /// JavaScript coerces it -- `` `x ${{a: 1}}` `` is `x [object Object]` and `` `x ${[1, 2]}` ``
+    /// is `x 1,2` -- never as the canonical fold, whose `{1:a:<number:1>}`-style text is an
+    /// internal identity no runtime title spells. Routing titles through
+    /// [`render_js_to_string`] is also what refuses the coercion this cannot prove: an object
+    /// with a `toString`, a `valueOf`, a `__proto__` setter or a computed key can stringify to
+    /// anything, so it degrades to [`Title::Dynamic`] instead of guessing.
+    fn fold_title_text(&self, expr: &Expression) -> Option<String> {
+        self.bound_binding(expr)
+            .and_then(|binding| binding.title.clone())
+            .or_else(|| render_js_to_string(expr, 0, None))
+    }
+
+    /// The binding of `expr` when an unrolled loop or helper parameter binds it. Innermost
+    /// binding first, and both stacks are keyed by symbol identity, so which list a binding
+    /// came from cannot change the answer: a symbol appears on at most one of them. S11's
+    /// `param_bindings` is consulted on exactly the same terms as the loop bindings above it.
+    fn bound_binding(&self, expr: &Expression) -> Option<&BindingValue> {
+        let Expression::Identifier(ident) = expr else {
+            return None;
+        };
+        let reference_id = ident.reference_id.get()?;
+        let symbol_id = self
+            .semantic
+            .scoping()
+            .get_reference(reference_id)
+            .symbol_id()?;
+        self.loop_bindings
+            .iter()
+            .rev()
+            .chain(self.param_bindings.iter().rev())
+            .find(|(bound_symbol, _)| *bound_symbol == symbol_id)
+            .map(|(_, value)| value)
+    }
+
+    /// Whether `expr` folds to a statically known VALUE at all (the canonical fold, not title
+    /// text): the imported-runner argument check needs value knowability, and a composite with
+    /// an interceptable coercion is a known value whose *title* text is not.
+    fn folds_to_known_value(&self, expr: &Expression) -> Option<String> {
+        self.bound_binding(expr)
+            .map(|binding| binding.canonical.clone())
+            .or_else(|| const_fold(expr, None))
+    }
+
+    /// One parameter binding's two texts, resolving through any enclosing binding first: a
+    /// helper call's argument may itself be a loop variable (`for (const a of [1, 2])
+    /// declare(a)`), whose value only the loop's own binding stack knows.
+    fn binding_value_of(&self, expr: &Expression) -> Option<BindingValue> {
+        Some(BindingValue {
+            canonical: self.folds_to_known_value(expr)?,
+            title: self.fold_title_text(expr),
+        })
     }
 
     /// Binds a local symbol introduced outside a plain `import` statement: either an
@@ -1611,7 +1782,13 @@ impl<'a> Walker<'a> {
             &self.file.path,
             None,
         );
-        let class_unresolved = body.class_unresolved;
+        // Both flags say "this body's views are not safe to compare": `class_unresolved` for a
+        // class dependency the serializer could not prove, `behavior_truncated` for a behavior
+        // trace the depth cap cut short. The scope's own context text is alpha and stays
+        // raw-fallback sound, but the hook's digest -- behavior included -- is what
+        // `redundant-hook` and the behavior-keyed claims consume, so an incomplete trace fails
+        // closed here exactly as a test body's does.
+        let body_unresolved = body.class_unresolved || body.behavior_truncated;
         let hook = Hook {
             kind,
             location: self.location(call.span),
@@ -1625,7 +1802,7 @@ impl<'a> Walker<'a> {
             .hook_scopes
             .last_mut()
             .expect("root hook scope always present");
-        scope.unresolved |= class_unresolved;
+        scope.unresolved |= body_unresolved;
         match kind {
             HookKind::BeforeAll => scope.before_all.push(hook),
             HookKind::BeforeEach => scope.before_each.push(hook),
@@ -2039,9 +2216,21 @@ impl<'a> Walker<'a> {
         let Some(frame) = self.begin_helper_expansion(call) else {
             return;
         };
+        // A setup call inside this body runs as often as the body does, and where the outermost
+        // helper call stands.
+        let conditional = self.setup_is_conditional(call);
+        self.conditional_helper_depth += usize::from(conditional);
+        let outermost = self.setup_site.is_none();
+        if outermost {
+            self.setup_site = Some(call.span.start);
+        }
         if let Some(body) = &frame.function.body {
             walk(self, &body.statements, registry);
         }
+        if outermost {
+            self.setup_site = None;
+        }
+        self.conditional_helper_depth -= usize::from(conditional);
         self.end_helper_expansion(frame);
     }
 
@@ -2174,7 +2363,7 @@ impl<'a> Walker<'a> {
     }
 
     /// Binds each of `function`'s formal parameters to the const-folded text of the argument this
-    /// call site passed for it, for [`Walker::fold_expr`].
+    /// call site passed for it, for [`Walker::fold_title_text`].
     ///
     /// Positional, and therefore refused wholesale the moment the positions stop being knowable:
     /// a spread argument (`run(...args)`) makes every position after it unknown, and this declines
@@ -2195,7 +2384,7 @@ impl<'a> Walker<'a> {
         &self,
         parameters: &FormalParameters<'_>,
         call: &CallExpression<'_>,
-    ) -> Vec<(SymbolId, String)> {
+    ) -> Vec<(SymbolId, BindingValue)> {
         if call
             .arguments
             .iter()
@@ -2215,7 +2404,7 @@ impl<'a> Walker<'a> {
                 .arguments
                 .get(index)
                 .and_then(Argument::as_expression)
-                .and_then(|argument| self.fold_expr(argument))
+                .and_then(|argument| self.binding_value_of(argument))
             else {
                 continue;
             };
@@ -2307,13 +2496,19 @@ impl<'a> Walker<'a> {
         //   arrow/function expression, or a `describe` callback that is neither a block nor a
         //   concise-arrow expression). The body is opaque, not absent -- unlike a genuine
         //   `.todo`/bodyless declaration, where `body_arg` is `None` and this stays `false`.
+        // - `behavior_truncated`: the behavior collector's depth cap dropped part of this
+        //   body, so its trace compares equal to a different body's equally-truncated trace. The
+        //   equality is an artifact of the cap, not a similarity claim, and every behavior-keyed
+        //   rule (`near-duplicate-test`, `subsumed-test`) would otherwise read it as one.
         let opaque_body = body_arg.is_some() && !has_body;
         let is_unresolved_title = title_is_unresolved(&title);
         // Defect 3 / F5: nested inside a `describe` whose own title is dynamic or parameterized,
         // this case's identity is exactly as unknown as that suite's, even when its own title and
         // everything else about it is fully static -- see the doc on
         // `Walker::unresolved_suite_depth`.
-        let unresolved = body_fingerprint.as_ref().is_some_and(|body| body.class_unresolved)
+        let unresolved = body_fingerprint
+            .as_ref()
+            .is_some_and(|body| body.class_unresolved || body.behavior_truncated)
             || fixtures_unresolved
             || self.mocks_unresolved
             || is_unresolved_title
@@ -2462,7 +2657,7 @@ fn as_function_like<'a, 'b>(arg: &'b Argument<'a>) -> Option<FunctionLike<'a, 'b
 /// assignment target, a non-array iterable (an identifier, a call, a spread inside the array, an
 /// element that does not itself const-fold, ...). [`Walker::walk_for_of_statement`] falls back to
 /// walking the loop body once, unrolled, in every one of those cases.
-fn literal_for_of_elements(for_of: &ForOfStatement) -> Option<(SymbolId, Vec<String>)> {
+fn literal_for_of_elements(for_of: &ForOfStatement) -> Option<(SymbolId, Vec<BindingValue>)> {
     let ForStatementLeft::VariableDeclaration(declaration) = &for_of.left else {
         return None;
     };
@@ -2482,7 +2677,19 @@ fn literal_for_of_elements(for_of: &ForOfStatement) -> Option<(SymbolId, Vec<Str
             ArrayExpressionElement::SpreadElement(_) | ArrayExpressionElement::Elision(_) => {
                 return None;
             }
-            _ => values.push(const_fold(element.as_expression()?, None)?),
+            // A binding needs the element's VALUE to fold -- that is what makes the loop
+            // enumerable at all, and it holds for a composite whose coercion is interceptable,
+            // whose title text nobody can spell. The title half is the coercion, so a loop over
+            // `[{ a: 1 }]` interpolates `[object Object]` into a template title exactly as the
+            // runtime would, while `[{ toString: 1 }]` still unrolls with a dynamic title.
+            // Literal elements only: a nested loop's element identifiers were never
+            // resolvable here (the free fold has no binding stacks), and stay that way.
+            _ => {
+                let element = element.as_expression()?;
+                let canonical = const_fold(element, None)?;
+                let title = render_js_to_string(element, 0, None);
+                values.push(BindingValue { canonical, title });
+            }
         }
     }
     if values.is_empty() {
@@ -2740,7 +2947,7 @@ fn raw_title_pattern(title_arg: Option<&Argument>, source: &str) -> TitlePattern
 
 impl<'a> Walker<'a> {
     /// Extracts a declaration's title, consulting the current `for...of` loop bindings (via
-    /// [`Walker::fold_expr`]) so a title built from an unrolled loop's own variable renders the
+    /// [`Walker::fold_title_text`]) so a title built from an unrolled loop's own variable renders the
     /// value for *this* iteration rather than degrading to [`Title::Dynamic`].
     fn extract_title(&self, title_arg: Option<&Argument>) -> Title {
         match title_arg {
@@ -2762,7 +2969,7 @@ impl<'a> Walker<'a> {
             }
             Some(argument) => {
                 let expr = argument.as_expression();
-                if let Some(value) = expr.and_then(|expr| self.fold_expr(expr)) {
+                if let Some(value) = expr.and_then(|expr| self.fold_title_text(expr)) {
                     return Title::Static(value);
                 }
                 let text = expr
@@ -2775,7 +2982,7 @@ impl<'a> Walker<'a> {
     }
 
     /// Renders a template-literal title when every substitution folds to a known value (via
-    /// [`Walker::fold_expr`], which resolves an unrolled loop's own variable to this iteration's
+    /// [`Walker::fold_title_text`], which resolves an unrolled loop's own variable to this iteration's
     /// element before falling back to ordinary constant folding), else normalizes every
     /// substitution to a placeholder (hazard 6: never claim a runtime value the extractor cannot
     /// prove from source, and never mix "some substitutions folded, some didn't" into one shape).
@@ -2783,7 +2990,7 @@ impl<'a> Walker<'a> {
         let folded: Vec<Option<String>> = template
             .expressions
             .iter()
-            .map(|expr| self.fold_expr(expr))
+            .map(|expr| self.fold_title_text(expr))
             .collect();
         if folded.iter().all(Option::is_some) {
             let mut rendered = String::new();
@@ -6607,10 +6814,10 @@ mod tests {
             "a non-literal title argument still folds when it can"
         );
         // C12's real shape, missed by the first disproof: the DIRECT title path
-        // (`extract_title` -> `fold_expr`) forwards `format_number`'s text verbatim, so a
-        // non-finite fold titled as `inf` where JavaScript's `String(1/0)` is `Infinity`.
-        // Measured against the binary; pinned here because the `.each` guard tests cannot
-        // catch this path -- their values are reparsed before display.
+        // (`extract_title` -> `fold_title_text`) forwards the ECMAScript number spelling
+        // verbatim, where a non-finite fold once titled as `inf` and JavaScript's `String(1/0)`
+        // is `Infinity`. Measured against the binary; pinned here because the `.each` guard
+        // tests cannot catch this path -- their values are reparsed before display.
         assert_eq!(
             titles_of("test(1 / 0, () => {});"),
             vec![Title::Static("Infinity".to_owned())],
@@ -8305,3 +8512,7 @@ mod imported_tests;
 #[cfg(test)]
 #[path = "extract/tests/budget.rs"]
 mod budget_tests;
+
+#[cfg(test)]
+#[path = "extract/tests/registration_free.rs"]
+mod registration_free_tests;

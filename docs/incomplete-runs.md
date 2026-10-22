@@ -42,10 +42,10 @@ a `fix` and `unresolvedImports`, and the terminal and HTML banners print it as a
 | --- | --- | --- |
 | `tsconfig-extends` | A tsconfig's `extends` target does not exist. Nothing under that tsconfig then resolves, relative imports included. | `nuxt prepare` for a path under `.nuxt` in a project with a `nuxt.config.*` or a `nuxt` dependency; the install command for a package target; otherwise `generate or restore this file`. |
 | `tsconfig-unreadable` | The target exists but is not valid JSON. An empty file or one holding only comments loads as an empty config and is not reported; neither is a root tsconfig that cannot be read at all, which the resolver skips. | `generate or restore this file`. |
-| `node-modules` | `package.json` lists dependencies, `node_modules` is missing or empty here and in every parent directory, and an import of a package could not be resolved. `vitest`, `node:` and Node core module imports do not count, nor do imports spelled as something other than a package (relative and absolute paths, `#` imports, `~/` and `@/` aliases, URLs, drive paths). An alias written like a package (`@app/missing`) cannot be told apart by its spelling and does count. | `pnpm install`, `bun install`, `yarn install` or `npm ci` for the nearest `pnpm-lock.yaml`, `bun.lock`/`bun.lockb`, `yarn.lock` or `package-lock.json`; otherwise `install the dependencies`. |
+| `node-modules` | A project's `package.json` lists dependencies, and an import of a package from a file in that project could not be resolved, where `node_modules` is missing or empty in that file's directory and in every parent directory. One entry per such project directory, with its own `path` (relative to the analyzed root, such as `packages/web/node_modules`), count and install command. `vitest`, `node:` and Node core module imports do not count, nor do imports spelled as something other than a package (relative and absolute paths, `#` imports, `~/` and `@/` aliases, URLs, drive paths). An alias written like a package (`@app/missing`) cannot be told apart by its spelling and does count. | `pnpm install`, `bun install`, `yarn install` or `npm ci` for the nearest `pnpm-lock.yaml`, `bun.lock`/`bun.lockb`, `yarn.lock` or `package-lock.json`; otherwise `install the dependencies`. |
 
 `unresolvedImports` counts the import resolutions that failed for that reason, once per analyzed
-file and specifier. The `package.json` consulted is the nearest one at or above the analyzed directory. A project that never needed the file is not told about it: no `extends`, no
+file and specifier. A file's project is the nearest `package.json` at or above it that lists dependencies, so a workspace member that lists none is judged by the manifest above it. A project that never needed the file is not told about it: no `extends`, no
 listed dependencies, or only relative imports produce nothing. Only resolution failures are
 reported, so a tsconfig that is merely unusual is silent.
 
@@ -94,8 +94,8 @@ alone. Past the cap the files with the fewest excluded tests are left out of the
 
 | Code | Meaning |
 | --- | --- |
-| `helper-export-unreadable` | An imported runner's export could not be resolved, read, or proved to be one function. |
-| `helper-setup-effects` | An imported runner or a module on its chain has setup, fixture or module effects that were not proved inert. |
+| `helper-export-unreadable` | An imported runner's export could not be resolved, read, or proved to be one function, and the call could not be proved to register nothing. |
+| `helper-setup-effects` | An imported runner or a module on its chain has setup, fixture or module effects that were not proved inert, and the call could not be proved to register nothing. |
 | `helper-effects-unproved` | A call, argument or parameter write inside an imported runner has unproved effects. |
 | `helper-limit` | A helper expansion budget, recursion or depth limit was reached. |
 | `helper-sources-unavailable` | Helper bodies are unavailable in a historical revision baseline. |
@@ -103,7 +103,7 @@ alone. Past the cap the files with the fewest excluded tests are left out of the
 | `unsupported-expression` | A title, callback, option or registration expression is outside the supported shapes. |
 | `mock-factory-unreadable` | A `vi.mock` factory could not be read. |
 | `fixture-unreadable` | A `test.extend` fixture value could not be read. |
-| `unresolved-context` | Another ambient fact of a test could not be resolved: a dynamic title, an unreadable `.each` table or nested config. |
+| `unresolved-context` | Another ambient fact of a test could not be resolved: a dynamic title, an unreadable `.each` table or nested config, or a body deeper than the analyzer's recursion cap (whose behavior trace was cut short and must not be compared). |
 | `unsupported-statement` | A statement form the walker does not enter, such as `with`, may hide declarations. |
 | `parse-error` | The parser reported errors. |
 | `unsupported-source` | The source type is unsupported. |

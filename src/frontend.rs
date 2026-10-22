@@ -4,9 +4,11 @@
 //! makes the pre-1.0 oxc pin survivable: a breaking release is a rewrite of this subtree, not of
 //! the analyzer.
 
+mod auto_imports;
 mod extract;
 mod fingerprint;
 mod helpers;
+mod package_manifests;
 mod registry;
 mod resolver;
 
@@ -52,6 +54,10 @@ pub struct FileExtraction {
 ///
 /// Never panics on malformed input: a file that fails to parse yields an empty extraction with
 /// `incomplete` set, matching the product rule that operational degradation stays visible.
+///
+/// What it reads of installed packages is remembered for the process until
+/// [`take_resolution_gaps`] is called; a caller that extracts the same project twice, with files
+/// changed in between, calls it between the runs.
 pub fn extract(source: &str, file: &SourceFile, globals: Globals) -> FileExtraction {
     extract::extract(source, file, globals)
 }
