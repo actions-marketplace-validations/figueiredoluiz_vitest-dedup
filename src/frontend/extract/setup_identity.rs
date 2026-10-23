@@ -40,6 +40,7 @@ impl<'a> Visit<'a> for Closure<'_, 'a> {
         self.add(format!("import.meta:{}", self.file.display()));
     }
 
+    /// Adds what a name the call reads stands for: its declaration's text, or its import.
     fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
         if self.failed {
             return;
@@ -70,7 +71,9 @@ impl<'a> Visit<'a> for Closure<'_, 'a> {
             ));
             return;
         }
-        let declaration = self.semantic.scoping().symbol_declaration(symbol);
+        // The declaration that runs, as the proof read it: an overload set's implementation.
+        let declaration = super::registration_free::runtime_declaration(self.semantic, symbol)
+            .unwrap_or(self.semantic.scoping().symbol_declaration(symbol));
         let node = self.semantic.nodes().get_node(declaration);
         let span = node.kind().span();
         let inside = |outer: &Span| span.start >= outer.start && span.end <= outer.end;

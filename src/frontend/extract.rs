@@ -2178,11 +2178,7 @@ impl<'a> Walker<'a> {
     /// inheriting caller registration context and the same depth/budget. Installed package
     /// bodies remain refused: the original package-runner motivating shape belongs to C11.
     fn walk_helper_call(&mut self, call: &CallExpression<'a>, registry: &mut Registry) {
-        if self.resolve_local_helper(&call.callee).is_some() {
-            self.with_helper_body(call, registry, Self::walk_statement_list);
-        } else {
-            self.imported_helper_call(call, false);
-        }
+        self.helper_call(call, registry, Self::walk_statement_list, false);
     }
 
     /// [`Self::walk_helper_call`]'s pre-scan counterpart: registers the hooks and bindings an
@@ -2195,10 +2191,25 @@ impl<'a> Walker<'a> {
     /// "a hook applies to every test in its scope regardless of textual order" rule intact for a
     /// helper called after the tests it affects.
     fn prepare_helper_call(&mut self, call: &CallExpression<'a>, registry: &mut Registry) {
+        self.helper_call(call, registry, Self::prepare_statements, true);
+    }
+
+    /// Both helper passes: refuse a redeclared local helper, inline one this file declares with
+    /// `walk`, and hand anything else to the imported-helper path.
+    fn helper_call(
+        &mut self,
+        call: &CallExpression<'a>,
+        registry: &mut Registry,
+        walk: fn(&mut Self, &[Statement<'a>], &mut Registry),
+        prepare: bool,
+    ) {
+        if self.refuse_redeclared_helper(&call.callee) {
+            return;
+        }
         if self.resolve_local_helper(&call.callee).is_some() {
-            self.with_helper_body(call, registry, Self::prepare_statements);
+            self.with_helper_body(call, registry, walk);
         } else {
-            self.imported_helper_call(call, true);
+            self.imported_helper_call(call, prepare);
         }
     }
 
@@ -2331,6 +2342,43 @@ impl<'a> Walker<'a> {
         self.diagnostics.push(sentence);
     }
 
+    /// Refuses a call to a local `function` declared more than once at runtime, or an overload set
+    /// the file reassigns: which body runs cannot be told from a declaration, and skipping it would
+    /// drop its tests silently.
+    fn refuse_redeclared_helper(&mut self, expr: &Expression) -> bool {
+        let Expression::Identifier(ident) = expr else {
+            return false;
+        };
+        let semantic: &'a Semantic<'a> = self.semantic;
+        let Some(symbol) = ident
+            .reference_id
+            .get()
+            .and_then(|reference| semantic.scoping().get_reference(reference).symbol_id())
+        else {
+            return false;
+        };
+        let scoping = semantic.scoping();
+        let declares_function = scoping
+            .symbol_declarations(symbol)
+            .any(|node| matches!(semantic.nodes().kind(node), AstKind::Function(_)));
+        if !declares_function {
+            return false;
+        }
+        // An overload set resolves to its implementation only while nothing reassigns the name:
+        // after `register = () => ...` the implementation is not what the call runs.
+        let text = if registration_free::redeclared_at_runtime(semantic, symbol) {
+            "the called helper is declared more than once"
+        } else if !scoping.symbol_redeclarations(symbol).is_empty()
+            && scoping.symbol_is_mutated(symbol)
+        {
+            "the called helper is reassigned"
+        } else {
+            return false;
+        };
+        self.refuse_helper_expansion(refusal(ExclusionReason::HelperExportUnreadable, text));
+        true
+    }
+
     /// The callee of `expr`, when it names a `function` declaration in *this* file.
     ///
     /// Deliberately narrow, and every restriction is load-bearing:
@@ -2353,7 +2401,9 @@ impl<'a> Walker<'a> {
         let semantic: &'a Semantic<'a> = self.semantic;
         let reference_id = ident.reference_id.get()?;
         let symbol = semantic.scoping().get_reference(reference_id).symbol_id()?;
-        let AstKind::Function(function) = semantic.symbol_declaration(symbol).kind() else {
+        // The declaration that runs: an overload set's implementation, none when redeclared.
+        let node = registration_free::runtime_declaration(semantic, symbol)?;
+        let AstKind::Function(function) = semantic.nodes().kind(node) else {
             return None;
         };
         if function.r#type != FunctionType::FunctionDeclaration || function.body.is_none() {

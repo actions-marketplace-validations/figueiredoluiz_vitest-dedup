@@ -105,7 +105,12 @@ what the code reads:
 - The arguments of the call are held to the same rule, and a binding they read must not be written
   after it is declared: a callback reassigned, or a config changed through a member (`config.mode =
   2`, `items[0]++`, `delete config.mode`), is refused. Calls that change a value through a method
-  (`items.push(1)`) are not tracked.
+  (`items.push(1)`) are not tracked. A name is read from the one declaration that runs: an overload
+  set from its implementation (a local overload set the file reassigns is refused), a function or class merged with a `namespace` together with the
+  namespace's members (also through an alias or a default export). An `interface`, a type alias,
+  overload signatures, `declare` declarations and namespaces of types only are erased. A name with
+  two declarations that run (`var run = a; var run = b`) is refused, as is an imported runner
+  declared twice.
 - Installed packages are judged by their manifests: one whose whole dependency closure names no
   test runner (`vitest`, `vitest-*`, `@vitest/*`, `jest`, `@jest/*`, `mocha`, `jasmine`,
   `playwright`, `playwright-core`, `@playwright/*`), and whose imported file and the scripts it loads

@@ -2004,6 +2004,219 @@ fn a_nuxt_mock_factory_that_registers_leaves_the_file_unresolved() {
     assert!(extraction.tests.iter().all(|case| case.context.unresolved));
 }
 
+/// A redeclared binding is refused: only its first declaration would be read, and a later one can
+/// register a test. Declarations that are erased (an interface, overload signatures) do not count.
+#[test]
+fn a_redeclared_binding_is_not_read_from_its_first_declaration() {
+    let run = |body: &str| {
+        let caller = format!(
+            "import {{ test, expect }} from 'vitest'; import {{ mockNuxtImport }} from '@nuxt/test-utils/runtime'; {body} {TWO_TESTS}"
+        );
+        let extraction = with_helpers(&[], &caller);
+        assert_eq!(extraction.tests.len(), 2, "{body}");
+        extraction.tests.iter().all(|case| !case.context.unresolved)
+    };
+    assert!(!run(
+        "var run = () => {}; var run = () => test('hidden', () => {}); mockNuxtImport('useRun', () => () => run);"
+    ));
+    assert!(run(
+        "var run = () => {}; mockNuxtImport('useRun', () => () => run);"
+    ));
+    assert!(run(
+        "const run = () => {}; interface run { value: number } mockNuxtImport('useRun', () => () => run);"
+    ));
+    assert!(run(
+        "function run(): void; function run(value?: number): void; function run() {} mockNuxtImport('useRun', () => () => run);"
+    ));
+    // The implementation behind the signatures is the one read, and a types-only namespace adds
+    // nothing at runtime.
+    assert!(!run(
+        "function run(): void; function run() { test('hidden', () => {}) } mockNuxtImport('useRun', () => () => run);"
+    ));
+    assert!(run(
+        "function run() {} namespace run { export interface Options { value: number } } mockNuxtImport('useRun', () => () => run);"
+    ));
+    assert!(!run(
+        "function run() {} namespace run { export const hidden = test('hidden', () => {}) } mockNuxtImport('useRun', () => () => run);"
+    ));
+}
+
+/// An installed helper's export read by name is refused when the name is declared twice at
+/// runtime, and a namespace's members are read when the whole module is.
+#[test]
+fn merged_and_namespaced_exports_are_read_whole() {
+    let caller = |import: &str, call: &str| {
+        format!(
+            "import {{ test, expect }} from 'vitest'; {import} import {{ invoke }} from './invoke'; invoke({call}); {TWO_TESTS}"
+        )
+    };
+    let invoke = (
+        "invoke.ts",
+        "export function invoke(fn: () => void) { fn() }",
+    );
+    let merged = Site::new(&[
+        invoke,
+        (
+            "helper.ts",
+            "import { beforeEach } from 'vitest'; export function Run() {} export namespace Run { export function install() { beforeEach(() => {}) } }",
+        ),
+    ]);
+    assert!(
+        merged
+            .extract(&caller("import { Run } from './helper';", "Run.install"))
+            .incomplete
+    );
+    let plain = Site::new(&[
+        invoke,
+        (
+            "helper.ts",
+            "export function Run() {} export function install() {}",
+        ),
+    ]);
+    assert!(
+        !plain
+            .extract(&caller("import { Run } from './helper';", "Run"))
+            .incomplete
+    );
+    let namespaced = Site::new(&[
+        invoke,
+        (
+            "helper.ts",
+            "import { beforeEach } from 'vitest'; export namespace N { export function install() { beforeEach(() => {}) } }",
+        ),
+    ]);
+    assert!(
+        namespaced
+            .extract(&caller("import { N } from './helper';", "N.install"))
+            .incomplete
+    );
+    // Reached through an alias or a default export, the merged namespace is read all the same.
+    for (export, import) in [
+        (
+            "export { Run as Alias };",
+            "import { Alias as Run } from './helper';",
+        ),
+        ("export default Run;", "import Run from './helper';"),
+    ] {
+        let helper = format!("import {{ beforeEach }} from 'vitest'; function Run() {{}} namespace Run {{ export function install() {{ beforeEach(() => {{}}) }} }} {export}");
+        let site = Site::new(&[invoke, ("helper.ts", helper.as_str())]);
+        assert!(
+            site.extract(&caller(import, "Run.install")).incomplete,
+            "{export}"
+        );
+    }
+}
+
+/// The imported-runner fallback and local helper inlining read the declaration that runs, not
+/// the first one.
+#[test]
+fn helper_fallbacks_do_not_read_a_redeclared_binding() {
+    let site = Site::new(&[(
+        "runner.ts",
+        "import { beforeEach } from 'vitest'; export let count = 0; export function setup() { var run = () => {}; var run = () => beforeEach(() => { count++ }); run() }",
+    )]);
+    let caller = format!(
+        "import {{ test, expect }} from 'vitest'; import {{ setup }} from './runner'; setup(); {TWO_TESTS}"
+    );
+    let extraction = site.extract(&caller);
+    assert!(extraction.incomplete);
+    assert!(extraction.tests.iter().all(|case| case.context.unresolved));
+    // The second `declare` is the one that runs; inlining the first would invent `first`.
+    let local = "import { test, expect } from 'vitest'; function declare() { test('first', () => { expect(1).toBe(1) }) } function declare() { test('second', () => { expect(1).toBe(1) }) } declare(); test('a', () => { expect(1).toBe(1) });";
+    let titles: Vec<String> = with_helpers(&[], local)
+        .tests
+        .iter()
+        .map(|case| format!("{:?}", case.title))
+        .collect();
+    assert!(
+        !titles.iter().any(|title| title.contains("first")),
+        "{titles:?}"
+    );
+    // An imported runner declared twice is refused rather than expanded from its first body.
+    let site = Site::new(&[(
+        "runner.ts",
+        "import { test } from 'vitest'; function register() { test('first', () => {}) } function register() { test('second', () => {}) } export { register };",
+    )]);
+    let extraction = site.extract(
+        "import { test, expect } from 'vitest'; import { register } from './runner'; register(); test('a', () => { expect(1).toBe(1) });",
+    );
+    let titles: Vec<String> = extraction
+        .tests
+        .iter()
+        .map(|case| format!("{:?}", case.title))
+        .collect();
+    assert!(
+        !titles.iter().any(|title| title.contains("first")),
+        "{titles:?}"
+    );
+    assert!(extraction.incomplete, "{titles:?}");
+    // The same with an empty first body, which would otherwise read as an inert runner.
+    let site = Site::new(&[(
+        "runner.ts",
+        "import { test } from 'vitest'; function register() {} function register() { test('second', () => {}) } export { register };",
+    )]);
+    assert!(
+        site.extract(
+            "import { test, expect } from 'vitest'; import { register } from './runner'; register(); test('a', () => { expect(1).toBe(1) });",
+        )
+        .incomplete
+    );
+    // An overload set resolves to its implementation, unless the file reassigns the name.
+    let overloads = "import { test, expect } from 'vitest'; function register(): void; function register() { test('old body', () => { expect(1).toBe(1) }) } REASSIGN register(); test('independent', () => { expect(1).toBe(1) });";
+    let extraction = with_helpers(&[], &overloads.replace("REASSIGN", ""));
+    assert!(!extraction.incomplete, "{:?}", extraction.diagnostics);
+    assert_eq!(extraction.tests.len(), 2);
+    let extraction = with_helpers(
+        &[],
+        &overloads.replace(
+            "REASSIGN",
+            "register = () => { test('replacement', () => { expect(2).toBe(2) }) };",
+        ),
+    );
+    assert!(extraction.incomplete);
+    assert!(extraction
+        .tests
+        .iter()
+        .all(|case| !format!("{:?}", case.title).contains("old body")));
+    // Ambient overloads alone declare nothing that runs, so the call is not a redeclared helper.
+    let ambient = "import { test, expect } from 'vitest'; declare function setup(): void; declare function setup(x: number): void; setup(); test('a', () => { expect(1).toBe(1) });";
+    let extraction = with_helpers(&[], ambient);
+    assert!(!extraction.incomplete, "{:?}", extraction.diagnostics);
+    // A local helper declared twice is refused, not skipped: its hook would vanish unseen.
+    let local = "import { test, expect, beforeEach } from 'vitest'; let count = 0; function install() {} function install() { beforeEach(() => { count++ }) } install(); test('a', () => { expect(count).toBe(1) }); test('b', () => { expect(count).toBe(1) });";
+    let extraction = with_helpers(&[], local);
+    assert!(extraction.incomplete);
+    assert!(extraction.tests.iter().all(|case| case.context.unresolved));
+}
+
+/// A namespace the proof reaches by name is read whole, and setup identity reads the declaration
+/// the proof read.
+#[test]
+fn namespaces_enums_and_overloads_are_read_as_they_run() {
+    let caller = "import { test, expect } from 'vitest'; import { setup } from './helper'; setup(); test('a', () => { expect(1).toBe(1) }); test('b', () => { expect(1).toBe(1) });";
+    for helper in [
+        "import { beforeEach } from 'vitest'; namespace N { export function install() { beforeEach(() => {}) } } export function setup() { N.install() }",
+        "import { beforeEach } from 'vitest'; enum E { A = (beforeEach(() => {}), 1) } export function setup() { return E.A }",
+    ] {
+        assert!(Site::new(&[("helper.ts", helper)]).extract(caller).incomplete, "{helper}");
+    }
+    let inert = "namespace N { export function install() { return 1 } } export function setup() { N.install() }";
+    assert!(
+        !Site::new(&[("helper.ts", inert)])
+            .extract(caller)
+            .incomplete
+    );
+    let setup_of = |value: u32| {
+        let caller = format!(
+            "import {{ test, expect }} from 'vitest'; import {{ registerEndpoint }} from '@nuxt/test-utils/runtime'; function handler(): number; function handler() {{ return {value} }} registerEndpoint('/value', handler); test('a', () => {{ expect(1).toBe(1) }});"
+        );
+        let extraction = with_helpers(&[], &caller);
+        assert!(!extraction.incomplete, "{:?}", extraction.diagnostics);
+        extraction.tests[0].context.module_setup.clone()
+    };
+    assert_ne!(setup_of(1), setup_of(2));
+}
+
 /// An imported object changed through a member is not the export the proof read.
 #[test]
 fn an_imported_binding_written_by_the_caller_is_not_placed() {

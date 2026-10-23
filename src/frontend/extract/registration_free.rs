@@ -585,6 +585,90 @@ enum Pending<'a> {
     Enum(&'a TSEnumDeclaration<'a>),
 }
 
+/// The one declaration of `symbol` that runs, or `None` when several do: a later declaration
+/// replaces or extends what the first one says (`var x = a; var x = b`, `function Run` merged with
+/// a `namespace Run` that holds values). Interfaces, type aliases, overload signatures, `declare`
+/// declarations and namespaces of types only are erased, so `const Foo` beside `interface Foo`
+/// resolves to the `const`, and an overload set to its implementation. A name with no declaration
+/// that runs (only `declare` overloads) resolves to its first declaration, as an ambient one does.
+pub(in crate::frontend::extract) fn runtime_declaration(
+    semantic: &Semantic<'_>,
+    symbol: SymbolId,
+) -> Option<oxc_semantic::NodeId> {
+    let scoping = semantic.scoping();
+    if scoping.symbol_redeclarations(symbol).is_empty() {
+        return Some(scoping.symbol_declaration(symbol));
+    }
+    let nodes = semantic.nodes();
+    let runs = |node: oxc_semantic::NodeId| match nodes.kind(node) {
+        AstKind::TSInterfaceDeclaration(_) | AstKind::TSTypeAliasDeclaration(_) => false,
+        AstKind::Function(function) => function.body.is_some() && !function.declare,
+        AstKind::Class(class) => !class.declare,
+        AstKind::TSEnumDeclaration(declaration) => !declaration.declare && !declaration.r#const,
+        AstKind::TSNamespaceDeclaration(declaration) => {
+            !declaration.declare && namespace_holds_values(declaration)
+        }
+        AstKind::VariableDeclarator(_) => !matches!(
+            nodes.parent_kind(node),
+            AstKind::VariableDeclaration(declaration) if declaration.declare
+        ),
+        _ => true,
+    };
+    let mut running = scoping
+        .symbol_declarations(symbol)
+        .filter(|node| runs(*node));
+    let Some(first) = running.next() else {
+        return Some(scoping.symbol_declaration(symbol));
+    };
+    running.next().is_none().then_some(first)
+}
+
+/// Whether `symbol` has more than one declaration that runs (see [`runtime_declaration`]).
+pub(in crate::frontend::extract) fn redeclared_at_runtime(
+    semantic: &Semantic<'_>,
+    symbol: SymbolId,
+) -> bool {
+    runtime_declaration(semantic, symbol).is_none()
+}
+
+/// Whether a namespace emits code: anything in it but interfaces, type aliases, `declare`
+/// statements and namespaces of types only.
+fn namespace_holds_values(namespace: &TSNamespaceDeclaration<'_>) -> bool {
+    let mut body = &namespace.body;
+    let block = loop {
+        match body {
+            TSNamespaceDeclarationBody::TSNamespaceDeclaration(inner) => body = &inner.body,
+            TSNamespaceDeclarationBody::TSModuleBlock(block) => break block,
+        }
+    };
+    block.body.iter().any(|statement| {
+        let declaration = match statement {
+            Statement::ExportDeclaration(export) => &export.declaration,
+            other => match other.as_declaration() {
+                Some(declaration) => declaration,
+                None => return true,
+            },
+        };
+        match declaration {
+            Declaration::TSInterfaceDeclaration(_) | Declaration::TSTypeAliasDeclaration(_) => {
+                false
+            }
+            Declaration::TSNamespaceDeclaration(inner) => {
+                !inner.declare && namespace_holds_values(inner)
+            }
+            Declaration::VariableDeclaration(variables) => !variables.declare,
+            Declaration::FunctionDeclaration(function) => {
+                !function.declare && function.body.is_some()
+            }
+            Declaration::ClassDeclaration(class) => !class.declare,
+            Declaration::TSEnumDeclaration(declaration) => {
+                !declaration.declare && !declaration.r#const
+            }
+            _ => true,
+        }
+    })
+}
+
 /// The declaration a top-level statement introduces, exported or not.
 enum Declared<'a> {
     Function(&'a Function<'a>),
@@ -960,8 +1044,8 @@ impl<'s, 'a> Scanner<'s, 'a> {
         let mut found = false;
         let mut stars = false;
         for statement in &program.body {
-            if let Some(declared) = declared_by(statement) {
-                found |= self.queue_declared(declared, Some(name));
+            if let Some(queued) = self.queue_named(statement, name) {
+                found |= queued;
                 continue;
             }
             match statement {
@@ -1072,8 +1156,8 @@ impl<'s, 'a> Scanner<'s, 'a> {
     fn seed_local(&mut self, program: &'a Program<'a>, name: &str) {
         let mut found = false;
         for statement in &program.body {
-            if let Some(declared) = declared_by(statement) {
-                found |= self.queue_declared(declared, Some(name));
+            if let Some(queued) = self.queue_named(statement, name) {
+                found |= queued;
                 continue;
             }
             let Statement::ImportDeclaration(import) = statement else {
@@ -1099,12 +1183,72 @@ impl<'s, 'a> Scanner<'s, 'a> {
 
     /// Queues every declaration, when nothing narrower can be named.
     fn seed_everything(&mut self, program: &'a Program<'a>) {
+        self.seed_declarations(&program.body);
         for statement in &program.body {
-            if let Some(declared) = declared_by(statement) {
-                self.queue_declared(declared, None);
-            } else if let Statement::ExportDefaultDeclaration(export) = statement {
+            if let Statement::ExportDefaultDeclaration(export) = statement {
                 self.queue_default(program, &export.declaration);
             }
+        }
+    }
+
+    /// Queues what `statement` declares under `name`, a merged namespace's members included:
+    /// `Some(whether anything was queued)` when it is a declaration, `None` otherwise.
+    fn queue_named(&mut self, statement: &'a Statement<'a>, name: &str) -> Option<bool> {
+        if self.seed_namespace_named(statement, name) {
+            return Some(true);
+        }
+        declared_by(statement).map(|declared| self.queue_declared(declared, Some(name)))
+    }
+
+    /// Queues the members of `statement` when it is a namespace called `name`, which merges into
+    /// any function, class or enum of that name. Whether it was one.
+    fn seed_namespace_named(&mut self, statement: &'a Statement<'a>, name: &str) -> bool {
+        let namespace = match statement {
+            Statement::TSNamespaceDeclaration(namespace) => namespace,
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::TSNamespaceDeclaration(namespace) => namespace,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if namespace.id.name.as_str() != name {
+            return false;
+        }
+        self.seed_declarations(std::slice::from_ref(statement));
+        true
+    }
+
+    /// Queues every declaration inside `namespace`, nested namespaces included.
+    fn seed_namespace_members(&mut self, namespace: &'a TSNamespaceDeclaration<'a>) {
+        let mut body = &namespace.body;
+        loop {
+            match body {
+                TSNamespaceDeclarationBody::TSNamespaceDeclaration(inner) => body = &inner.body,
+                TSNamespaceDeclarationBody::TSModuleBlock(block) => {
+                    self.seed_declarations(&block.body);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Queues every declaration among `statements`, and those inside namespaces, whose members
+    /// are reachable as properties of the namespace object.
+    fn seed_declarations(&mut self, statements: &'a [Statement<'a>]) {
+        for statement in statements {
+            if let Some(declared) = declared_by(statement) {
+                self.queue_declared(declared, None);
+                continue;
+            }
+            let namespace = match statement {
+                Statement::TSNamespaceDeclaration(namespace) => namespace,
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::TSNamespaceDeclaration(namespace) => namespace,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            self.seed_namespace_members(namespace);
         }
     }
 
@@ -1113,6 +1257,11 @@ impl<'s, 'a> Scanner<'s, 'a> {
         if !self.seen.insert(symbol) {
             return;
         }
+        // The declaration that runs: a redeclaration (`var x = a; var x = b`) has no single one.
+        let Some(declaration) = runtime_declaration(self.semantic, symbol) else {
+            self.failed = true;
+            return;
+        };
         if self
             .written
             .is_some_and(|written| written.contains(&symbol))
@@ -1121,7 +1270,6 @@ impl<'s, 'a> Scanner<'s, 'a> {
             self.failed = true;
             return;
         }
-        let declaration = self.semantic.scoping().symbol_declaration(symbol);
         match self.semantic.nodes().get_node(declaration).kind() {
             AstKind::VariableDeclarator(declarator) => {
                 // In a call's arguments a declarator with no initialiser takes its value from
@@ -1134,6 +1282,8 @@ impl<'s, 'a> Scanner<'s, 'a> {
             }
             AstKind::Function(function) => self.queue.push(Pending::Function(function)),
             AstKind::Class(class) => self.queue.push(Pending::Class(class)),
+            // A namespace object carries every member it declares.
+            AstKind::TSNamespaceDeclaration(namespace) => self.seed_namespace_members(namespace),
             _ => {}
         }
     }
