@@ -105,16 +105,29 @@ what the code reads:
 - The arguments of the call are held to the same rule, and a binding they read must not be written
   after it is declared: a callback reassigned, or a config changed through a member (`config.mode =
   2`, `items[0]++`, `delete config.mode`), is refused. Calls that change a value through a method
-  (`items.push(1)`) are not tracked.
+  (`items.push(1)`) are not tracked. A name is read from the one declaration that runs: an overload
+  set from its implementation (a local overload set the file reassigns is refused), a function or class merged with a `namespace` together with the
+  namespace's members (also through an alias or a default export). An `interface`, a type alias,
+  overload signatures, `declare` declarations and namespaces of types only are erased. A name with
+  two declarations that run (`var run = a; var run = b`) is refused, as is an imported runner
+  declared twice.
 - Installed packages are judged by their manifests: one whose whole dependency closure names no
   test runner (`vitest`, `vitest-*`, `@vitest/*`, `jest`, `@jest/*`, `mocha`, `jasmine`,
   `playwright`, `playwright-core`, `@playwright/*`), and whose imported file and the scripts it loads
   by relative path (`require('./x')`, `from './x'`, `import('./x')`, up to 1,024 files and 32 MiB)
   do not mention `vitest`, cannot register a test. When the project enables Vitest globals those
-  files must also not call a registration global as a free name (read across whitespace, newlines and
-  comments, and as `name?.(...)`, `name.each(...)`, a tagged template or `globalThis.name(...)`). A package imported as a data file or asset (`.json`, a stylesheet, an image)
-  is judged by its manifest, by the word `vitest` and, under globals, by calls to a registration global,
-  and is not parsed or followed, as the bundler treats it, including when a script loads it by a relative
+  files must also not read a registration global as a free name, that is one no declaration in the
+  file binds: a local `function test`, a parameter, a property or a method of the same name is not
+  one. Any read counts (a call however it is spelled, a tagged template, `name.each`, a parenthesised
+  or indexed use, a value stored for later) except `typeof name`; so does a property of `globalThis`,
+  `global`, `window` or `self` that names one, when the file does not bind that object. A `with`
+  statement, or a TypeScript `declare` of such a name (which binds nothing at run time), refuses the
+  package. Setting such a property (`globalThis.test = handler`) is not a read. This check does not
+  follow a registration name taken from the global object by destructuring
+  (`const { test } = globalThis`) or reached through `eval`, `Function` or other reflection. A package
+  imported as a data file or asset (`.json`,
+  a stylesheet, an image) is judged by its manifest and by the word `vitest`, and is not parsed or
+  followed, as the bundler treats it, including when a script loads it by a relative
   path; a native addon or a WebAssembly module is refused. The loads are read from each
   script's syntax tree. A name that could be several files (`./x` as `x.js`, `x.mjs` or `x.ts`, or
   a directory) is checked against every one of them, and directories are followed through their
@@ -133,7 +146,7 @@ what the code reads:
 - Single-file components contribute their script blocks; `<script setup>` runs when mounted, not
   when imported. Styles, images, fonts and JSON carry no code.
 
-The proof is lexical and aimed at code that is not written to evade it. It does not follow a value
+The in-file helper proof is lexical and aimed at code that is not written to evade it. It does not follow a value
 through an alias (`const alias = config; alias.mode = 2`), a method that mutates (`items.push(1)`), a
 registration global reached by another name (`const register = test`), a package that registers
 tests from another installed package's files without either declaring Vitest, reflection
@@ -188,6 +201,16 @@ generated list are not read.
   installed package it reaches.
 - The text check of an installed package follows relative `require`, `from` and `import()` to at
   most 1,024 scripts and 32 MiB (8 MiB each); a package past that is refused.
+- The command-line tool reads an installed package in a separate worker process with a 20 s deadline
+  and a 64 MiB parser stack, so a large bundle is read and a script that crashes or hangs the parser
+  refuses only its package; a worker that cannot be started, times out, crashes or answers anything but
+  a complete verdict refuses it too. A program that embeds the library gets an in-process scan instead,
+  which refuses a script past the parser's syntax size budget (8,192 units) unread, unless it calls
+  `frontend::use_package_worker` and runs `frontend::run_package_worker` first in `main`.
+- Worker stdout is read within the same deadline as its exit, with at most 256 bytes accepted.
+  A descendant holding stdout open cannot extend that deadline. On Unix a failed read kills the
+  worker's process group before reaping it; Windows cancels pipe I/O and terminates the worker.
+  Failures are counted in the [run notice](incomplete-runs.md#package-worker-failures).
 - Helper files share the source byte limit (8 MiB), the bracket nesting limit (256) and the
   export-hop limit (8).
 - Exact helper sources retained for one caller share an additional 8 MiB budget; repeated calls

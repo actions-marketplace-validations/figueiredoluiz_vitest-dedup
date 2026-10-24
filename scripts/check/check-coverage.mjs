@@ -146,6 +146,8 @@ const RUST_MODULES = {
   'src/frontend/extract/setup_identity.rs': 93,
   'src/frontend/auto_imports.rs': 97,
   'src/frontend/package_manifests.rs': 98,
+  // N19b: 98.61% (142/144), including portable child-process tests and deadline ordering.
+  'src/frontend/package_supervisor.rs': 98,
   // Formerly the weakest module at 71.3%, and the one the last four adjudicated false positives
   // lived in. Raised after a survivor-driven pass over the 466 depth-guard and 135 deleted-arm
   // mutants; the documented-unreachable lines (a Windows-only path component, `should not happen`
@@ -340,6 +342,7 @@ const JS_MODULES = {
   'scripts/check/lib/corpus-labels.mjs': 98,
   'scripts/check/lib/corpus-evaluation.mjs': 98,
   'scripts/check/lib/corpus-comparison.mjs': 98,
+  'scripts/check/lib/excluded-share.mjs': 100,
   'scripts/check/evaluate-corpus.mjs': 98,
   'scripts/check/lib/output-equivalence.mjs': 98,
   'scripts/check/lib/equivalence-shim.mjs': 100,

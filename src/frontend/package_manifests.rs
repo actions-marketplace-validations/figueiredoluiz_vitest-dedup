@@ -10,18 +10,28 @@
 //! Only registration is ruled out. Import-time side effects of a package (patching globals,
 //! polyfills) are not modelled, exactly as they are not for a package the test file imports.
 
+use super::extract::registration_free::REGISTRATION;
+use super::package_supervisor::supervise;
+use crate::model::PackageWorkerFailure;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, CallExpression, Expression, IdentifierReference, StaticMemberExpression,
 };
+use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::{GetSpan, SourceType};
 use serde_json::Value;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use subprocess::Exec;
 
 /// Most packages one closure may visit before it is refused.
 const MAX_PACKAGES: usize = 256;
@@ -153,286 +163,6 @@ fn closure_has_no_runner(root: &Path) -> bool {
 /// Largest entry file the text check reads; a larger one is "cannot tell".
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Names a test file calls without importing them when the project enables Vitest globals.
-const GLOBAL_REGISTRATION: &[&str] = &[
-    "test",
-    "it",
-    "describe",
-    "suite",
-    "bench",
-    "beforeAll",
-    "beforeEach",
-    "afterAll",
-    "afterEach",
-    "onTestFinished",
-    "onTestFailed",
-    "aroundEach",
-    "aroundAll",
-];
-
-/// Whether `c` ends a line in JavaScript.
-fn is_line_terminator(c: char) -> bool {
-    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
-}
-
-/// `text` with comments, string literals and regular-expression literals blanked, so prose ("don't
-/// change it."), messages and quotes inside a pattern are not mistaken for code. A `/` starts a
-/// regular expression where an operand is expected (after an operator, a bracket, `,`, `;`, or
-/// `return`/`typeof`); elsewhere it divides. A pattern read as a division after a `)` (as in
-/// `if (x) /re/.test(y)`) is the one shape this misses.
-fn without_comments_and_strings(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    // The last character of code seen, and the word it ended, to tell a pattern from a division.
-    let mut previous = ' ';
-    let mut word = String::new();
-    while let Some(c) = chars.next() {
-        let operand_expected = matches!(
-            previous,
-            ' ' | '('
-                | ','
-                | '='
-                | ':'
-                | '['
-                | '!'
-                | '&'
-                | '|'
-                | '?'
-                | '{'
-                | '}'
-                | ';'
-                | '+'
-                | '-'
-                | '*'
-                | '%'
-                | '<'
-                | '>'
-                | '~'
-                | '^'
-        ) || matches!(word.as_str(), "return" | "typeof");
-        match c {
-            '/' if chars.peek() == Some(&'/') => {
-                for next in chars.by_ref() {
-                    if is_line_terminator(next) {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut last = ' ';
-                let mut lines = false;
-                for next in chars.by_ref() {
-                    if last == '*' && next == '/' {
-                        break;
-                    }
-                    lines |= is_line_terminator(next);
-                    last = next;
-                }
-                // A comment that spans lines still ends the line it started on.
-                out.push(if lines { '\n' } else { ' ' });
-            }
-            '/' if operand_expected => {
-                let mut in_class = false;
-                while let Some(next) = chars.next() {
-                    match next {
-                        '\\' => {
-                            chars.next();
-                        }
-                        '[' => in_class = true,
-                        ']' => in_class = false,
-                        '/' if !in_class => break,
-                        c if is_line_terminator(c) => break,
-                        _ => {}
-                    }
-                }
-                out.push(' ');
-                previous = ')';
-                word.clear();
-            }
-            '`' => {
-                // Template text is blanked, but an interpolation is code. The opening is kept as
-                // a marker, so a template right after a name reads as a tagged call.
-                out.push('`');
-                let mut interpolation = 0usize;
-                while let Some(next) = chars.next() {
-                    if interpolation == 0 {
-                        if next == '\\' {
-                            chars.next();
-                        } else if next == '`' {
-                            break;
-                        } else if next == '$' && chars.peek() == Some(&'{') {
-                            chars.next();
-                            interpolation = 1;
-                            out.push(' ');
-                        }
-                    } else {
-                        match next {
-                            '{' => interpolation += 1,
-                            '}' => {
-                                interpolation -= 1;
-                                if interpolation == 0 {
-                                    out.push(';');
-                                    continue;
-                                }
-                            }
-                            _ => {}
-                        }
-                        // A nested template's backticks are not tag markers.
-                        out.push(if next == '`' { ' ' } else { next });
-                    }
-                }
-                out.push(' ');
-                previous = ')';
-                word.clear();
-            }
-            '\'' | '"' => {
-                while let Some(next) = chars.next() {
-                    if next == '\\' {
-                        chars.next();
-                    } else if next == c {
-                        break;
-                    }
-                }
-                out.push(' ');
-                previous = ')';
-                word.clear();
-            }
-            other => {
-                out.push(other);
-                if other.is_alphanumeric() || other == '_' || other == '$' {
-                    word.push(other);
-                } else if !other.is_whitespace() {
-                    word.clear();
-                }
-                if !other.is_whitespace() {
-                    previous = other;
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Whether the `(` at `open` starts the parameters of a function or method being defined rather
-/// than a call: its matching `)` is followed by a block (`describe(path) { ... }`).
-fn defines_function(code: &str, open: usize) -> bool {
-    let mut depth = 0usize;
-    for (offset, byte) in code.as_bytes()[open..].iter().take(4096).enumerate() {
-        match byte {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    // A block on the next line after a call is a statement, not a body.
-                    let rest = &code[open + offset + 1..];
-                    let gap = rest.len() - rest.trim_start_matches([' ', '\t']).len();
-                    return rest[gap..].starts_with('{');
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Whether `text` calls (or chains from) a registration global as a free name: the name stands
-/// alone, not part of a longer identifier and not a property (`pattern.test(...)`; a property of
-/// the global object, `globalThis.test(...)`, is the global), and is followed, across any
-/// whitespace (a newline included; comments are already blanked), by `(`, `?.(`, a template
-/// literal (a tagged call), or `.`/`?.` and a Vitest modifier (`describe.each(...)`). Textual and
-/// deliberately generous: a local function that happens to be called `test` is a false alarm,
-/// which only costs the proof.
-fn calls_registration_global(text: &str) -> bool {
-    let code = without_comments_and_strings(text);
-    let bytes = code.as_bytes();
-    GLOBAL_REGISTRATION.iter().any(|name| {
-        code.match_indices(name).any(|(start, _)| {
-            let before = start.checked_sub(1).map(|index| bytes[index]);
-            if before.is_some_and(is_identifier_byte) {
-                return false;
-            }
-            let prior =
-                code[..start].trim_end_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
-            // A property access is the global only on the global object; `...` is a spread.
-            if !prior.ends_with("...")
-                && prior
-                    .strip_suffix('.')
-                    .is_some_and(|receiver| !receiver_is_global_object(receiver))
-            {
-                return false;
-            }
-            let end = start + name.len();
-            let mut at = skip_space(&code, end);
-            // `?.` reaches the same call or modifier as `.`.
-            let optional = code[at..].starts_with("?.");
-            if optional {
-                at = skip_space(&code, at + 2);
-            }
-            match bytes.get(at) {
-                Some(b'(') => !defines_function(&code, at),
-                Some(b'`') => true,
-                Some(b'.') if !optional => names_modifier(&code[skip_space(&code, at + 1)..]),
-                _ => optional && names_modifier(&code[at..]),
-            }
-        })
-    })
-}
-
-/// Whether `byte` can be part of an identifier name.
-fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
-}
-
-/// The offset of the first character at or after `from` that JavaScript does not count as
-/// whitespace (which includes U+FEFF).
-fn skip_space(code: &str, from: usize) -> usize {
-    code.len()
-        - code[from..]
-            .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
-            .len()
-}
-
-/// Whether the text before a `.` ends in the global object (`globalThis`, `global`, `window`;
-/// not `self`, which is often an alias of `this`), so `globalThis.test(...)` reads as the global call it is.
-fn receiver_is_global_object(before_dot: &str) -> bool {
-    let head = before_dot.trim_end_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
-    let head = head.strip_suffix('?').unwrap_or(head);
-    let head = head.trim_end_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
-    let start = head
-        .bytes()
-        .rposition(|byte| !is_identifier_byte(byte))
-        .map_or(0, |index| index + 1);
-    // A longer chain (`a.window.test(...)`) is a property of something else.
-    let chained = head[..start]
-        .trim_end_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
-        .ends_with('.');
-    !chained && matches!(&head[start..], "globalThis" | "global" | "window")
-}
-
-/// Whether `rest` starts with a Vitest modifier as a whole word.
-fn names_modifier(rest: &str) -> bool {
-    const MODIFIERS: &[&str] = &[
-        "each",
-        "skip",
-        "only",
-        "todo",
-        "concurrent",
-        "sequential",
-        "runIf",
-        "skipIf",
-        "extend",
-        "fails",
-        "for",
-        "shuffle",
-    ];
-    MODIFIERS.iter().any(|modifier| {
-        rest.strip_prefix(modifier)
-            .is_some_and(|after| !after.bytes().next().is_some_and(is_identifier_byte))
-    })
-}
-
 /// Most local files one package's entry may reach before the text rule gives up.
 const MAX_LOCAL_FILES: usize = 1024;
 /// Most bytes those files may hold in all.
@@ -476,7 +206,13 @@ enum Load {
 /// is left out; so is a Node builtin. A specifier that is neither relative nor a package name
 /// (`#internal`, absolute, `file:`), carries a `?`, `#` or `%`, or is not a plain string, is an
 /// [`Load::Unknown`], as is any other use of the name `require` (an alias, `(0, require)(x)`).
-fn loads(path: &Path, text: &str, own: Option<&str>) -> Vec<Load> {
+fn scan_script(
+    path: &Path,
+    text: &str,
+    own: Option<&str>,
+    guarded: bool,
+    globals: bool,
+) -> ScriptScan {
     struct Scan<'n> {
         /// The package's own name: a bare load of it resolves inside the package.
         own: Option<&'n str>,
@@ -656,16 +392,28 @@ fn loads(path: &Path, text: &str, own: Option<&str>) -> Vec<Load> {
             }
         }
     }
-    if super::extract::parse_refusal(text).is_some() {
-        return vec![Load::Unknown];
+    let unknown = || ScriptScan {
+        loads: vec![Load::Unknown],
+        registers_global: false,
+    };
+    if guarded && super::extract::parse_refusal(text).is_some() {
+        return unknown();
     }
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path)
-        .unwrap_or_default()
-        .with_unambiguous(true);
+    // `.mjs` and `.cjs` (and their TypeScript forms) say what they are; only the ambiguous
+    // extensions are guessed from the syntax.
+    let source_type = SourceType::from_path(path).unwrap_or_default();
+    let source_type = if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("mjs" | "cjs" | "mts" | "cts")
+    ) {
+        source_type
+    } else {
+        source_type.with_unambiguous(true)
+    };
     let parsed = Parser::new(&allocator, text, source_type).parse();
     if parsed.fatal_error || !parsed.diagnostics.is_empty() {
-        return vec![Load::Unknown];
+        return unknown();
     }
     let mut scan = Scan {
         own,
@@ -673,7 +421,110 @@ fn loads(path: &Path, text: &str, own: Option<&str>) -> Vec<Load> {
         handled: HashSet::new(),
     };
     scan.visit_program(&parsed.program);
-    scan.found
+    ScriptScan {
+        loads: scan.found,
+        // Only a project that enables globals can lean on them.
+        registers_global: globals && reads_registration_global(&parsed.program),
+    }
+}
+
+/// What one script was found to do.
+struct ScriptScan {
+    loads: Vec<Load>,
+    /// Whether it reads a registration global that no declaration in the file binds.
+    registers_global: bool,
+}
+
+/// Whether `program` reads one of the [`REGISTRATION`] names as a free name: a reference no
+/// binding in the file resolves (so a local `function test` or a parameter named `it` is not one,
+/// and neither is a property, a key or a method). Any read counts, whether the name is called,
+/// tagged, indexed, parenthesised or stored for later, except under `typeof`; a write alone does
+/// not. A property of the global object (`globalThis.test`, also `global`, `window`, `self` when
+/// they are not bound in the file) counts as well.
+fn reads_registration_global(program: &oxc_ast::ast::Program<'_>) -> bool {
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(program)
+        .semantic;
+    let scoping = semantic.scoping();
+    let nodes = semantic.nodes();
+    // A `with` statement looks names up on an object first, so no binding settles a name in it.
+    if nodes
+        .iter()
+        .any(|node| matches!(node.kind(), AstKind::WithStatement(_)))
+    {
+        return true;
+    }
+    // `declare const test: ...` binds nothing at run time: the name is still the global.
+    if REGISTRATION.iter().any(|name| {
+        scoping
+            .get_root_binding((*name).into())
+            .is_some_and(|symbol| scoping.symbol_flags(symbol).is_ambient())
+    }) {
+        return true;
+    }
+    // The node that uses the reference, skipping the parentheses and the TypeScript wrappers
+    // (`as`, `!`, `satisfies`, `<T>x`, `x<T>`) around it.
+    let user_id = |id: oxc_semantic::NodeId| {
+        let mut id = nodes.parent_id(id);
+        while matches!(
+            nodes.kind(id),
+            AstKind::ParenthesizedExpression(_)
+                | AstKind::TSAsExpression(_)
+                | AstKind::TSSatisfiesExpression(_)
+                | AstKind::TSTypeAssertion(_)
+                | AstKind::TSNonNullExpression(_)
+                | AstKind::TSInstantiationExpression(_)
+        ) {
+            id = nodes.parent_id(id);
+        }
+        id
+    };
+    let user_of = |id: oxc_semantic::NodeId| nodes.kind(user_id(id));
+    for (name, references) in scoping.root_unresolved_references() {
+        let name = name.as_str();
+        let registration = REGISTRATION.contains(&name);
+        if !registration && !matches!(name, "globalThis" | "global" | "window" | "self") {
+            continue;
+        }
+        for id in references.iter() {
+            let reference = scoping.get_reference(*id);
+            if !reference.is_read() {
+                continue;
+            }
+            let user = user_of(reference.node_id());
+            let counts = if registration {
+                !matches!(user, AstKind::UnaryExpression(unary)
+                    if unary.operator == oxc_ast::ast::UnaryOperator::Typeof)
+            } else {
+                let (property, span) = match user {
+                    AstKind::StaticMemberExpression(member) => {
+                        (Some(member.property.name.as_str()), member.span)
+                    }
+                    AstKind::ComputedMemberExpression(member) => match &member.expression {
+                        Expression::StringLiteral(literal) => {
+                            (Some(literal.value.as_str()), member.span)
+                        }
+                        _ => (None, member.span),
+                    },
+                    _ => (None, oxc_span::Span::default()),
+                };
+                // `globalThis.test = handler` only sets the property; `+=` and `++` read it first.
+                let assigned = property.is_some()
+                    && matches!(
+                        user_of(user_id(reference.node_id())),
+                        AstKind::AssignmentExpression(assign)
+                            if assign.operator == oxc_ast::ast::AssignmentOperator::Assign
+                                && assign.left.span() == span
+                    );
+                !assigned && property.is_some_and(|property| REGISTRATION.contains(&property))
+            };
+            if counts {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `path` with `.` and `..` folded away, without touching the file system.
@@ -864,6 +715,135 @@ fn resolve_target(
     true
 }
 
+/// Whether package scans run in a child process (see [`use_package_worker`]).
+static WORKER_MODE: AtomicBool = AtomicBool::new(false);
+
+/// The argument that starts the binary as a package scan worker.
+const WORKER_ARG: &str = "--vitest-dedup-package-worker";
+
+/// Set in a worker's environment: a worker never starts another, so an embedding program that
+/// forgot [`run_package_worker`] cannot recurse.
+const WORKER_ENV: &str = "VITEST_DEDUP_PACKAGE_WORKER";
+
+/// Longest a worker may run before it is killed and the package refused.
+const WORKER_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Stack of the thread that parses in a worker: ample for deeply nested but valid code. A stack
+/// overflow past it aborts the worker, never the analyzer.
+const WORKER_STACK: usize = 64 * 1024 * 1024;
+
+/// Runs the installed-package scan in a child process from now on.
+///
+/// A parser stack overflow aborts the whole process and `oxc_parser` has no recursion limit, so
+/// by default (library callers, tests) a script that trips the parser's raw syntax size
+/// budget (8,192 units) is refused unread. The command-line tool calls this instead: the scan then runs
+/// in a worker started from the current executable, without the budget, and a worker that
+/// crashes, times out, cannot be started or answers anything but a complete verdict refuses the
+/// package. There is no in-process fallback once this is on. The embedding executable must call
+/// [`run_package_worker`] first thing in `main`.
+pub fn use_package_worker() {
+    WORKER_MODE.store(true, Ordering::Relaxed);
+}
+
+/// Whether this process may start a worker: not if it is one.
+fn may_start_worker() -> bool {
+    std::env::var_os(WORKER_ENV).is_none()
+}
+
+/// Failure counts describe uncached attempts, not affected tests or cache hits.
+static WORKER_FAILURES: Mutex<BTreeMap<PackageWorkerFailure, usize>> = Mutex::new(BTreeMap::new());
+
+/// Drain worker failures once per analysis. Like resolution gaps, simultaneous analyses in
+/// one process share these counters; library callers drain them between runs.
+pub fn take_package_worker_failures() -> BTreeMap<PackageWorkerFailure, usize> {
+    std::mem::take(
+        &mut *WORKER_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Valid refusal and clean responses are distinct from infrastructure or protocol failures.
+fn registers_from_worker(
+    output: Result<String, PackageWorkerFailure>,
+) -> Result<bool, PackageWorkerFailure> {
+    match output?.as_str() {
+        "clean\n" => Ok(false),
+        "registers\n" => Ok(true),
+        _ => Err(PackageWorkerFailure::Output),
+    }
+}
+
+/// Refuse a failed attempt and retain its fixed, path-free cause for the run notice.
+fn record_worker_result(result: Result<bool, PackageWorkerFailure>) -> bool {
+    result.unwrap_or_else(|cause| {
+        let mut failures = WORKER_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *failures.entry(cause).or_default() += 1;
+        true
+    })
+}
+
+/// Ask a supervised worker whether this package can register tests.
+fn scan_in_worker(file: &Path, globals: bool) -> bool {
+    let answer = if !may_start_worker() {
+        Err(PackageWorkerFailure::Nested)
+    } else if let Ok(exe) = std::env::current_exe() {
+        let command = Exec::cmd(exe)
+            .env(WORKER_ENV, "1")
+            .arg(WORKER_ARG)
+            .arg(file)
+            .arg(if globals { "1" } else { "0" });
+        registers_from_worker(supervise(command, WORKER_DEADLINE))
+    } else {
+        Err(PackageWorkerFailure::Start)
+    };
+    record_worker_result(answer)
+}
+
+/// The worker side: `Some(exit code)` when this process was started as a package scan worker, so
+/// `main` can return it before any other work.
+pub fn run_package_worker(args: &[OsString]) -> Option<i32> {
+    if args.get(1).and_then(|argument| argument.to_str()) != Some(WORKER_ARG) {
+        return None;
+    }
+    // Only the supervisor starts a worker: it marks the environment and passes exactly a file and
+    // the globals flag.
+    let (Some(file), Some(globals), 4, true) = (
+        args.get(2),
+        args.get(3).and_then(|globals| globals.to_str()),
+        args.len(),
+        !may_start_worker(),
+    ) else {
+        return Some(2);
+    };
+    if !matches!(globals, "0" | "1") {
+        return Some(2);
+    }
+    // A worker that outlives its deadline (its parent may be gone) ends itself.
+    std::thread::spawn(|| {
+        std::thread::sleep(WORKER_DEADLINE + Duration::from_secs(5));
+        std::process::exit(3);
+    });
+    let file = PathBuf::from(file);
+    let globals = globals == "1";
+    let registers = std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(move || reached_files_register(&file, globals, false));
+    let Ok(scan) = registers else {
+        return Some(4);
+    };
+    let registers = scan.join().ok();
+    match registers {
+        Some(registers) => {
+            println!("{}", if registers { "registers" } else { "clean" });
+            Some(0)
+        }
+        None => Some(5),
+    }
+}
+
 /// Whether the entry file, or a script of the same package it loads by a relative path, names
 /// Vitest anywhere in its text, or -- when the project enables globals, which a package can lean
 /// on without importing anything -- calls a registration global. A package that registers tests
@@ -879,7 +859,11 @@ fn entry_registers(file: &Path, globals: bool) -> bool {
     {
         return known;
     }
-    let registers = reached_files_register(file, globals);
+    let registers = if WORKER_MODE.load(Ordering::Relaxed) {
+        scan_in_worker(file, globals)
+    } else {
+        reached_files_register(file, globals, true)
+    };
     reached_verdicts()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -888,7 +872,7 @@ fn entry_registers(file: &Path, globals: bool) -> bool {
 }
 
 /// Whether any script reachable from `entry` registers tests, or the walk cannot tell.
-fn reached_files_register(entry: &Path, globals: bool) -> bool {
+fn reached_files_register(entry: &Path, globals: bool, guarded: bool) -> bool {
     // Everything below is in real paths, so a link inside the package neither hides a file nor
     // changes which directory a later relative load resolves from.
     let Ok(real_entry) = entry.canonicalize() else {
@@ -931,17 +915,16 @@ fn reached_files_register(entry: &Path, globals: bool) -> bool {
         if kind == Kind::Binary {
             return true;
         }
-        // Text that calls a registration global is refused whatever its extension: Node runs an
-        // unknown extension as JavaScript.
-        if globals && calls_registration_global(&text) {
-            return true;
-        }
         // Data and assets are inert to the bundler that serves them (Vite), so they are not parsed
         // or followed; Node's `require` would run an unknown extension as JavaScript.
         if kind == Kind::Data {
             continue;
         }
-        for load in loads(&file, &text, own.as_deref()) {
+        let scan = scan_script(&file, &text, own.as_deref(), guarded, globals);
+        if globals && scan.registers_global {
+            return true;
+        }
+        for load in scan.loads {
             match load {
                 Load::Unknown => return true,
                 Load::Relative(specifier) => match follow(&file, &real_root, &specifier) {
@@ -1237,71 +1220,227 @@ mod tests {
         assert!(!cannot_register_tests(&package.join("index.js"), false));
     }
 
-    /// A registration global is a call however the name is separated from its parenthesis, and a
-    /// near miss one edit away is not.
+    /// Without globals the registration-global pass does not run, and the loads are still read.
     #[test]
-    fn registration_calls_are_found_across_whitespace_comments_and_optional_calls() {
-        for (code, calls) in [
-            ("test('a', () => {})", true),
-            ("test\n('a', () => {})", true),
-            ("test\r\n\t('a', () => {})", true),
-            ("test /* c */ ('a', () => {})", true),
-            ("test // c\n('a', () => {})", true),
-            ("test?.('a', () => {})", true),
-            ("test ?. ('a', () => {})", true),
-            ("test`a`", true),
-            ("test\n`a`", true),
-            ("describe\n.each([1])('a', () => {})", true),
-            ("describe.\neach([1])('a', () => {})", true),
-            ("test?.each([1])('a', () => {})", true),
-            ("test?.\nskip('a', () => {})", true),
-            ("beforeEach\n(() => {})", true),
-            ("test", false),
-            ("test;\n('a')", false),
-            ("test = 1\n", false),
-            ("globalThis.test('a', () => {})", true),
-            ("globalThis?.describe.each([1])('a', () => {})", true),
-            ("window\n.it('a', () => {})", true),
-            ("window.test`a`", true),
-            ("self.test('a')", false),
-            ("test\u{feff}('a', () => {})", true),
-            ("a.window.test('a')", false),
-            ("a. window.test('a')", false),
-            ("patterns. test?.('a')", false),
-            ("patterns.\ntest`a`", false),
-            ("patterns./* c */test('a')", false),
-            ("[...test('a')]", true),
-            ("const s = `${test}${`hello`}`;", false),
-            ("const s = `${`test`}`;", false),
-            ("const s = `${test}`\n`x`;", false),
-            ("test // c\r('a')", true),
-            ("x = /a\r test('a')", true),
-            ("test // c\u{2028}('a')", true),
-            ("test('a', () => {}) /*\u{2028}*/ {}", true),
-            ("a./* c */window.test('a')", false),
-            ("test`a${1}`", true),
-            ("globalThis.test`a${1}`", true),
-            ("const s = `${test}`;", false),
-            ("test('a', () => {}) /*\n*/ {}", true),
-            ("myglobalThis.test('a')", false),
-            ("localThis.test('a')", false),
-            ("pattern.test('a')", false),
-            ("pattern\n.test('a')", false),
-            ("pattern?.test('a')", false),
-            ("mytest\n('a')", false),
-            ("test?.other('a')", false),
-            ("test.eachx('a')", false),
-            ("test\n.other('a')", false),
-            ("// test\n('a')", false),
-            ("x = 'test'\n('a')", false),
-            ("class A { test\n(a) { return a } }", false),
+    fn registration_globals_are_only_looked_for_under_globals() {
+        let code = "test('a', () => {}); require('./x')";
+        let on = scan_script(Path::new("x.js"), code, None, false, true);
+        let off = scan_script(Path::new("x.js"), code, None, false, false);
+        assert!(on.registers_global);
+        assert!(!off.registers_global);
+        assert_eq!(on.loads, off.loads);
+        assert_eq!(off.loads, vec![Load::Relative("./x".to_owned())]);
+    }
+
+    /// A large flat bundle trips the in-process size budget and is refused unread; the unguarded
+    /// scan a worker runs reads it, and still refuses a bundle that registers a test.
+    #[test]
+    fn the_size_budget_applies_in_process_but_not_in_a_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = install(directory.path(), "bundle", r#"{"name":"bundle"}"#);
+        let entry = package.join("index.js");
+        let flat = "x();\n".repeat(10_000);
+        fs::write(&entry, &flat).unwrap();
+        assert!(reached_files_register(&entry, true, true));
+        assert!(!reached_files_register(&entry, true, false));
+        fs::write(&entry, format!("{flat}describe('a', () => {{}})")).unwrap();
+        assert!(reached_files_register(&entry, true, false));
+    }
+
+    /// The dispatch leaves an ordinary command line alone and answers a malformed worker call with
+    /// a failure code; a process marked as a worker never starts another.
+    #[test]
+    fn worker_dispatch_ignores_ordinary_arguments() {
+        let args = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(run_package_worker(&args(&["vitest-dedup"])), None);
+        assert_eq!(run_package_worker(&args(&["vitest-dedup", "."])), None);
+        assert_eq!(run_package_worker(&args(&[])), None);
+        assert_eq!(
+            run_package_worker(&args(&["vitest-dedup", WORKER_ARG])),
+            Some(2)
+        );
+        assert_eq!(
+            run_package_worker(&args(&["vitest-dedup", WORKER_ARG, "/x"])),
+            Some(2)
+        );
+        // Well-formed operands without the supervisor's marker, and malformed ones with it.
+        assert_eq!(
+            run_package_worker(&args(&["vitest-dedup", WORKER_ARG, "/x", "1"])),
+            Some(2)
+        );
+        // The one test that sets the marker, so no other test sees it.
+        assert!(may_start_worker());
+        std::env::set_var(WORKER_ENV, "1");
+        let marked_may_start = may_start_worker();
+        let malformed = [
+            run_package_worker(&args(&["vitest-dedup", WORKER_ARG, "/x", "2"])),
+            run_package_worker(&args(&["vitest-dedup", WORKER_ARG, "/x", "1", "extra"])),
+        ];
+        std::env::remove_var(WORKER_ENV);
+        assert!(
+            !marked_may_start,
+            "a marked process must not start a worker"
+        );
+        assert_eq!(malformed, [Some(2), Some(2)]);
+    }
+
+    /// Clean and refusal responses are valid; all other bytes are infrastructure failures.
+    #[test]
+    fn only_a_complete_clean_answer_admits_a_package() {
+        assert_eq!(registers_from_worker(Ok("clean\n".into())), Ok(false));
+        assert_eq!(registers_from_worker(Ok("registers\n".into())), Ok(true));
+        for output in ["", "clean", "clean\nclean\n", "clean \n"] {
+            assert_eq!(
+                registers_from_worker(Ok(output.into())),
+                Err(PackageWorkerFailure::Output)
+            );
+        }
+        assert_eq!(
+            registers_from_worker(Err(PackageWorkerFailure::Start)),
+            Err(PackageWorkerFailure::Start)
+        );
+    }
+
+    /// Successful verdicts do not count as worker failures, and draining resets the run.
+    #[test]
+    fn worker_failures_are_counted_and_drained() {
+        assert!(take_package_worker_failures().is_empty());
+        assert!(!record_worker_result(Ok(false)));
+        assert!(record_worker_result(Ok(true)));
+        assert!(take_package_worker_failures().is_empty());
+        assert!(record_worker_result(Err(PackageWorkerFailure::Start)));
+        assert!(record_worker_result(Err(PackageWorkerFailure::Start)));
+        assert!(record_worker_result(Err(PackageWorkerFailure::Timeout)));
+        assert_eq!(
+            take_package_worker_failures(),
+            BTreeMap::from([
+                (PackageWorkerFailure::Start, 2),
+                (PackageWorkerFailure::Timeout, 1),
+            ])
+        );
+        assert!(take_package_worker_failures().is_empty());
+    }
+
+    /// A registration global is read as a free name however the call is spelled, and only then:
+    /// a binding in the file, a property, a key or a method named the same is not the global.
+    #[test]
+    fn registration_globals_are_found_by_reference() {
+        let reads = |code: &str, file: &str| {
+            let scan = scan_script(Path::new(file), code, None, false, true);
+            assert!(
+                !scan.loads.contains(&Load::Unknown),
+                "{code:?} did not parse"
+            );
+            scan.registers_global
+        };
+        for (code, file, registers) in [
+            // Every spelling of a call.
+            ("test('a', () => {})", "x.js", true),
+            ("test\n('a', () => {})", "x.js", true),
+            ("test /* c */ ('a', () => {})", "x.js", true),
+            ("test?.('a', () => {})", "x.js", true),
+            ("test`a${1}`", "x.js", true),
+            ("describe\n.each([1])('a', () => {})", "x.js", true),
+            ("describe?.each([1])('a', () => {})", "x.js", true),
+            ("test['each']([1])('a', () => {})", "x.js", true),
+            ("describe<Ctx>('a', () => {})", "x.ts", true),
+            ("(test)('a', () => {})", "x.js", true),
+            ("(test)?.('a', () => {})", "x.js", true),
+            ("(0, test)('a', () => {})", "x.js", true),
+            ("[...test('a')]", "x.js", true),
+            ("beforeEach\n(() => {})", "x.js", true),
+            // Inside a template interpolation, however it is written.
+            ("const s = `${test /* c */ ('a')}`", "x.js", true),
+            ("const s = `${'}' + test('a')}`", "x.js", true),
+            // The global object.
+            ("globalThis.test('a', () => {})", "x.js", true),
+            ("(globalThis).test('a', () => {})", "x.js", true),
+            ("(globalThis.test)?.('a')", "x.js", true),
+            (
+                "globalThis?.describe.each([1])('a', () => {})",
+                "x.js",
+                true,
+            ),
+            ("window\n.it('a', () => {})", "x.js", true),
+            ("self.test`a`", "x.js", true),
+            ("globalThis['test']('a')", "x.js", true),
+            // Stored for later.
+            ("const t = test; t('a')", "x.js", true),
+            ("[test].forEach((f) => f('a'))", "x.js", true),
+            ("test++", "x.js", true),
+            ("globalThis.test += 1", "x.js", true),
+            ("globalThis.test++", "x.js", true),
+            ("globalThis.test = handler", "x.js", false),
+            ("(globalThis as any).test = handler", "x.ts", false),
+            ("globalThis['test'] = handler", "x.js", false),
+            ("globalThis.test = globalThis.test", "x.js", true),
+            ("{ function test() {} }\ntest('a')", "x.mjs", true),
+            (
+                "declare const test: (name: string, fn: () => void) => void\ntest('a', () => {})",
+                "x.ts",
+                true,
+            ),
+            (
+                "declare function describe(name: string): void\ndescribe('a')",
+                "x.ts",
+                true,
+            ),
+            (
+                "function test() {}\nwith (globalThis) { test('a') }",
+                "x.js",
+                true,
+            ),
+            ("(test as any)('a')", "x.ts", true),
+            ("(globalThis as any).test('a')", "x.ts", true),
+            ("(test!)('a')", "x.ts", true),
+            // Not the global.
+            ("typeof test", "x.js", false),
+            ("type T = typeof test", "x.ts", false),
+            ("typeof (test as any) === 'function'", "x.ts", false),
+            ("typeof (test!) === 'function'", "x.ts", false),
+            ("{ function test() {} }\ntest('a')", "x.cjs", false),
+            ("var test = function () {}; test('a')", "x.js", false),
+            ("var self = this; self.test('a')", "x.js", false),
+            // Known limit: a name taken from the global object is a local binding afterwards.
+            ("const { test } = globalThis; test('a')", "x.js", false),
+            ("typeof test === 'function'", "x.js", false),
+            ("test = 1", "x.js", false),
+            ("pattern.test('a')", "x.js", false),
+            ("pattern?.test('a')", "x.js", false),
+            ("a.window.test('a')", "x.js", false),
+            ("localThis.test('a')", "x.js", false),
+            ("const self = this; self.test('a')", "x.js", false),
+            ("function test(a) { return a } test('a')", "x.js", false),
+            ("const it = 1; it", "x.js", false),
+            (
+                "function f(describe) { return describe('a') }",
+                "x.js",
+                false,
+            ),
+            ("class A { test(a) { return a } }", "x.js", false),
+            ("class A {\n  test(a)\n  { return a }\n}", "x.js", false),
+            (
+                "const o = { test(x) /*\n*/ { return x }, it: 1 }",
+                "x.js",
+                false,
+            ),
+            ("const o = { test: 1 }; o.test", "x.js", false),
+            ("// test('a')", "x.js", false),
+            ("x = 'test(1)'; y = `test(2)`; z = /test(3)/", "x.js", false),
+            (
+                "const other = 1; const s = `test ${other} it(1)`",
+                "x.js",
+                false,
+            ),
+            ("export function describe() {}", "x.js", false),
+            ("import { test } from 'node:test'; test('a')", "x.js", false),
         ] {
-            assert_eq!(calls_registration_global(code), calls, "{code:?}");
+            assert_eq!(reads(code, file), registers, "{code:?}");
         }
     }
 
     /// A package imported as a data file (a locale table, a stylesheet) is judged by its manifest
-    /// and by the word `vitest`, not parsed as JavaScript; a native addon is still refused.
+    /// and by the word `vitest`, not parsed as JavaScript; a native addon is refused.
     #[test]
     fn data_files_reached_directly_run_nothing() {
         let directory = tempfile::tempdir().unwrap();
@@ -1314,13 +1453,11 @@ mod tests {
             ("addon.node", "\u{7f}ELF\u{0}\u{1}", true),
             ("addon.node", "exports.go = 1", true),
             ("boot.wasm", "\u{0}asm\u{1}", true),
-            (
-                "entry.png",
-                "describe('x', () => { test('y', () => {}) })",
-                true,
-            ),
-            ("entry.json", "describe('x', () => {})", true),
+            // Data is not read as code: only the word `vitest` refuses it.
             ("entry.json", r#"{"describe": "x", "test": ["y"]}"#, false),
+            ("entry.png", "describe('x', () => {})", false),
+            // The same text as a script is refused.
+            ("entry.js", "describe('x', () => {})", true),
         ] {
             write_file(&package, name, text);
             forget_reached();

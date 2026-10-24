@@ -36,6 +36,11 @@ mod memory_roof_tests;
 /// Run the CLI, preserving quality-gate exit codes and reporting operational errors with
 /// sanitized diagnostics.
 fn main() -> ProcessExitCode {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = vitest_dedup::frontend::run_package_worker(&args) {
+        return ProcessExitCode::from(u8::try_from(code).unwrap_or(2));
+    }
+    vitest_dedup::frontend::use_package_worker();
     match run() {
         Ok(code) => process_code(code),
         Err(error) => {
@@ -426,6 +431,7 @@ fn run_with_rss(args: ParsedArgs, mut resident: impl FnMut() -> Option<u64>) -> 
                 &config.root,
                 &vitest_dedup::frontend::take_resolution_gaps(),
             );
+            base_causes.package_worker_failures = frontend::take_package_worker_failures();
             let base_result = analysis::analyze(base_tests, &config, base_files, base_causes)?;
             // A base run that could not see the whole tree (oversized, non-UTF-8, or skipped
             // files) produces a PARTIAL baseline: it accepts less than the base really had, so
@@ -798,6 +804,8 @@ fn run_with_rss(args: ParsedArgs, mut resident: impl FnMut() -> Option<u64>) -> 
         &config.root,
         &vitest_dedup::frontend::take_resolution_gaps(),
     );
+
+    causes.package_worker_failures = frontend::take_package_worker_failures();
 
     diagnostics::write_read_omissions(&mut stderr, read_errors)?;
 

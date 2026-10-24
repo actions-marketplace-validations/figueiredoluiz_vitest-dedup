@@ -510,6 +510,12 @@ const DELIBERATE_BLIND_FILES = new Set([
   'recall/framework-auto-import-ungenerated-control/known.test.ts',
   'recall/framework-hook-helper-server/orders.test.ts',
   'recall/framework-package-mock-call-uninstalled/users.test.ts',
+  // `mockNuxtImport` factories that must stay refused: a redeclared `var` whose later value registers,
+  // and a counter a hook increments (identical tests that observe different values).
+  'recall/framework-nuxt-mock-redeclared-binding/run.test.ts',
+  'recall/framework-nuxt-mock-accumulating-hook/count.test.ts',
+  // A local overloaded helper reassigned before the call: refused on purpose.
+  'recall/local-helper-overloaded-reassigned/run.test.ts',
   // Default exports a runner must keep refusing (a `let`, a reassigned declaration, an imported
   // binding): blind on purpose, permanently, as the controls for the default-identifier support.
   'recall/framework-runner-default-imported-negative/slugs.test.ts',
