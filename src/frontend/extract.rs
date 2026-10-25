@@ -44,8 +44,8 @@ use super::fingerprint::{fingerprint, FunctionLike, RowSubstitution};
 use super::registry::{
     canonicalize_export_name, const_fold, is_ecmascript_trim_whitespace, js_number_to_string,
     js_radix_digits_value, property_key_name, render_js_to_string, resolve_callee, source_text,
-    split_radix_prefix, CellValue, ChainStep, Globals, Registry, ResolvedCallee, Row, RowCells,
-    TitleArg, TitleNumber, OVER_LIMIT_TABLE,
+    split_radix_prefix, CellValue, ChainStep, Globals, ImportedConstants, Registry, ResolvedCallee,
+    Row, RowCells, TitleArg, TitleNumber, OVER_LIMIT_TABLE,
 };
 use super::FileExtraction;
 
@@ -80,7 +80,17 @@ pub(super) fn extract_within(
     globals: Globals,
     root: &Path,
 ) -> FileExtraction {
-    extract_confined(source, file, globals, true, Some(root))
+    extract_confined(source, file, globals, true, Confinement::All(root))
+}
+
+/// [`extract_with_imports`] for a historical file, with resolution confined to `root`.
+pub(super) fn extract_historical_within(
+    source: &str,
+    file: &SourceFile,
+    globals: Globals,
+    root: &Path,
+) -> FileExtraction {
+    extract_confined(source, file, globals, false, Confinement::Proofs(root))
 }
 
 /// Extracts owned declarations under an explicit current-tree or historical import policy.
@@ -90,16 +100,29 @@ pub(super) fn extract_with_imports(
     globals: Globals,
     allow_imported: bool,
 ) -> FileExtraction {
-    extract_confined(source, file, globals, allow_imported, None)
+    extract_confined(source, file, globals, allow_imported, Confinement::None)
 }
 
-/// Shared body of the extraction entry points; `root` confines import resolution when given.
+/// Which resolutions an extraction confines to an analysis root.
+#[derive(Clone, Copy)]
+enum Confinement<'r> {
+    /// None: the library default.
+    None,
+    /// Every resolution.
+    All(&'r Path),
+    /// Only the optional imported-constant proofs: a revision baseline, whose own resolutions
+    /// stay as they were.
+    Proofs(&'r Path),
+}
+
+/// Shared body of the extraction entry points; `confinement` says which resolutions stay inside
+/// the analysis root.
 fn extract_confined(
     source: &str,
     file: &SourceFile,
     globals: Globals,
     allow_imported: bool,
-    root: Option<&Path>,
+    confinement: Confinement,
 ) -> FileExtraction {
     if let Some(reason) = parse_refusal(source) {
         return refused_extraction(ExclusionReason::SourceLimit, reason);
@@ -120,7 +143,13 @@ fn extract_confined(
                 #[cfg(test)]
                 imported::EMISSION_LIMIT_OVERRIDE.with(|limit| limit.set(emission_limit));
                 super::registry::reset_cell_census_file_scope();
-                super::resolver::begin_file(root);
+                match confinement {
+                    Confinement::None => super::resolver::begin_file(None),
+                    Confinement::All(root) => super::resolver::begin_file(Some(root)),
+                    Confinement::Proofs(root) => {
+                        super::resolver::begin_file_with_proof_root(None, Some(root))
+                    }
+                }
                 registration_free::begin_file(globals == Globals::Enabled);
                 let extraction = run(source, file, globals, allow_imported);
                 #[cfg(test)]
@@ -496,7 +525,9 @@ fn run(source: &str, file: &SourceFile, globals: Globals, allow_imported: bool) 
         let mut registry = Registry::new(program, globals);
         let mut walker = Walker::new(source, file, program, semantic, globals);
         walker.allow_imported = allow_imported;
+        walker.prepare_imported_constants(&allocator);
         walker.walk_statements(&program.body, &mut registry);
+        walker.finish_imported_constants();
         if !walker.helper_setup.is_empty() {
             for case in &mut walker.tests {
                 case.context
@@ -887,7 +918,14 @@ fn collect_mocked_modules(
     ) -> Option<String> {
         // Only the root and the last member matter here; never read a `.each` table's rows.
         registry.limit_table_rows(0);
-        let resolved = resolve_callee(&call.callee, registry, semantic, source, file)?;
+        let resolved = resolve_callee(
+            &call.callee,
+            registry,
+            semantic,
+            &ImportedConstants::default(),
+            source,
+            file,
+        )?;
         if resolved.root != "vi" {
             return None;
         }
@@ -1300,6 +1338,9 @@ struct Walker<'a> {
     /// zero-test outcome, so `main.rs`'s "extracted no tests" guard can name the real cause
     /// instead of always blaming `test.globals`.
     proven_empty_tables: usize,
+    /// Value imports proved to hold a scalar literal when this file's table cells read them; see
+    /// [`Walker::prepare_imported_constants`]. Proves nothing in an imported helper's frame.
+    imported_constants: ImportedConstants<'a>,
 }
 
 impl<'a> Walker<'a> {
@@ -1371,6 +1412,7 @@ impl<'a> Walker<'a> {
             #[cfg(test)]
             helper_refusal_taint_visits: 0,
             proven_empty_tables: 0,
+            imported_constants: ImportedConstants::default(),
         }
     }
 
@@ -1483,6 +1525,7 @@ impl<'a> Walker<'a> {
             callee,
             registry,
             self.semantic,
+            &self.imported_constants,
             self.source,
             &self.file.path,
         )
@@ -9013,8 +9056,8 @@ mod tests {
              "const LEVELS = { high: 3 };\nconfigure(LEVELS);\ntest.each([[LEVELS.high]])('n %d', () => {});"),
             ("a const object aliased",
              "const LEVELS = { high: 3 }; const other = LEVELS; test.each([[LEVELS.high]])('n %d', () => {});"),
-            // Destructured and imported bindings: the declaration is not a `const` declarator
-            // with a plain identifier pattern.
+            // Destructured and unresolved imported bindings: the declaration is not a `const`
+            // declarator with a plain identifier pattern, and `./mode` does not exist.
             ("a destructured const", "const { a } = { a: 1 }; test.each([[a]])('%s', () => {});"),
             // Copilot review, PR #28 round 4, premise verified in node: the table evaluates
             // where it is written, so a cell read of a const declared LATER is a TDZ
@@ -10291,3 +10334,7 @@ mod budget_tests;
 #[cfg(test)]
 #[path = "extract/tests/registration_free.rs"]
 mod registration_free_tests;
+
+#[cfg(test)]
+#[path = "extract/tests/imported_constants.rs"]
+mod imported_constants_tests;

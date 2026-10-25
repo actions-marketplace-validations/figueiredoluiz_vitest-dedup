@@ -440,10 +440,11 @@ pub(super) enum RowCells {
 /// [`ResolvedCallee`]. Returns `None` for anything that does not trace back to a recognized
 /// Vitest export -- including a shape this function does not model, which is the conservative
 /// choice: a call this function cannot explain is never reported as a Vitest declaration.
-pub(super) fn resolve_callee(
-    expr: &Expression,
+pub(super) fn resolve_callee<'a>(
+    expr: &Expression<'a>,
     registry: &Registry,
-    semantic: &Semantic<'_>,
+    semantic: &Semantic<'a>,
+    imported: &ImportedConstants<'a>,
     source: &str,
     file: &Path,
 ) -> Option<ResolvedCallee> {
@@ -511,6 +512,7 @@ pub(super) fn resolve_callee(
                     &call.arguments,
                     registry.table_row_limit.get(),
                     semantic,
+                    imported,
                     source,
                     file,
                 )?;
@@ -521,6 +523,7 @@ pub(super) fn resolve_callee(
                     &tagged.quasi,
                     registry.table_row_limit.get(),
                     semantic,
+                    imported,
                     source,
                 )?;
             }
@@ -531,6 +534,7 @@ pub(super) fn resolve_callee(
                         &call.arguments,
                         registry.table_row_limit.get(),
                         semantic,
+                        imported,
                         source,
                         file,
                     )?;
@@ -615,11 +619,12 @@ fn is_namespace(expr: &Expression, registry: &Registry, scoping: &Scoping) -> bo
 /// this makes no such assumption: it converts whatever member the call closes over, wherever it
 /// falls in the chain, so `test.skipIf(x).each(table)` and `test.each(table)` are both handled by
 /// the same code path.
-fn finish_interior_call(
+fn finish_interior_call<'a>(
     mut resolved: ResolvedCallee,
-    arguments: &[Argument],
+    arguments: &[Argument<'a>],
     row_limit: usize,
-    semantic: &Semantic<'_>,
+    semantic: &Semantic<'a>,
+    imported: &ImportedConstants<'a>,
     source: &str,
     file: &Path,
 ) -> Option<ResolvedCallee> {
@@ -630,14 +635,28 @@ fn finish_interior_call(
     };
     match name.as_str() {
         "each" => {
-            let rows = table_rows(arguments.first(), row_limit, semantic, source, file);
+            let rows = table_rows(
+                arguments.first(),
+                row_limit,
+                semantic,
+                imported,
+                source,
+                file,
+            );
             resolved.steps.push(ChainStep::Each {
                 is_for: false,
                 rows,
             });
         }
         "for" => {
-            let rows = table_rows(arguments.first(), row_limit, semantic, source, file);
+            let rows = table_rows(
+                arguments.first(),
+                row_limit,
+                semantic,
+                imported,
+                source,
+                file,
+            );
             resolved.steps.push(ChainStep::Each { is_for: true, rows });
         }
         "skipIf" => {
@@ -775,11 +794,12 @@ fn fixture_body_fingerprint(
 }
 
 /// The tagged-template sibling of [`finish_interior_call`], for `` test.each`a|b\n${1}|${2}` ``.
-fn finish_tagged_call(
+fn finish_tagged_call<'a>(
     mut resolved: ResolvedCallee,
-    quasi: &TemplateLiteral,
+    quasi: &TemplateLiteral<'a>,
     row_limit: usize,
-    semantic: &Semantic<'_>,
+    semantic: &Semantic<'a>,
+    imported: &ImportedConstants<'a>,
     source: &str,
 ) -> Option<ResolvedCallee> {
     let ChainStep::Member(name) = resolved.steps.pop()? else {
@@ -790,7 +810,11 @@ fn finish_tagged_call(
         "for" => true,
         _ => return None,
     };
-    let rows = tagged_template_rows(quasi, row_limit, source, Some(semantic));
+    let scope = FoldScope {
+        semantic,
+        imported: Some(imported),
+    };
+    let rows = tagged_template_rows(quasi, row_limit, source, Some(scope));
     resolved.steps.push(ChainStep::Each { is_for, rows });
     Some(resolved)
 }
@@ -955,15 +979,16 @@ fn table_identity(expr: &Expression, semantic: &Semantic<'_>, source: &str, file
 /// nobody could read never compare equal -- an identity for the table expression when its rows
 /// could not be read. `argument` is `None` when the call
 /// carries no argument at all (`.each()`), which is as unreadable as any other shape.
-fn table_rows(
-    argument: Option<&Argument>,
+fn table_rows<'a>(
+    argument: Option<&Argument<'a>>,
     row_limit: usize,
-    semantic: &Semantic<'_>,
+    semantic: &Semantic<'a>,
+    imported: &ImportedConstants<'a>,
     source: &str,
     file: &Path,
 ) -> Result<Vec<Row>, String> {
     match argument.and_then(Argument::as_expression) {
-        Some(table) => literal_table_rows(table, row_limit, semantic, source, file),
+        Some(table) => literal_table_rows(table, row_limit, semantic, imported, source, file),
         None => Err("<unresolved:no-table-argument>".to_owned()),
     }
 }
@@ -982,13 +1007,18 @@ pub(super) fn property_key_name(key: &PropertyKey) -> Option<String> {
 /// Read a literal array table using homogeneous-array spreading rules, retaining unresolved
 /// cells and refusing unreadable tables. A table longer than `row_limit` is refused as
 /// [`OVER_LIMIT_TABLE`] before any row is read.
-fn literal_table_rows(
-    expr: &Expression,
+fn literal_table_rows<'a>(
+    expr: &Expression<'a>,
     row_limit: usize,
-    semantic: &Semantic<'_>,
+    semantic: &Semantic<'a>,
+    imported: &ImportedConstants<'a>,
     source: &str,
     file: &Path,
 ) -> Result<Vec<Row>, String> {
+    let scope = Some(FoldScope {
+        semantic,
+        imported: Some(imported),
+    });
     let Expression::ArrayExpression(array) = unwrap_parens(expr) else {
         // Not a literal array at all (an identifier, a call like `getCases()`, ...): the row
         // count is not statically knowable. Hazard 5: this must stay unreadable, not an empty
@@ -1047,9 +1077,9 @@ fn literal_table_rows(
                 if !uniform_arrays
                     && matches!(unwrap_parens(cell_expr), Expression::ArrayExpression(_))
                 {
-                    rows.push(analyze_whole_row(cell_expr, source, Some(semantic)));
+                    rows.push(analyze_whole_row(cell_expr, source, scope));
                 } else {
-                    rows.push(analyze_row(cell_expr, source, Some(semantic)));
+                    rows.push(analyze_row(cell_expr, source, scope));
                 }
             }
         }
@@ -1069,7 +1099,11 @@ fn literal_table_rows(
 /// callback receives `[[1, 2]]`, one argument), while Vitest's *title* formatter spreads the same
 /// array. Binding is what comparison depends on, so binding is what this follows; the title is
 /// rendered from the array's elements rather than from the bound value (see [`Row::title_args`]).
-fn analyze_whole_row(cell_expr: &Expression, source: &str, resolve: Resolve<'_, '_>) -> Row {
+fn analyze_whole_row<'a>(
+    cell_expr: &Expression<'a>,
+    source: &str,
+    resolve: Resolve<'_, 'a>,
+) -> Row {
     // Folded exactly once (Copilot review, PR #28): a second fold of the same cell double-counts
     // it in the `VD_CELL_CENSUS` histogram and halves nothing else -- both fields below derive
     // from this one value.
@@ -1105,7 +1139,7 @@ fn analyze_whole_row(cell_expr: &Expression, source: &str, resolve: Resolve<'_, 
 /// caches the env setting once when the variable is unset. A re-measure answers "which
 /// refusal causes remain, and how large" -- the number that decides whether `call` and `function`
 /// cells (deliberately unread: they are runtime values) are the whole story or not.
-fn fold_cell(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<CellValue> {
+fn fold_cell<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> Option<CellValue> {
     // `display` is the `$field` title rendering -- the only consumer is title assembly, so the
     // budget mirror applies. The fingerprint-facing `raw` is untouched: a non-injective
     // rendering there would be an Error-severity false merge.
@@ -1219,7 +1253,7 @@ fn census_enabled() -> bool {
 }
 
 /// Record a refused cell once per span when census collection is enabled.
-fn census_refusal(expr: &Expression, resolve: Resolve<'_, '_>) {
+fn census_refusal<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) {
     if !census_enabled() {
         return;
     }
@@ -1247,16 +1281,16 @@ fn record_census_refusal(cause: String) {
 /// fold refused for a reason resolution does not share (the depth bounds differ) -- is
 /// annotated (`identifier (through a binding)`), keeping the histogram honest about which of
 /// the two refusers fired.
-fn cell_refusal_cause(expr: &Expression, resolve: Resolve<'_, '_>) -> String {
+fn cell_refusal_cause<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> String {
     match unwrap_transparent(expr) {
         Expression::Identifier(_) => {
-            match resolve.and_then(|semantic| resolved_binding(expr, semantic, 0)) {
+            match resolve.and_then(|scope| resolved_binding(expr, scope, 0)) {
                 Some(_) => "identifier (through a binding)".to_owned(),
                 None => "identifier".to_owned(),
             }
         }
         Expression::StaticMemberExpression(_) => {
-            match resolve.and_then(|semantic| resolved_binding(expr, semantic, 0)) {
+            match resolve.and_then(|scope| resolved_binding(expr, scope, 0)) {
                 Some(_) => "static member (through a binding)".to_owned(),
                 None => "static member".to_owned(),
             }
@@ -1300,13 +1334,47 @@ fn cell_refusal_cause(expr: &Expression, resolve: Resolve<'_, '_>) -> String {
     }
 }
 
-/// The file's semantic, when a fold is running somewhere that has one.
+/// What names resolve against ([`FoldScope`]: the file's semantic and its imported constants),
+/// when a fold is running somewhere that has one.
 ///
 /// `None` everywhere a fold runs without a file behind it (unit tests, and -- deliberately --
 /// [`const_fold_tagged`]'s fixture values, whose contract treats an identifier as `Unresolved`
 /// on purpose: a fixture's *value* is compared, and pretending a same-named local in two scopes
 /// is one value is the exact defect `const_fold_tagged` exists to prevent).
-pub(super) type Resolve<'s, 'a> = Option<&'s Semantic<'a>>;
+pub(super) type Resolve<'s, 'a> = Option<FoldScope<'s, 'a>>;
+
+/// What a fold resolves names against: the file's semantic, and the imported constants it may
+/// prove ([`ImportedConstants`]; `None` where no file-level proof runs, such as an imported
+/// helper's own frame).
+#[derive(Clone, Copy)]
+pub(super) struct FoldScope<'s, 'a> {
+    semantic: &'s Semantic<'a>,
+    imported: Option<&'s ImportedConstants<'a>>,
+}
+
+impl<'s, 'a> FoldScope<'s, 'a> {
+    /// A scope that resolves only this file's own bindings.
+    pub(super) fn local(semantic: &'s Semantic<'a>) -> Self {
+        Self {
+            semantic,
+            imported: None,
+        }
+    }
+}
+
+/// The imported scalar constants one file's tables read (see [`imported_constants`]), proved
+/// when a fold first reaches the import binding: the declaring module's literal, cloned into this
+/// file's arena. Asking the reader, rather than predicting which bindings it will reach, keeps
+/// the proof bound and a revision baseline's partial marking on the cells really read.
+#[derive(Default)]
+pub(super) struct ImportedConstants<'a> {
+    /// Proves one import binding, or `None` where this file proves nothing.
+    prove: Option<Box<dyn Fn(SymbolId) -> imported_constants::Proof<'a> + 'a>>,
+    /// Each binding's outcome, so a binding is proved at most once.
+    proved: std::cell::RefCell<HashMap<SymbolId, Option<&'a Expression<'a>>>>,
+    /// Set when a read value cannot be used: a revision baseline reading today's modules.
+    unavailable: std::cell::Cell<bool>,
+}
 
 /// How many binding hops a cell value may follow while resolving (see [`resolved_binding`]). A
 /// bound, not a judgement: `const` cycles are impossible in valid JavaScript (TDZ), so this
@@ -1329,8 +1397,9 @@ const MAX_VALUE_HOPS: u32 = 8;
 ///
 /// Resolution is by symbol identity, never by name -- the same discipline [`resolve_identifier`]
 /// applies to callees -- so two sibling scopes that each declare their own `MODE` resolve to
-/// their own values and never collide, and an imported binding (whose declaration is an import
-/// statement, not a `const`) is refused, keeping cross-file value resolution in C7's territory.
+/// their own values and never collide. An imported binding (whose declaration is an import
+/// statement, not a `const`) is refused here; [`resolved_binding`] reads it only when
+/// [`ImportedConstants`] proved it for this file.
 /// The one `const` declarator that declares `symbol_id`, when the binding is a plain
 /// `const name = ...` with a single declaration.
 ///
@@ -1381,7 +1450,7 @@ fn const_declarator<'a>(
 
 /// Recognize immutable ECMAScript globals only after semantic resolution rules out lexical
 /// bindings and dynamic `with` scopes. Missing semantic evidence never proves a global.
-fn global_constant(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<&'static str> {
+fn global_constant<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> Option<&'static str> {
     let Expression::Identifier(ident) = unwrap_transparent(expr) else {
         return None;
     };
@@ -1391,8 +1460,7 @@ fn global_constant(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<&'stat
         "Infinity" => "Infinity",
         _ => return None,
     };
-    let semantic = resolve?;
-    let scoping = semantic.scoping();
+    let scoping = resolve?.semantic.scoping();
     let reference = scoping.get_reference(ident.reference_id.get()?);
     if reference.symbol_id().is_some()
         || scoping
@@ -1419,26 +1487,34 @@ fn declaration_precedes(declarator: &VariableDeclarator, use_span: oxc_span::Spa
     declarator.span().start <= use_span.start
 }
 
-/// Follow supported earlier const bindings within the value-hop limit, declining unavailable or
-/// unsafe references.
+/// Follow supported earlier const bindings, and imports the scope proves, within the value-hop
+/// limit, declining unavailable or unsafe references.
 fn resolved_binding<'e, 'a: 'e>(
     expr: &'e Expression<'a>,
-    semantic: &Semantic<'a>,
+    scope: FoldScope<'_, 'a>,
     hops: u32,
 ) -> Option<&'e Expression<'a>> {
     if hops >= MAX_VALUE_HOPS {
         return None;
     }
+    let semantic = scope.semantic;
     match unwrap_transparent(expr) {
         Expression::Identifier(ident) => {
             let reference_id = ident.reference_id.get()?;
             let symbol_id = semantic.scoping().get_reference(reference_id).symbol_id()?;
+            // An import proved to hold a scalar literal: already a closed value, cloned here.
+            if let Some(value) = scope
+                .imported
+                .and_then(|imported| imported.lookup(symbol_id))
+            {
+                return Some(value);
+            }
             let declarator = const_declarator(semantic, symbol_id)?;
             if !declaration_precedes(declarator, ident.span()) {
                 return None;
             }
             let init = declarator.init.as_ref()?;
-            let resolved = resolved_binding(init, semantic, hops + 1).unwrap_or(init);
+            let resolved = resolved_binding(init, scope, hops + 1).unwrap_or(init);
             // An IMMUTABLE value only. A scalar cannot be changed out from under this read
             // (primitives are values, and `const` bars reassignment), which is what makes
             // following the binding a proof. A composite can: `const L = { n: 1 }; L.n = 2` is
@@ -1446,7 +1522,7 @@ fn resolved_binding<'e, 'a: 'e>(
             // reading a stale 1 where the runtime observes 2 -- so composite initializers stay
             // unread as whole values. (Member reads off them are the member arm below, with
             // their own discipline.)
-            is_immutable_value(resolved, semantic, hops + 1).then_some(resolved)
+            is_immutable_value(resolved, scope, hops + 1).then_some(resolved)
         }
         Expression::StaticMemberExpression(member) => {
             // The object must be a `const` in this file whose initializer is an object literal:
@@ -1509,8 +1585,8 @@ fn resolved_binding<'e, 'a: 'e>(
                 }
             }
             let value = value?;
-            let resolved = resolved_binding(value, semantic, hops + 1).unwrap_or(value);
-            is_immutable_value(resolved, semantic, hops + 1).then_some(resolved)
+            let resolved = resolved_binding(value, scope, hops + 1).unwrap_or(value);
+            is_immutable_value(resolved, scope, hops + 1).then_some(resolved)
         }
         _ => None,
     }
@@ -1520,7 +1596,7 @@ fn resolved_binding<'e, 'a: 'e>(
 /// or a fold of scalars. Primitives are immutable and a `const` cannot be reassigned, so a
 /// `const` whose initializer is THIS is stable for the life of the file; an object or array
 /// never is, whatever the binding kind (`const L = [1]; L.push(2)`).
-fn is_immutable_value<'a>(expr: &Expression<'a>, semantic: &Semantic<'a>, hops: u32) -> bool {
+fn is_immutable_value<'a>(expr: &Expression<'a>, scope: FoldScope<'_, 'a>, hops: u32) -> bool {
     if hops >= MAX_VALUE_HOPS {
         return false;
     }
@@ -1538,23 +1614,23 @@ fn is_immutable_value<'a>(expr: &Expression<'a>, semantic: &Semantic<'a>, hops: 
         // peel of B -- and with the peel gone, the fold never sees the binary at all, since it
         // only receives the cell's own (unpeeled) expression.
         Expression::Identifier(_) => {
-            global_constant(expr, Some(semantic)).is_some()
-                || resolved_binding(expr, semantic, hops + 1).is_some()
+            global_constant(expr, Some(scope)).is_some()
+                || resolved_binding(expr, scope, hops + 1).is_some()
         }
         Expression::TemplateLiteral(template) => template
             .expressions
             .iter()
-            .all(|expression| is_immutable_value(expression, semantic, hops)),
+            .all(|expression| is_immutable_value(expression, scope, hops)),
         Expression::UnaryExpression(unary) => {
             matches!(
                 unary.operator,
                 UnaryOperator::UnaryNegation | UnaryOperator::UnaryPlus
-            ) && is_immutable_value(&unary.argument, semantic, hops)
+            ) && is_immutable_value(&unary.argument, scope, hops)
         }
         // Every arithmetic, comparison, and logical operator over scalars produces a scalar.
         Expression::BinaryExpression(binary) => {
-            is_immutable_value(&binary.left, semantic, hops)
-                && is_immutable_value(&binary.right, semantic, hops)
+            is_immutable_value(&binary.left, scope, hops)
+                && is_immutable_value(&binary.right, scope, hops)
         }
         _ => false,
     }
@@ -1638,13 +1714,13 @@ fn member_chain_is_invoked(nodes: &AstNodes<'_>, mut chain_id: oxc_semantic::Nod
 /// [`Resolve`] applied to one expression: what it resolves through, or itself unchanged.
 fn peeled<'e, 'a: 'e>(expr: &'e Expression<'a>, resolve: Resolve<'_, 'a>) -> &'e Expression<'a> {
     resolve
-        .and_then(|semantic| resolved_binding(expr, semantic, 0))
+        .and_then(|scope| resolved_binding(expr, scope, 0))
         .unwrap_or(expr)
 }
 
 /// Extract positional/named row cells and title arguments, retaining unresolved evidence for
 /// unsupported values.
-fn analyze_row(cell_expr: &Expression, source: &str, resolve: Resolve<'_, '_>) -> Row {
+fn analyze_row<'a>(cell_expr: &Expression<'a>, source: &str, resolve: Resolve<'_, 'a>) -> Row {
     let display = source_text(source, cell_expr.span());
     let (cells, unresolved) = match unwrap_parens(cell_expr) {
         Expression::ArrayExpression(inner) => {
@@ -1756,7 +1832,10 @@ fn analyze_row(cell_expr: &Expression, source: &str, resolve: Resolve<'_, '_>) -
 /// holds for a uniform table (where the binding spreads too) and for an array row inside a mixed
 /// table (where the binding does NOT) -- the title formatter does not consult the uniformity rule
 /// that governs binding, which is why this is computed from the row expression alone.
-fn title_args_for(cell_expr: &Expression, resolve: Resolve<'_, '_>) -> Vec<Option<TitleArg>> {
+fn title_args_for<'a>(
+    cell_expr: &Expression<'a>,
+    resolve: Resolve<'_, 'a>,
+) -> Vec<Option<TitleArg>> {
     match unwrap_transparent(cell_expr) {
         Expression::ArrayExpression(array) => array
             .elements
@@ -1773,7 +1852,7 @@ fn title_args_for(cell_expr: &Expression, resolve: Resolve<'_, '_>) -> Vec<Optio
 
 /// One argument in all three renderings. `%s` is the one that must succeed: without it there is
 /// no argument at all, and the title falls back to its pattern.
-fn title_arg(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<TitleArg> {
+fn title_arg<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> Option<TitleArg> {
     // `$field` of a non-string IS the inspect rendering (Vitest's `formatAttribute` calls the
     // same `inspect`), so the budget pipeline runs once and serves both.
     let inspected = inspect_within_budget(expr, resolve)?;
@@ -1806,7 +1885,7 @@ fn title_arg(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<TitleArg> {
 /// non-discriminating title `NaN` (18 of `duplicate-each-row`'s 41 false positives on the
 /// 2026-09-27 scan were exactly that shape), so the renderer refuses it rather than trades a
 /// recall gap for a precision one.
-fn js_number_value(expr: &Expression, depth: u32, resolve: Resolve<'_, '_>) -> Option<f64> {
+fn js_number_value<'a>(expr: &Expression<'a>, depth: u32, resolve: Resolve<'_, 'a>) -> Option<f64> {
     if depth > MAX_CELL_DEPTH {
         return None;
     }
@@ -2016,11 +2095,11 @@ fn number_of_string(raw: &str) -> Option<f64> {
 
 /// Read a tagged table's header and substitutions into rows, refusing unsupported or
 /// inconsistent forms.
-fn tagged_template_rows(
-    quasi: &TemplateLiteral,
+fn tagged_template_rows<'a>(
+    quasi: &TemplateLiteral<'a>,
     row_limit: usize,
     source: &str,
-    resolve: Resolve<'_, '_>,
+    resolve: Resolve<'_, 'a>,
 ) -> Result<Vec<Row>, String> {
     let Some(header_text) = quasi
         .quasis
@@ -2097,11 +2176,11 @@ fn tagged_template_rows(
 /// object whose fields are the template's columns, so the halving loop re-renders the columns
 /// at the halved depth and the elision search counts columns. Same algorithm, different
 /// rendering source -- the object has no single `Expression` to re-render, only parts.
-fn assembled_object_within_budget(
-    columns: &[(&str, &Expression)],
-    resolve: Resolve<'_, '_>,
+fn assembled_object_within_budget<'a>(
+    columns: &[(&str, &Expression<'a>)],
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
-    let render_column = |(name, expr): &(&str, &Expression), limit: Option<u32>| {
+    let render_column = |(name, expr): &(&str, &Expression<'a>), limit: Option<u32>| {
         render_inspect(expr, 1, limit, resolve).map(|rendered| format!("{name}: {rendered}"))
     };
     // A fn item rather than a closure: it is used from two closures, and passing a closure by
@@ -2196,9 +2275,9 @@ pub(super) fn const_fold_tagged(expr: &Expression) -> Option<String> {
 /// so the two never disagree
 /// about whether a given cell is readable at all -- only about the shape of what they return for
 /// one that is.
-pub(super) fn const_fold_kind(
-    expr: &Expression,
-    resolve: Resolve<'_, '_>,
+pub(super) fn const_fold_kind<'a>(
+    expr: &Expression<'a>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<(&'static str, String)> {
     let expr = peeled(expr, resolve);
     if let Some(scalar) = const_fold_kind_scalar(expr, resolve) {
@@ -2222,9 +2301,9 @@ pub(super) fn const_fold_kind(
 
 /// Read a supported scalar's runtime kind and raw fingerprint value after bounded binding
 /// resolution.
-fn const_fold_kind_scalar(
-    expr: &Expression,
-    resolve: Resolve<'_, '_>,
+fn const_fold_kind_scalar<'a>(
+    expr: &Expression<'a>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<(&'static str, String)> {
     let expr = peeled(expr, resolve);
     if let Some(value) = global_constant(expr, resolve) {
@@ -2266,7 +2345,7 @@ fn const_fold_kind_scalar(
 /// Render supported constant expressions as display text, returning None for forms the
 /// evaluator cannot establish. With semantic evidence, immutable global primitives and earlier
 /// local const aliases also resolve; unknown bindings and calls remain refused.
-pub(super) fn const_fold(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<String> {
+pub(super) fn const_fold<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> Option<String> {
     let expr = peeled(expr, resolve);
     if let Some(value) = global_constant(expr, resolve) {
         return Some(value.to_owned());
@@ -2354,7 +2433,11 @@ const MAX_CELL_DEPTH: u32 = 8;
 ///   across the two. Unequal is the answer that cannot be wrong.
 /// * **Anything computed stays unread**: a spread, a computed key, a shorthand, a getter, a
 ///   method, an array hole. Each is a value this cannot prove from source alone.
-fn fold_composite(expr: &Expression, depth: u32, resolve: Resolve<'_, '_>) -> Option<String> {
+fn fold_composite<'a>(
+    expr: &Expression<'a>,
+    depth: u32,
+    resolve: Resolve<'_, 'a>,
+) -> Option<String> {
     if depth > MAX_CELL_DEPTH {
         return None;
     }
@@ -2428,7 +2511,11 @@ fn fold_composite(expr: &Expression, depth: u32, resolve: Resolve<'_, '_>) -> Op
 }
 
 /// One cell as `<kind:raw>` or a nested composite, for [`fold_composite`]'s canonical form.
-fn fold_cell_canonical(expr: &Expression, depth: u32, resolve: Resolve<'_, '_>) -> Option<String> {
+fn fold_cell_canonical<'a>(
+    expr: &Expression<'a>,
+    depth: u32,
+    resolve: Resolve<'_, 'a>,
+) -> Option<String> {
     let expr = peeled(expr, resolve);
     if let Some((kind, raw)) = const_fold_kind_scalar(expr, resolve) {
         return Some(format!("<{kind}:{}>", escape_literal_delimiters(&raw)));
@@ -2459,7 +2546,11 @@ fn peeled_unwrapped<'e, 'a: 'e>(
 
 /// Render supported top-level values for string-format coercion, preserving inspected objects
 /// and BigInt suffixes.
-fn render_coerce(expr: &Expression, depth: u32, resolve: Resolve<'_, '_>) -> Option<String> {
+fn render_coerce<'a>(
+    expr: &Expression<'a>,
+    depth: u32,
+    resolve: Resolve<'_, 'a>,
+) -> Option<String> {
     let inner = peeled_unwrapped(expr, resolve, depth)?;
     match inner {
         // A plain object has no own `toString`, so the formatter inspects it instead of
@@ -2494,7 +2585,7 @@ fn render_coerce(expr: &Expression, depth: u32, resolve: Resolve<'_, '_>) -> Opt
 /// special case below -- the unary operand refused to resolve, control fell through to
 /// `render_js_to_string`, and ECMAScript's `ToString(-0)` printed `0` where Vitest's `%s`
 /// keeps the sign. A wrong accepted value, not a refusal.
-fn numeric_value(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<f64> {
+fn numeric_value<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> Option<f64> {
     if is_string_valued(expr, resolve) {
         return None;
     }
@@ -2516,10 +2607,10 @@ fn numeric_value(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<f64> {
 ///
 /// Arrays agree, because `%s` on an array *is* `ToString` -- `Array.prototype.join` calling
 /// `ToString` on each element is the only path either renderer takes.
-pub(super) fn render_js_to_string(
-    expr: &Expression,
+pub(super) fn render_js_to_string<'a>(
+    expr: &Expression<'a>,
     depth: u32,
-    resolve: Resolve<'_, '_>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
     let expr = peeled_unwrapped(expr, resolve, depth)?;
     if let Some(value) = global_constant(expr, resolve) {
@@ -2608,10 +2699,10 @@ fn inherits_default_string_coercion(expr: &Expression) -> bool {
 /// Identical to [`render_js_to_string`] except that `null` and `undefined` become empty strings
 /// -- `[null]` really does stringify to nothing, and `[null, undefined]` to a bare `,`. That is
 /// a rule of `join`, not of `ToString`.
-fn render_js_join_element(
-    expr: &Expression,
+fn render_js_join_element<'a>(
+    expr: &Expression<'a>,
     depth: u32,
-    resolve: Resolve<'_, '_>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
     let expr = peeled_unwrapped(expr, resolve, depth)?;
     if global_constant(expr, resolve) == Some("undefined") {
@@ -2656,10 +2747,10 @@ pub(super) fn js_number_to_string(value: f64) -> String {
 /// `truncateString(value, 40)` -- unchanged at 40 units, cut to 39 plus `…` above -- and
 /// anything else through the same `inspect` call `%o` uses. `inspected` supplies that
 /// rendering so a caller that already has it ([`title_arg`]) does not run the budget twice.
-fn field_within_budget(
-    expr: &Expression,
+fn field_within_budget<'a>(
+    expr: &Expression<'a>,
     inspected: impl FnOnce() -> Option<String>,
-    resolve: Resolve<'_, '_>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
     let inner = unwrap_transparent(peeled(expr, resolve));
     if is_string_valued(inner, resolve) {
@@ -2736,7 +2827,7 @@ const TITLE_VALUE_BUDGET: usize = 40;
 /// fingerprints still distinguish the tests; only the title text aligns with runtime. The
 /// item-count search reproduces §4's measured rows byte-for-byte (`…(10)`, `…(3)`, `…(1)` --
 /// including width 0, where even one item cannot fit).
-fn inspect_within_budget(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<String> {
+fn inspect_within_budget<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> Option<String> {
     let full = render_inspect(expr, 0, None, resolve)?;
     let over = match halve_to_budget(full, |max_depth| {
         render_inspect(expr, 0, Some(max_depth), resolve)
@@ -2832,11 +2923,11 @@ fn search_first_n(
 
 /// The array half of the elision rendering: the first `keep` items at `maxDepth: 1`, then
 /// `…(k)` for the omitted tail.
-fn render_array_items(
-    expr: &Expression,
+fn render_array_items<'a>(
+    expr: &Expression<'a>,
     keep: usize,
     total: usize,
-    resolve: Resolve<'_, '_>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
     let elements = array_elements(expr)?;
     let mut parts: Vec<String> = elements
@@ -2852,11 +2943,11 @@ fn render_array_items(
 }
 
 /// The object half: `key: value` items, the same bare-key rule as the full renderer.
-fn render_object_items(
-    expr: &Expression,
+fn render_object_items<'a>(
+    expr: &Expression<'a>,
     keep: usize,
     total: usize,
-    resolve: Resolve<'_, '_>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
     let fields = object_fields(expr)?;
     let mut parts: Vec<String> = fields
@@ -2886,11 +2977,11 @@ fn render_object_items(
 /// `[Array]`/`[Object]` marker instead of recursing, exactly as pretty-format prints a composite
 /// past `maxDepth`. `None` renders unbounded (still refused past [`MAX_CELL_DEPTH`]). Strings are
 /// leaves and render at any depth; only composites check the limit.
-fn render_inspect(
-    expr: &Expression,
+fn render_inspect<'a>(
+    expr: &Expression<'a>,
     depth: u32,
     limit: Option<u32>,
-    resolve: Resolve<'_, '_>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
     let expr = peeled_unwrapped(expr, resolve, depth)?;
     match expr {
@@ -2968,7 +3059,7 @@ fn is_bare_inspect_key(name: &str) -> bool {
 /// refuses rather than inventing a representation. Compact separators, matching the real thing
 /// (`{"a":1}`, not `{ "a": 1 }`) -- measured: `%j` on `'a'` prints `"a"` while `%o` on the same
 /// value prints `'a'`, which is exactly why the two cannot share one rendering.
-fn render_json(expr: &Expression, depth: u32, resolve: Resolve<'_, '_>) -> Option<String> {
+fn render_json<'a>(expr: &Expression<'a>, depth: u32, resolve: Resolve<'_, 'a>) -> Option<String> {
     let expr = peeled_unwrapped(expr, resolve, depth)?;
     if let Some(value) = global_constant(expr, resolve) {
         return (value != "undefined").then(|| "null".to_owned());
@@ -3110,7 +3201,7 @@ fn object_fields<'e, 'a>(expr: &'e Expression<'a>) -> Option<Vec<(String, &'e Ex
 }
 
 /// Whether an expression is a statically known *string*, which makes `+` concatenate.
-fn is_string_valued(expr: &Expression, resolve: Resolve<'_, '_>) -> bool {
+fn is_string_valued<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> bool {
     match unwrap_transparent(peeled(expr, resolve)) {
         Expression::StringLiteral(_) => true,
         Expression::TemplateLiteral(template) => fold_template(template, 0, resolve).is_some(),
@@ -3124,7 +3215,7 @@ fn is_string_valued(expr: &Expression, resolve: Resolve<'_, '_>) -> bool {
 }
 
 /// Read a numeric literal or supported folded numeric expression as f64.
-fn const_fold_number(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<f64> {
+fn const_fold_number<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> Option<f64> {
     let expr = peeled(expr, resolve);
     match global_constant(expr, resolve) {
         Some("Infinity") => return Some(f64::INFINITY),
@@ -3195,9 +3286,9 @@ pub(super) fn unwrap_transparent<'e, 'a>(expr: &'e Expression<'a>) -> &'e Expres
 /// `ser_template` keeps templates distinct from string literals in a *body*, because a template
 /// with substitutions is a computation. One with none is not: `` `foo` `` and `'foo'` are the
 /// same value, and reading it as a string is what lets a row carrying one participate at all.
-fn template_without_substitutions(
-    template: &TemplateLiteral,
-    resolve: Resolve<'_, '_>,
+fn template_without_substitutions<'a>(
+    template: &TemplateLiteral<'a>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
     fold_template(template, 0, resolve)
 }
@@ -3208,10 +3299,10 @@ fn template_without_substitutions(
 /// substitution is interpolated with JavaScript's string coercion -- the same rule `%s` follows,
 /// so `` `${[1, 2]}` `` is `1,2` -- which is what [`render_coerce`] already implements. A
 /// substitution referencing anything runtime refuses the whole template, so this never guesses.
-fn fold_template(
-    template: &TemplateLiteral,
+fn fold_template<'a>(
+    template: &TemplateLiteral<'a>,
     depth: u32,
-    resolve: Resolve<'_, '_>,
+    resolve: Resolve<'_, 'a>,
 ) -> Option<String> {
     if depth > MAX_CELL_DEPTH {
         return None;
@@ -3241,7 +3332,7 @@ fn fold_template(
 /// has already evaluated by the time the test body runs, so `-1` in a table is the number -1, and
 /// reading it as one makes rows comparable to each other. It can only cost a match against a
 /// body that writes `-1` inline -- a false negative, never a false positive.
-fn fold_signed_number(expr: &Expression, resolve: Resolve<'_, '_>) -> Option<f64> {
+fn fold_signed_number<'a>(expr: &Expression<'a>, resolve: Resolve<'_, 'a>) -> Option<f64> {
     let Expression::UnaryExpression(unary) = expr else {
         return None;
     };
@@ -3262,5 +3353,6 @@ pub(super) fn source_text(source: &str, span: oxc_span::Span) -> String {
         .to_owned()
 }
 
+pub(super) mod imported_constants;
 #[cfg(test)]
 mod tests;
