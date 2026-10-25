@@ -246,6 +246,63 @@ pub struct Hook {
     /// compare the text, so nothing above this type can tell the difference.
     #[serde(with = "arc_str")]
     pub alpha_source: Arc<str>,
+    /// The control-flow positions this registration sits under, outermost first. Empty for an
+    /// ordinary registration, and serialized only when non-empty: a hook recorded before this
+    /// field existed produces byte-identical JSON, so every `contextKey` already published
+    /// stays where it was.
+    #[serde(default, skip_serializing_if = "HookGuards::is_empty")]
+    pub guards: HookGuards,
+}
+
+/// An owned guard sequence with no allocation and one pointer of inline storage when empty.
+/// Hooks are copied into every test context, so even unused vector capacity metadata costs
+/// retained memory. Nonempty sequences keep their vector behind the optional pointer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(clippy::box_collection)] // The pointer saves two words in every unguarded hook copy.
+pub struct HookGuards(pub(crate) Option<Box<Vec<HookGuard>>>);
+
+impl HookGuards {
+    /// Whether this hook has no conditional registration positions.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl std::ops::Deref for HookGuards {
+    type Target = [HookGuard];
+
+    /// Expose sequence semantics without allowing an allocated empty representation.
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+}
+
+impl From<Vec<HookGuard>> for HookGuards {
+    /// Canonicalize empty input to the allocation-free representation.
+    fn from(guards: Vec<HookGuard>) -> Self {
+        Self((!guards.is_empty()).then(|| Box::new(guards)))
+    }
+}
+
+impl FromIterator<HookGuard> for HookGuards {
+    /// Collect guards in their original outermost-first order.
+    fn from_iter<T: IntoIterator<Item = HookGuard>>(iter: T) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
+impl Serialize for HookGuards {
+    /// Preserve the existing array encoding, including an explicitly serialized empty array.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for HookGuards {
+    /// Normalize an empty JSON array just like a missing, defaulted hook guard field.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<HookGuard>::deserialize(deserializer).map(Into::into)
+    }
 }
 
 /// The lifecycle hooks an extractor recognizes.
@@ -274,6 +331,64 @@ impl HookKind {
             Self::AfterAll => "afterAll",
         }
     }
+}
+
+/// One enclosing control-flow position a hook's registration sits under.
+///
+/// A hook registered inside an `if`/loop/`try`/`switch` body -- or after a `return`/`throw`
+/// that ends its block -- does not simply run for every test its scope governs the way an
+/// unguarded one does, and two hooks whose guards differ can make the same-named tests behave
+/// differently: one registers, the other does not. The guard therefore participates in the
+/// hook's identity, kind and position structurally and, where a condition exists, by its own
+/// source text -- the same raw-text identity [`EachRows::Unreadable`] uses for a table
+/// expression the analyzer does not evaluate. Never a claim about which branch runs: this is
+/// where the registration was written, not an evaluation of whether it will be.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookGuard {
+    /// Where in control flow the registration sits.
+    pub kind: HookGuardKind,
+    /// The guard's own source text, for the guards that have a controlling expression (`if`
+    /// conditions, loop heads, the whole `try` statement for a `catch` handler, and the whole
+    /// `switch` statement for a case body). Structural positions (`try` block, `finally`,
+    /// placement after a terminator) carry none: the kind alone is the identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+}
+
+/// The control-flow positions [`HookGuard`] can describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HookGuardKind {
+    /// Registered in the `consequent` of an `if`.
+    IfConsequent,
+    /// Registered in the `alternate` of an `if`.
+    IfAlternate,
+    /// Registered inside a `for` body. The guard's condition text is the whole loop head --
+    /// initializer, test and update -- because a body that runs zero times under one head can
+    /// run under another with the same test (`for (i = 1; i < 1; ...)` never enters; `i = 0`
+    /// enters once).
+    ForBody,
+    /// Registered inside a `for...in` body.
+    ForInBody,
+    /// Registered inside a `for...of` body.
+    ForOfBody,
+    /// Registered inside a `while` body: never runs when the test is false.
+    WhileBody,
+    /// Registered inside a `do...while` body: runs once before the test is consulted, which is
+    /// why this is not [`HookGuardKind::WhileBody`].
+    DoWhileBody,
+    /// Registered in a `try` block.
+    TryBlock,
+    /// Registered in a `catch` handler.
+    CatchHandler,
+    /// Registered in a `finally` block.
+    FinallyBlock,
+    /// Registered in a `switch` case body.
+    SwitchCase,
+    /// Registered after a `return`, `throw`, `break`, or `continue` among direct siblings in
+    /// the same block: control leaves before the registration can be reached.
+    AfterTerminator,
 }
 
 /// The three normalized views of a function body that rules compare.
@@ -508,7 +623,8 @@ impl Context {
     /// Purely structural and reflexive. It does not consult [`Context::is_comparable`], because a
     /// non-reflexive equivalence would be unusable as a grouping key.
     ///
-    /// It compares every field of [`Context`] except `unresolved`. That is not a style preference:
+    /// It compares every field of [`Context`] except `unresolved` -- hooks by `kind`, body
+    /// digest and guard list, never by `location`. That is not a style preference:
     /// the agreement test only proves what its matrix varies, and it hardcoded `module_setup` and
     /// `config_scope` at their defaults for two releases, so both fields reached `ContextKey`
     /// without reaching this predicate and the test stayed green. A field added to `Context` must
@@ -529,7 +645,11 @@ impl Context {
                 .hooks
                 .iter()
                 .zip(&other.hooks)
-                .all(|(left, right)| left.kind == right.kind && left.body.alpha == right.body.alpha)
+                .all(|(left, right)| {
+                    left.kind == right.kind
+                        && left.body.alpha == right.body.alpha
+                        && left.guards == right.guards
+                })
     }
 }
 
@@ -3204,6 +3324,7 @@ mod tests {
             },
             idempotent: false,
             alpha_source: Arc::from(source),
+            guards: Default::default(),
         }
     }
 
