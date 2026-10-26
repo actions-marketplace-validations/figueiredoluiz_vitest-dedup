@@ -44,8 +44,8 @@ use super::fingerprint::{fingerprint, FunctionLike, RowSubstitution};
 use super::registry::{
     canonicalize_export_name, const_fold, is_ecmascript_trim_whitespace, js_number_to_string,
     js_radix_digits_value, property_key_name, render_js_to_string, resolve_callee, source_text,
-    split_radix_prefix, CellValue, ChainStep, Globals, Registry, ResolvedCallee, Row, RowCells,
-    TitleArg, TitleNumber, OVER_LIMIT_TABLE,
+    split_radix_prefix, CellValue, ChainStep, Globals, ImportedConstants, Registry, ResolvedCallee,
+    Row, RowCells, TitleArg, TitleNumber, OVER_LIMIT_TABLE,
 };
 use super::FileExtraction;
 
@@ -80,7 +80,17 @@ pub(super) fn extract_within(
     globals: Globals,
     root: &Path,
 ) -> FileExtraction {
-    extract_confined(source, file, globals, true, Some(root))
+    extract_confined(source, file, globals, true, Confinement::All(root))
+}
+
+/// [`extract_with_imports`] for a historical file, with resolution confined to `root`.
+pub(super) fn extract_historical_within(
+    source: &str,
+    file: &SourceFile,
+    globals: Globals,
+    root: &Path,
+) -> FileExtraction {
+    extract_confined(source, file, globals, false, Confinement::Proofs(root))
 }
 
 /// Extracts owned declarations under an explicit current-tree or historical import policy.
@@ -90,16 +100,29 @@ pub(super) fn extract_with_imports(
     globals: Globals,
     allow_imported: bool,
 ) -> FileExtraction {
-    extract_confined(source, file, globals, allow_imported, None)
+    extract_confined(source, file, globals, allow_imported, Confinement::None)
 }
 
-/// Shared body of the extraction entry points; `root` confines import resolution when given.
+/// Which resolutions an extraction confines to an analysis root.
+#[derive(Clone, Copy)]
+enum Confinement<'r> {
+    /// None: the library default.
+    None,
+    /// Every resolution.
+    All(&'r Path),
+    /// Only the optional imported-constant proofs: a revision baseline, whose own resolutions
+    /// stay as they were.
+    Proofs(&'r Path),
+}
+
+/// Shared body of the extraction entry points; `confinement` says which resolutions stay inside
+/// the analysis root.
 fn extract_confined(
     source: &str,
     file: &SourceFile,
     globals: Globals,
     allow_imported: bool,
-    root: Option<&Path>,
+    confinement: Confinement,
 ) -> FileExtraction {
     if let Some(reason) = parse_refusal(source) {
         return refused_extraction(ExclusionReason::SourceLimit, reason);
@@ -120,7 +143,13 @@ fn extract_confined(
                 #[cfg(test)]
                 imported::EMISSION_LIMIT_OVERRIDE.with(|limit| limit.set(emission_limit));
                 super::registry::reset_cell_census_file_scope();
-                super::resolver::begin_file(root);
+                match confinement {
+                    Confinement::None => super::resolver::begin_file(None),
+                    Confinement::All(root) => super::resolver::begin_file(Some(root)),
+                    Confinement::Proofs(root) => {
+                        super::resolver::begin_file_with_proof_root(None, Some(root))
+                    }
+                }
                 registration_free::begin_file(globals == Globals::Enabled);
                 let extraction = run(source, file, globals, allow_imported);
                 #[cfg(test)]
@@ -171,7 +200,12 @@ pub(super) const MAX_NESTING_DEPTH: usize = 256;
 /// Independent upper bound on recursion-bearing raw syntax units. It deliberately also counts
 /// text in strings/comments/regexes, so lexical ambiguity cannot hide recursive syntax. Wide or
 /// punctuation-heavy generated inputs may be refused even when their actual syntax is shallow.
-const MAX_RAW_SYNTAX_UNITS: usize = 8_192;
+///
+/// Set three times below the shallowest chain that overflows [`EXTRACTION_STACK_BYTES`] on a debug
+/// build, the larger frames of the two: an assignment chain overflows from about 114,800 units
+/// (release from about 245,000). At this value every chain class completes, and the slowest, a
+/// call chain, which the parser handles in quadratic time, takes a few seconds.
+const MAX_RAW_SYNTAX_UNITS: usize = 36_864;
 
 /// Checks every production parser entry before Oxc sees source. No JS tokenization or recursion.
 /// Keywords cover bracket-free unary/control/type chains; punctuation covers calls, member and
@@ -496,7 +530,9 @@ fn run(source: &str, file: &SourceFile, globals: Globals, allow_imported: bool) 
         let mut registry = Registry::new(program, globals);
         let mut walker = Walker::new(source, file, program, semantic, globals);
         walker.allow_imported = allow_imported;
+        walker.prepare_imported_constants(&allocator);
         walker.walk_statements(&program.body, &mut registry);
+        walker.finish_imported_constants();
         if !walker.helper_setup.is_empty() {
             for case in &mut walker.tests {
                 case.context
@@ -811,7 +847,8 @@ fn is_nuxt_mock_call(
 ///   `vi.mock` is modelled -- the original defect this arm exists to stop repeating -- put one
 ///   test's runtime-only mock into every other test's `Context`.
 /// - **A specifier that is not a readable string literal** (A3), or **a `vi.mock` factory that is
-///   present but is not an inline arrow/function** (A4): recording nothing would be
+///   present but is neither an inline arrow/function nor the bounded `{ spy: true }` options
+///   object** (A4): recording nothing would be
 ///   indistinguishable from a file with no mock at all.
 /// - **A hoisted member called somewhere other than module top level** -- inside a `describe`, a
 ///   test body, an `if`. Vitest 5 refuses to run such a file at all: its `vitest:mocks` plugin
@@ -856,6 +893,23 @@ fn collect_mocked_modules(
         (!body.class_unresolved).then(|| MockFactory::Factory(body.into_alpha_source()))
     }
 
+    /// Prove that an options value selects spying without evaluating user code or admitting
+    /// overrides: one own, noncomputed data property named `spy`, whose value is literal true.
+    fn is_spy_options(argument: &Argument<'_>) -> bool {
+        let Argument::ObjectExpression(options) = argument else {
+            return false;
+        };
+        let [ObjectPropertyKind::ObjectProperty(property)] = options.properties.as_slice() else {
+            return false;
+        };
+        !property.computed
+            && !property.method
+            && !property.shorthand
+            && property.kind == oxc_ast::ast::PropertyKind::Init
+            && property_key_name(&property.key).as_deref() == Some("spy")
+            && matches!(&property.value, Expression::BooleanLiteral(literal) if literal.value)
+    }
+
     /// The member name of a `vi.<mock|unmock|doMock|doUnmock>(...)` call, or `None` for any other
     /// call. Shared by both passes so "is this a mocking call" is decided in exactly one place --
     /// a second, subtly different predicate in the nesting pass would let a call be modelled by
@@ -869,7 +923,14 @@ fn collect_mocked_modules(
     ) -> Option<String> {
         // Only the root and the last member matter here; never read a `.each` table's rows.
         registry.limit_table_rows(0);
-        let resolved = resolve_callee(&call.callee, registry, semantic, source, file)?;
+        let resolved = resolve_callee(
+            &call.callee,
+            registry,
+            semantic,
+            &ImportedConstants::default(),
+            source,
+            file,
+        )?;
         if resolved.root != "vi" {
             return None;
         }
@@ -907,6 +968,10 @@ fn collect_mocked_modules(
                     let factory = match call.arguments.get(1) {
                         // No second argument at all: a real automock.
                         None => MockFactory::Automock,
+                        // Options are a distinct mode, never a function factory or automock.
+                        Some(argument) if call.arguments.len() == 2 && is_spy_options(argument) => {
+                            MockFactory::Spy
+                        }
                         // A4: an imported or computed factory (identifier, call, member
                         // expression, ...) is not automock and must never be treated as one.
                         Some(argument) => read_factory(argument, semantic, source, file)
@@ -1104,6 +1169,88 @@ struct Fallthrough {
     label_target: Option<String>,
 }
 
+/// The exits one statement can take, outside nested functions and literal-dead branches.
+#[derive(Default)]
+struct ExitDestinations<'s> {
+    source: &'s str,
+    /// See [`Walker::throw_fails_file`]: such a throw skips no registration a test could
+    /// observe, so it is no exit here.
+    ignore_throws: bool,
+    local_labels: Vec<String>,
+    label: Option<String>,
+    mixed: bool,
+    escapes: bool,
+    /// Any reachable `return`, `break` or `continue`, local or not.
+    jumped: bool,
+}
+
+impl ExitDestinations<'_> {
+    /// Local destinations stay inside this statement; external names share one target only
+    /// when every observed jump agrees. Unlabeled jumps have no named destination.
+    fn record_jump(&mut self, label: &Option<LabelIdentifier<'_>>) {
+        self.jumped = true;
+        if let Some(label) = label {
+            let target = label.name.as_str();
+            if self.local_labels.iter().any(|local| local == target) {
+                return;
+            }
+            self.escapes = true;
+            if self.label.as_deref().is_some_and(|prior| prior != target) {
+                self.mixed = true;
+            } else {
+                self.label = Some(target.to_owned());
+            }
+        } else {
+            self.mixed = true;
+        }
+    }
+}
+
+impl<'a> Visit<'a> for ExitDestinations<'_> {
+    /// Records jumps and exits; a literal condition visits only the arm it selects.
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        match statement {
+            Statement::BreakStatement(jump) => self.record_jump(&jump.label),
+            Statement::ThrowStatement(_) if self.ignore_throws => {}
+            Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
+                self.jumped |= matches!(statement, Statement::ReturnStatement(_));
+                self.mixed = true;
+                self.escapes = true;
+            }
+            Statement::ContinueStatement(jump) => self.record_jump(&jump.label),
+            Statement::LabeledStatement(labeled) => {
+                self.local_labels
+                    .push(labeled.label.name.as_str().to_owned());
+                self.visit_statement(&labeled.body);
+                self.local_labels.pop();
+            }
+            Statement::IfStatement(branch) => {
+                let span = branch.test.span();
+                match self.source.get(span.start as usize..span.end as usize) {
+                    Some("true") => self.visit_statement(&branch.consequent),
+                    Some("false") => {
+                        if let Some(alternate) = &branch.alternate {
+                            self.visit_statement(alternate);
+                        }
+                    }
+                    _ => walk::walk_statement(self, statement),
+                }
+            }
+            _ => walk::walk_statement(self, statement),
+        }
+    }
+
+    /// A nested function's exits leave that function, not this statement.
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    /// A nested arrow's exits leave that arrow, not this statement.
+    fn visit_arrow_function_expression(
+        &mut self,
+        _arrow: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
 /// One enclosing registration position and its optional raw controlling expression.
 #[derive(Clone)]
 struct PendingGuard {
@@ -1278,6 +1425,9 @@ struct Walker<'a> {
     /// zero-test outcome, so `main.rs`'s "extracted no tests" guard can name the real cause
     /// instead of always blaming `test.globals`.
     proven_empty_tables: usize,
+    /// Value imports proved to hold a scalar literal when this file's table cells read them; see
+    /// [`Walker::prepare_imported_constants`]. Proves nothing in an imported helper's frame.
+    imported_constants: ImportedConstants<'a>,
 }
 
 impl<'a> Walker<'a> {
@@ -1349,6 +1499,7 @@ impl<'a> Walker<'a> {
             #[cfg(test)]
             helper_refusal_taint_visits: 0,
             proven_empty_tables: 0,
+            imported_constants: ImportedConstants::default(),
         }
     }
 
@@ -1461,6 +1612,7 @@ impl<'a> Walker<'a> {
             callee,
             registry,
             self.semantic,
+            &self.imported_constants,
             self.source,
             &self.file.path,
         )
@@ -1662,7 +1814,7 @@ impl<'a> Walker<'a> {
                 self.label_stack.pop();
             }
             Statement::ThrowStatement(_) => {
-                if !self.guards_prove_unreachable() {
+                if !self.guards_prove_unreachable() && !self.throw_fails_file() {
                     for frame in &mut self.helper_frames {
                         frame.saw_throw = true;
                     }
@@ -1858,9 +2010,7 @@ impl<'a> Walker<'a> {
             }
             if self.always_terminates(statement) {
                 terminated = true;
-                terminal_exit = self
-                    .exit_escapes(statement)
-                    .then(|| self.residual_exit_targets(statement).0);
+                terminal_exit = self.terminal_exit(statement);
             } else if let Statement::IfStatement(if_statement) = statement {
                 // Exactly one branch always leaves: every later statement runs only through the
                 // branch that falls through -- the implicit alternate when the consequent
@@ -1877,17 +2027,19 @@ impl<'a> Walker<'a> {
                 match test.as_str() {
                     "true" if consequent_leaves => {
                         terminated = true;
-                        terminal_exit = self
-                            .exit_escapes(statement)
-                            .then(|| self.residual_exit_targets(statement).0);
+                        terminal_exit = self.terminal_exit(statement);
                     }
                     "false" if alternate_leaves => {
                         terminated = true;
-                        terminal_exit = self
-                            .exit_escapes(statement)
-                            .then(|| self.residual_exit_targets(statement).0);
+                        terminal_exit = self.terminal_exit(statement);
                     }
                     "true" | "false" => {}
+                    _ if consequent_leaves && self.only_throws(&if_statement.consequent) => {}
+                    _ if alternate_leaves
+                        && if_statement
+                            .alternate
+                            .as_ref()
+                            .is_some_and(|alternate| self.only_throws(alternate)) => {}
                     _ if consequent_leaves => {
                         let (label_target, escapes) =
                             self.residual_exit_targets(&if_statement.consequent);
@@ -1935,6 +2087,14 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// The exit an unconditional terminator leaves its list through: its label target, if
+    /// known, when it can escape the current construct. `None` when it cannot escape, or when it
+    /// only throws an exception that fails the file (see [`Self::only_throws`]).
+    fn terminal_exit(&self, statement: &Statement<'a>) -> Option<Option<String>> {
+        (self.exit_escapes(statement) && !self.only_throws(statement))
+            .then(|| self.residual_exit_targets(statement).0)
+    }
+
     /// Record an observed escaping path until its known label or function boundary ends.
     fn record_exit_target(&mut self, target: Option<String>) {
         let scope = self.hook_scopes.last_mut().expect("root hook scope");
@@ -1943,6 +2103,55 @@ impl<'a> Walker<'a> {
         } else {
             scope.exit_unexpressible = true;
         }
+    }
+
+    /// Whether a `throw` at the current position fails the whole file. Vitest 5 fails a file on
+    /// any collection-time throw nothing catches -- no test runs, earlier or later -- so such a
+    /// throw cannot leave a test running without a hook and guards nothing. Uncaught means no
+    /// `try` position on the guard stack: the stack continues through helper expansion and
+    /// imported runners, where a caller's `try` does catch, and restarts at each suite callback,
+    /// which Vitest runs after the enclosing `try` has finished. A `finally`-only `try` counts
+    /// as catching, which refuses more than needed.
+    fn throw_fails_file(&self) -> bool {
+        !self.guards.iter().any(|guard| {
+            matches!(
+                guard.kind,
+                HookGuardKind::TryBlock | HookGuardKind::CatchHandler | HookGuardKind::FinallyBlock
+            )
+        })
+    }
+
+    /// Whether an arm that always terminates ends only by a throw that fails the file: no
+    /// reachable `return`, `break` or `continue` outside nested functions, so taking it runs no
+    /// test.
+    fn only_throws(&self, arm: &Statement<'a>) -> bool {
+        self.throw_fails_file() && !self.exit_destinations(arm).jumped
+    }
+
+    /// Summarize possible exits once: their common label target, if known, and whether any
+    /// can escape the current construct. Literal-unreachable branches and nested functions
+    /// contribute no exits; unknown conditions retain both paths.
+    fn residual_exit_targets(&self, statement: &Statement<'a>) -> (Option<String>, bool) {
+        let destinations = self.exit_destinations(statement);
+        (
+            if destinations.mixed {
+                None
+            } else {
+                destinations.label
+            },
+            destinations.escapes,
+        )
+    }
+
+    /// Walks one statement's reachable exits; see [`ExitDestinations`].
+    fn exit_destinations(&self, statement: &Statement<'a>) -> ExitDestinations<'a> {
+        let mut destinations = ExitDestinations {
+            source: self.source,
+            ignore_throws: self.throw_fails_file(),
+            ..ExitDestinations::default()
+        };
+        destinations.visit_statement(statement);
+        destinations
     }
 
     /// These recorded positions are already known unreachable; no general condition folding
@@ -1954,92 +2163,6 @@ impl<'a> Walker<'a> {
             HookGuardKind::IfAlternate => guard.text.as_deref() == Some("true"),
             _ => false,
         })
-    }
-
-    /// Summarize possible exits once: their common label target, if known, and whether any
-    /// can escape the current construct. Literal-unreachable branches and nested functions
-    /// contribute no exits; unknown conditions retain both paths.
-    fn residual_exit_targets(&self, statement: &Statement<'a>) -> (Option<String>, bool) {
-        #[derive(Default)]
-        struct Destinations<'s> {
-            source: &'s str,
-            local_labels: Vec<String>,
-            label: Option<String>,
-            mixed: bool,
-            escapes: bool,
-        }
-        impl Destinations<'_> {
-            /// Local destinations stay inside this statement; external names share one target
-            /// only when every observed jump agrees. Unlabeled jumps have no named destination.
-            fn record_jump(&mut self, label: &Option<LabelIdentifier<'_>>) {
-                if let Some(label) = label {
-                    let target = label.name.as_str();
-                    if self.local_labels.iter().any(|local| local == target) {
-                        return;
-                    }
-                    self.escapes = true;
-                    if self.label.as_deref().is_some_and(|prior| prior != target) {
-                        self.mixed = true;
-                    } else {
-                        self.label = Some(target.to_owned());
-                    }
-                } else {
-                    self.mixed = true;
-                }
-            }
-        }
-        impl<'a> Visit<'a> for Destinations<'_> {
-            fn visit_statement(&mut self, statement: &Statement<'a>) {
-                match statement {
-                    Statement::BreakStatement(jump) => self.record_jump(&jump.label),
-                    Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
-                        self.mixed = true;
-                        self.escapes = true;
-                    }
-                    Statement::ContinueStatement(jump) => self.record_jump(&jump.label),
-                    Statement::LabeledStatement(labeled) => {
-                        self.local_labels
-                            .push(labeled.label.name.as_str().to_owned());
-                        self.visit_statement(&labeled.body);
-                        self.local_labels.pop();
-                    }
-                    Statement::IfStatement(branch) => {
-                        let span = branch.test.span();
-                        match self.source.get(span.start as usize..span.end as usize) {
-                            Some("true") => self.visit_statement(&branch.consequent),
-                            Some("false") => {
-                                if let Some(alternate) = &branch.alternate {
-                                    self.visit_statement(alternate);
-                                }
-                            }
-                            _ => walk::walk_statement(self, statement),
-                        }
-                    }
-                    _ => walk::walk_statement(self, statement),
-                }
-            }
-
-            fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-
-            fn visit_arrow_function_expression(
-                &mut self,
-                _arrow: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-            ) {
-            }
-        }
-        let mut destinations = Destinations {
-            source: self.source,
-            ..Destinations::default()
-        };
-        destinations.visit_statement(statement);
-        (
-            if destinations.mixed {
-                None
-            } else {
-                destinations.label
-            },
-            destinations.escapes,
-        )
     }
 
     /// Whether executing this statement ends the execution its enclosing list was promised,
@@ -7772,8 +7895,9 @@ mod tests {
         tests
     }
 
-    /// A helper's local return does not govern later caller hooks; guarded registrations and
-    /// throws still refuse comparison. The same sources run in the owned runtime corpus.
+    /// A helper's local return, or a throw nothing catches, does not govern later caller hooks;
+    /// guarded registrations and a throw under the caller's `try` still refuse comparison. The
+    /// same sources run in the owned runtime corpus.
     #[test]
     fn helper_exit_hook_boundaries() {
         for (source, unresolved) in [
@@ -7782,7 +7906,17 @@ mod tests {
                 false,
             ),
             (
-                include_str!("../../fixtures/recall/helper-throw-hook-uncertainty/run.test.ts"),
+                include_str!("../../fixtures/recall/helper-throw-hook-retention/run.test.ts"),
+                false,
+            ),
+            (
+                include_str!("../../fixtures/recall/collection-throw-hook-retention/run.test.ts"),
+                false,
+            ),
+            (
+                include_str!(
+                    "../../fixtures/recall/caught-helper-throw-hook-uncertainty/run.test.ts"
+                ),
                 true,
             ),
             (
@@ -7839,7 +7973,8 @@ mod tests {
         }
         for (helper, unresolved) in [
             ("function inner(skip) { if (skip) return }\nfunction finish(skip) { inner(skip); return }", false),
-            ("function inner(skip) { if (skip) throw new Error('stop') }\nfunction finish(skip) { inner(skip); return }", true),
+            ("function inner(skip) { if (skip) throw new Error('stop') }\nfunction finish(skip) { inner(skip); return }", false),
+            ("function inner(skip) { if (skip) throw new Error('stop') }\nfunction finish(skip) { try { inner(skip) } finally {} return }", true),
             ("function finish(skip) { if (skip) return; beforeEach(() => { state.n = 1 }) }", true),
         ] {
             let source = source.replace("function finish(skip) {\n  if (skip) return\n}", helper);
@@ -7925,7 +8060,8 @@ mod tests {
             ("stop: { if (enabled) break stop; beforeEach(() => { state.n = 1 }) }", true),
             ("outer: { stop: { if (enabled) break outer } beforeEach(() => { state.n = 1 }) }", true),
             ("stop: { if (enabled) { if (enabled) return; break stop } }", true),
-            ("stop: { if (enabled) { if (enabled) throw new Error('stop'); break stop } }", true),
+            ("stop: { if (enabled) { if (enabled) throw new Error('stop'); break stop } }", false),
+            ("stop: { if (enabled) { try { if (enabled) throw new Error('stop') } finally {} break stop } }", true),
             ("outer: { stop: { if (enabled) { if (enabled) break outer; break stop } } }", true),
             ("stop: { if (enabled) { for (;;) { break } break stop } }", true),
             ("stop: { if (enabled) { for (const x of []) { continue } break stop } }", true),
@@ -7972,7 +8108,8 @@ mod tests {
             ("for (const n of [1]) { if (enabled) return; continue }", "", true),
             ("switch (true) { case true: if (enabled) return; else break }", "", true),
             ("switch (true) { case true: if (enabled) break; else return }", "", true),
-            ("switch (true) { case true: if (enabled) throw new Error('stop'); break }", "", true),
+            ("switch (true) { case true: if (enabled) throw new Error('stop'); break }", "", false),
+            ("switch (true) { case true: try { if (enabled) throw new Error('stop') } finally {} break }", "", true),
             ("stop: { for (const n of [1]) { if (enabled) { try { break stop } finally {} } }", "}", true),
             ("stop: { for (const n of [1]) { break stop }", "}", true),
             ("outer: for (const n of [1]) { for (const m of [1]) { if (enabled) { try { continue outer } finally {} } }", "}", true),
@@ -7990,12 +8127,14 @@ mod tests {
             ("function finish() { if (false) throw new Error('stop'); return } finish()", "", false),
             ("function finish() { return; throw new Error('stop') } finish()", "", false),
             ("function finish() { if (true) return; else throw new Error('stop') } finish()", "", false),
-            ("function finish() { if (false) return; else throw new Error('stop') } finish()", "", true),
+            ("function finish() { if (false) return; else throw new Error('stop') } finish()", "", false),
+            ("function finish() { if (false) return; else throw new Error('stop') } try { finish() } finally {}", "", true),
             ("for (const n of [1]) { inner: { break inner } break }", "", false),
             ("for (const n of [1]) { inner: for (const m of [1]) { continue inner } break }", "", false),
             ("if (enabled) { stop: { if (enabled) break stop } }", "", false),
             ("function finish() { if (enabled) return } stop: { for (const n of [1]) { finish(); break stop } }", "", false),
-            ("function fail() { if (enabled) throw new Error('stop') } stop: { for (const n of [1]) { fail(); break stop } }", "", true),
+            ("function fail() { if (enabled) throw new Error('stop') } stop: { for (const n of [1]) { fail(); break stop } }", "", false),
+            ("function fail() { if (enabled) throw new Error('stop') } stop: { for (const n of [1]) { try { fail() } finally {} break stop } }", "", true),
             ("function finish() { stop: {} } stop: { for (const n of [1]) { if (enabled) break stop } finish();", "}", true),
         ] {
             for named in [false, true] {
@@ -8022,8 +8161,8 @@ mod tests {
                 false,
             ),
             (
-                include_str!("../../fixtures/recall/helper-plain-throw-uncertainty/run.test.ts"),
-                true,
+                include_str!("../../fixtures/recall/helper-plain-throw-retention/run.test.ts"),
+                false,
             ),
             (
                 include_str!("../../fixtures/recall/helper-plain-return-retention/run.test.ts"),
@@ -8991,8 +9130,8 @@ mod tests {
              "const LEVELS = { high: 3 };\nconfigure(LEVELS);\ntest.each([[LEVELS.high]])('n %d', () => {});"),
             ("a const object aliased",
              "const LEVELS = { high: 3 }; const other = LEVELS; test.each([[LEVELS.high]])('n %d', () => {});"),
-            // Destructured and imported bindings: the declaration is not a `const` declarator
-            // with a plain identifier pattern.
+            // Destructured and unresolved imported bindings: the declaration is not a `const`
+            // declarator with a plain identifier pattern, and `./mode` does not exist.
             ("a destructured const", "const { a } = { a: 1 }; test.each([[a]])('%s', () => {});"),
             // Copilot review, PR #28 round 4, premise verified in node: the table evaluates
             // where it is written, so a cell read of a const declared LATER is a TDZ
@@ -9361,6 +9500,72 @@ mod tests {
         assert_eq!(extraction.tests.len(), 1, "expected one declaration");
         let test = extraction.tests.into_iter().next().expect("one");
         (test.context.mocked_modules, test.context.unresolved)
+    }
+
+    /// Spy options select an explicit mode, survive last-wins folding and serialize distinctly.
+    #[test]
+    fn spy_options_identity_and_registration_order() {
+        for (setup, expected) in [
+            ("vi.mock('./m', { spy: true });", Some(MockFactory::Spy)),
+            ("vi.mock('./m', { 'spy': true });", Some(MockFactory::Spy)),
+            (
+                "vi.mock('./m'); vi.mock('./m', { spy: true });",
+                Some(MockFactory::Spy),
+            ),
+            (
+                "vi.mock('./m', { spy: true }); vi.mock('./m');",
+                Some(MockFactory::Automock),
+            ),
+            ("vi.mock('./m', { spy: true }); vi.unmock('./m');", None),
+        ] {
+            let (modules, unresolved) = mock_context(&format!(
+                "import {{ vi }} from 'vitest'; {setup} test('x', () => {{}});"
+            ));
+            assert!(!unresolved, "{setup}");
+            assert_eq!(modules.len(), usize::from(expected.is_some()), "{setup}");
+            assert_eq!(
+                modules.first().map(|module| &module.factory),
+                expected.as_ref(),
+                "{setup}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&MockFactory::Spy).unwrap(),
+            r#""Spy""#
+        );
+        assert_eq!(
+            serde_json::from_str::<MockFactory>(r#""Spy""#).unwrap(),
+            MockFactory::Spy
+        );
+    }
+
+    /// Unsupported options and registration positions cannot become eligible spy contexts.
+    #[test]
+    fn spy_options_reject_unproved_values_and_unsupported_sites() {
+        for setup in [
+            "vi.mock('./m', { spy: false });",
+            "vi.mock('./m', {});",
+            "vi.mock('./m', { spy: Boolean(true) });",
+            "vi.mock('./m', { ['spy']: true });",
+            "vi.mock('./m', { spy: true, ...more });",
+            "vi.mock('./m', { ...more, spy: true });",
+            "vi.mock('./m', { spy: true, extra: touch() });",
+            "vi.mock('./m', { spy: true, spy: false });",
+            "vi.mock('./m', { get spy() { return true } });",
+            "vi.mock('./m', { spy() { return true } });",
+            "vi.mock('./m', { spy });",
+            "vi.mock('./m', options);",
+            "vi.mock('./m', { spy: true }, extra);",
+            "vi.mock('./m', { spy: true }, ...extra);",
+            "vi.mock(specifier, { spy: true });",
+            "vi.doMock('./m', { spy: true });",
+            "if (true) vi.mock('./m', { spy: true });",
+        ] {
+            let (_, unresolved) = mock_context(&format!(
+                "import {{ vi }} from 'vitest'; {setup} test('x', () => {{}});"
+            ));
+            assert!(unresolved, "{setup}");
+        }
     }
 
     /// Check declaration extraction: a mocking call this extractor cannot read taints the whole
@@ -10203,3 +10408,7 @@ mod budget_tests;
 #[cfg(test)]
 #[path = "extract/tests/registration_free.rs"]
 mod registration_free_tests;
+
+#[cfg(test)]
+#[path = "extract/tests/imported_constants.rs"]
+mod imported_constants_tests;

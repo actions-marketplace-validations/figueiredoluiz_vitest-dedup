@@ -112,7 +112,7 @@ alone. Past the cap the files with the fewest excluded tests are left out of the
 | `helper-setup-effects` | An imported runner or a module on its chain has setup, fixture or module effects that were not proved inert, and the call could not be proved to register nothing. |
 | `helper-effects-unproved` | A call, argument or parameter write inside an imported runner has unproved effects. |
 | `helper-limit` | A helper expansion budget, recursion or depth limit was reached. |
-| `helper-sources-unavailable` | Helper bodies are unavailable in a historical revision baseline. |
+| `helper-sources-unavailable` | Helper bodies, or the imported constants a table cell reads, are unavailable in a historical revision baseline. |
 | `runner-mocked` | The runner, or a module on its re-export chain, is mocked or mocking is unresolved. |
 | `unsupported-expression` | A title, callback, option or registration expression is outside the supported shapes. |
 | `mock-factory-unreadable` | A `vi.mock` factory could not be read. |
@@ -134,7 +134,7 @@ alone. Past the cap the files with the fewest excluded tests are left out of the
 ## Source limits
 
 Source files are limited to 8 MiB. Before parsing, the frontend also refuses lexical bracket
-nesting deeper than 256 and more than 8,192 raw syntax units.
+nesting deeper than 256 and more than 36,864 raw syntax units.
 
 - The units count opening brackets, operator, member, label and escape punctuation, and recursive
   control and type keywords, including occurrences in strings, comments and regexes.

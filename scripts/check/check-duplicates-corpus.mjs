@@ -508,12 +508,13 @@ const DELIBERATE_BLIND_FILES = new Set([
   // row that supports its shape lands, and leaves this list in the same change.
   'recall/framework-auto-import-in-helper/unknown.test.ts',
   'recall/framework-auto-import-ungenerated-control/known.test.ts',
-  'recall/framework-hook-helper-server/orders.test.ts',
   'recall/framework-package-mock-call-uninstalled/users.test.ts',
   // `mockNuxtImport` factories that must stay refused: a redeclared `var` whose later value registers,
   // and a counter a hook increments (identical tests that observe different values).
   'recall/framework-nuxt-mock-redeclared-binding/run.test.ts',
   'recall/framework-nuxt-mock-accumulating-hook/count.test.ts',
+  // Deliberately dynamic spy options remain unreadable; the recall case pins both excluded tests.
+  'recall/mock-spy-options-unreadable/unknown.test.ts',
   // A local overloaded helper reassigned before the call: refused on purpose.
   'recall/local-helper-overloaded-reassigned/run.test.ts',
   // Hooks registered under control flow make their scope's contexts incomparable by design
@@ -522,13 +523,12 @@ const DELIBERATE_BLIND_FILES = new Set([
   'recall/guarded-hook-differing/run.test.ts',
   'recall/guarded-hook-identical/run.test.ts',
   'recall/guarded-hook-named-exit/run.test.ts',
-  'recall/helper-throw-hook-uncertainty/run.test.ts',
   'recall/nested-hook-after-exit-uncertainty/run.test.ts',
   'recall/labeled-return-hook-uncertainty/run.test.ts',
   'recall/guarded-return-before-break/run.test.ts',
   'recall/labeled-return-before-break/run.test.ts',
   'recall/braceless-return-hook-uncertainty/run.test.ts',
-  'recall/helper-plain-throw-uncertainty/run.test.ts',
+  'recall/caught-helper-throw-hook-uncertainty/run.test.ts',
   'recall/helper-guarded-hook-uncertainty/run.test.ts',
   'recall/concise-suite-guarded-hook-uncertainty/run.test.ts',
   // A local helper reassigned with no overload signature: refused for the reassignment alone.
@@ -538,6 +538,18 @@ const DELIBERATE_BLIND_FILES = new Set([
   'recall/framework-runner-default-imported-negative/slugs.test.ts',
   'recall/framework-runner-default-let-negative/slugs.test.ts',
   'recall/framework-runner-default-reassigned-negative/slugs.test.ts',
+  // A runner module whose non-`declare` namespace registers a hook at import: blind on purpose,
+  // permanently, as the control for admitting ambient declarations on a runner's chain.
+  'recall/framework-runner-namespace-hook-negative/observe.test.ts',
+  'recall/framework-runner-namespace-hook-negative/slugs.test.ts',
+  // A runner module that switches to fake timers at import: blind on purpose, permanently, as the
+  // control for admitting module-local values on a runner's chain.
+  'recall/framework-runner-fake-timers-negative/observe.test.ts',
+  'recall/framework-runner-fake-timers-negative/slugs.test.ts',
+  // A runner module whose destructured getter registers a test at import: blind on purpose.
+  'recall/framework-runner-getter-value-negative/slugs.test.ts',
+  // A runner whose imported module mocks a module at load: blind on purpose, permanently.
+  'recall/framework-runner-import-time-mock-negative/slugs.test.ts',
 ])
 
 /**

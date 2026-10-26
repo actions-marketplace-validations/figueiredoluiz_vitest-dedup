@@ -69,7 +69,14 @@ it refuses the outer runner. Recursion through modules or local helpers is refus
 - A default export of a name that is not a readable runner in the same file: an imported binding
   (a further hop), a class or other value, a `const` declared after the export statement, or a function declaration
   the module reassigns.
-- Module setup effects.
+- Module setup effects. TypeScript ambient declarations (`declare module`, `declare global`,
+  `declare namespace`, `declare enum`) are erased before the module runs and are not effects.
+  Creating a module-local value is not an effect either: literals, functions, object literals
+  without getters, setters or `__proto__`, array literals, and classes whose static fields hold
+  such values, bound to a plain name. Creating these calls no function. Any call or `new` at
+  import refuses the runner, including `vi.fn()` and `new Set()`: a setup file may have replaced
+  the function, and calls such as `vi.stubEnv`, `vi.mock`, `vi.useFakeTimers` or `expect.extend`
+  change what the importing file's own tests observe.
 - Called opaque imports at registration time. Uncalled imports and calls inside test callbacks are
   not registration candidates.
 - Named or default object method calls as runner candidates, and function `.call()` / `.apply()`
@@ -167,7 +174,9 @@ and a helper that registers anything are refused as before.
 Importing a module runs it, called or not. Module dependencies must be Vitest, the validated named
 re-export chain, or first-party modules that are inert or that provably register nothing (see
 [Setup helpers](#setup-helpers)); effects other than registration at import time are accepted and
-are attributed through the runner's identity. Unknown dependency or setup effects, and helper
+are attributed through the runner's identity. A module that uses `vi` or `expect` while it loads
+(`vi.mock`, `vi.stubEnv`, `vi.fn()`, `expect.extend`, ...) is not: that effect reaches every test in
+the calling file, not only the runner's. Unknown dependency or setup effects, and helper
 mocking effects, mark the entire calling file unresolved.
 
 ### What a refusal does
@@ -205,7 +214,7 @@ generated list are not read.
   and a 64 MiB parser stack, so a large bundle is read and a script that crashes or hangs the parser
   refuses only its package; a worker that cannot be started, times out, crashes or answers anything but
   a complete verdict refuses it too. A program that embeds the library gets an in-process scan instead,
-  which refuses a script past the parser's syntax size budget (8,192 units) unread, unless it calls
+  which refuses a script past the parser's syntax size budget (36,864 units) unread, unless it calls
   `frontend::use_package_worker` and runs `frontend::run_package_worker` first in `main`.
 - Worker stdout is read within the same deadline as its exit, with at most 256 bytes accepted.
   A descendant holding stdout open cannot extend that deadline. On Unix a failed read kills the

@@ -283,6 +283,10 @@ thread_local! {
     /// The analysis root the current extraction confines tsconfig-derived resolutions to.
     static ANALYSIS_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 
+    /// The root [`quietly`] lookups are confined to: the analysis root, or for a revision
+    /// baseline, which resolves unconfined, the root its optional proofs must stay inside.
+    static PROOF_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+
     /// Resolutions refused by confinement during the current extraction.
     static REFUSALS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 
@@ -290,6 +294,24 @@ thread_local! {
     /// why this is the mechanism that keeps resolution from being paid for on every test body
     /// rather than once per specifier actually written in a file.
     static CACHE: RefCell<HashMap<(PathBuf, String), Resolved>> = RefCell::new(HashMap::new());
+
+    /// Set inside [`quietly`]: a confinement refusal is neither recorded nor memoized.
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `body` with failures unrecorded (confinement refusals and resolution gaps): for an
+/// optional lookup whose failure must not mark the file incomplete or report a prerequisite. A
+/// failed result is not memoized either, so a later lookup that needs the module records it.
+pub(super) fn quietly<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        /// Restores the enclosing setting, also when `body` panics.
+        fn drop(&mut self) {
+            QUIET.with(|quiet| quiet.set(self.0));
+        }
+    }
+    let _restore = Restore(QUIET.with(|quiet| quiet.replace(true)));
+    body()
 }
 
 /// Builds a worker resolver with parser-supported extensions, `module`/`import` conditions,
@@ -353,20 +375,32 @@ pub(super) enum Resolved {
 /// operational degradation stays visible as an under-match, never a crash.
 pub(super) fn resolve(importing_file: &Path, specifier: &str) -> Resolved {
     let key = (importing_file.to_path_buf(), specifier.to_owned());
+    let quiet = QUIET.with(std::cell::Cell::get);
     if let Some(cached) = CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
-        return cached;
+        // A memo made unconfined (a revision baseline's own lookups) still answers a quiet
+        // lookup only inside the proof root.
+        return if quiet {
+            confine_resolution(importing_file, specifier, cached)
+        } else {
+            cached
+        };
     }
     let resolved =
         RESOLVER.with(
             |resolver| match resolver.resolve_file(importing_file, specifier) {
                 Ok(resolution) => Resolved::Module(resolution.into_path_buf()),
                 Err(error) => {
-                    record_failure(importing_file, specifier, &error);
+                    if !quiet {
+                        record_failure(importing_file, specifier, &error);
+                    }
                     Resolved::Unresolved
                 }
             },
         );
     let resolved = confine_resolution(importing_file, specifier, resolved);
+    if quiet && resolved == Resolved::Unresolved {
+        return resolved;
+    }
     CACHE.with(|cache| {
         cache.borrow_mut().insert(key, resolved.clone());
     });
@@ -377,6 +411,13 @@ pub(super) fn resolve(importing_file: &Path, specifier: &str) -> Resolved {
 /// earlier file's memoized results and refusals. Each extraction runs on its own worker thread,
 /// so in production there is nothing to forget; the reset keeps direct callers honest.
 pub(super) fn begin_file(root: Option<&Path>) {
+    begin_file_with_proof_root(root, root);
+}
+
+/// [`begin_file`] for a file whose own resolutions are confined to `root` while its [`quietly`]
+/// lookups are confined to `proof_root`.
+pub(super) fn begin_file_with_proof_root(root: Option<&Path>, proof_root: Option<&Path>) {
+    PROOF_ROOT.with(|slot| *slot.borrow_mut() = proof_root.map(Path::to_path_buf));
     ANALYSIS_ROOT.with(|slot| *slot.borrow_mut() = root.map(Path::to_path_buf));
     REFUSALS.with(|refusals| refusals.borrow_mut().clear());
     CACHE.with(|cache| cache.borrow_mut().clear());
@@ -392,7 +433,12 @@ fn confine_resolution(importing_file: &Path, specifier: &str, resolved: Resolved
     let Resolved::Module(path) = &resolved else {
         return resolved;
     };
-    let Some(root) = ANALYSIS_ROOT.with(|slot| slot.borrow().clone()) else {
+    let confining = if QUIET.with(std::cell::Cell::get) {
+        &PROOF_ROOT
+    } else {
+        &ANALYSIS_ROOT
+    };
+    let Some(root) = confining.with(|slot| slot.borrow().clone()) else {
         return resolved;
     };
     if crate::confine::contains(&root, path) {
@@ -409,12 +455,14 @@ fn confine_resolution(importing_file: &Path, specifier: &str, resolved: Resolved
         "import `{specifier}` resolves outside the analysis root through the tsconfig and was \
          not read"
     );
-    REFUSALS.with(|refusals| {
-        let mut refusals = refusals.borrow_mut();
-        if !refusals.contains(&message) {
-            refusals.push(message);
-        }
-    });
+    if !QUIET.with(std::cell::Cell::get) {
+        REFUSALS.with(|refusals| {
+            let mut refusals = refusals.borrow_mut();
+            if !refusals.contains(&message) {
+                refusals.push(message);
+            }
+        });
+    }
     Resolved::Unresolved
 }
 
@@ -724,6 +772,43 @@ mod tests {
         assert_eq!(refusals.len(), 1, "{refusals:?}");
         assert!(refusals[0].contains("`@out/target`") && refusals[0].contains("outside"));
         assert!(take_refusals().is_empty(), "taking drains the list");
+    }
+
+    /// A missing package looked up inside [`quietly`] is no resolution gap; the same lookup outside
+    /// it, not answered from a memo, is.
+    #[test]
+    fn a_quiet_failure_records_no_gap() {
+        let _gaps = GAPS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let importer = dir.path().join("importer.ts");
+        fs::write(&importer, "// importer").unwrap();
+        begin_file(None);
+        let missing = "vitest-dedup-quiet-missing-package";
+        assert_eq!(
+            quietly(|| resolve(&importer, missing)),
+            Resolved::Unresolved
+        );
+        let recorded = |gaps: &ResolutionGaps| gaps.packages_not_found.contains_key(dir.path());
+        assert!(!recorded(&take_resolution_gaps()));
+        assert_eq!(resolve(&importer, missing), Resolved::Unresolved);
+        assert!(recorded(&take_resolution_gaps()));
+    }
+
+    /// A refusal inside [`quietly`] is not recorded and not memoized, so a later lookup of the
+    /// same specifier that needs the module still records it.
+    #[test]
+    fn a_quiet_refusal_is_neither_recorded_nor_memoized() {
+        let (_guard, root, importer) = escaping_alias();
+        begin_file(Some(&root));
+        assert_eq!(
+            quietly(|| resolve(&importer, "@out/target")),
+            Resolved::Unresolved
+        );
+        assert!(take_refusals().is_empty());
+        assert_eq!(resolve(&importer, "@out/target"), Resolved::Unresolved);
+        assert_eq!(take_refusals().len(), 1);
     }
 
     /// The analyzer canonicalizes its root, which on Windows yields a verbatim `\\?\` path, and

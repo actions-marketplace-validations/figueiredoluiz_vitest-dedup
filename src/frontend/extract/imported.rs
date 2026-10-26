@@ -2,8 +2,9 @@
 //! owned; no symbol ID or parameter binding crosses the boundary.
 use super::*;
 use crate::frontend::fingerprint::ImportOrigin;
-use crate::frontend::helpers::export_contract::resolve_export_chain;
+use crate::frontend::helpers::export_contract::{resolve_export_chain, resolve_value_export_chain};
 use crate::frontend::helpers::{self, Callable, Export};
+use crate::frontend::registry::imported_constants::{self, Proof};
 use crate::frontend::resolver::{self, Resolved};
 use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, ImportOrExportKind};
 use std::path::{Path, PathBuf};
@@ -172,6 +173,17 @@ impl ExpansionState {
     }
 }
 
+/// Whether one of `mocked` names the imported module or any module on its re-export chain.
+fn chain_is_mocked(mocked: &[MockedModule], origin: &ImportOrigin, modules: &[PathBuf]) -> bool {
+    mocked.iter().any(|mock| {
+        mock.specifier.as_ref() == origin.component
+            || modules.iter().any(|path| {
+                mock.specifier.as_ref()
+                    == super::super::fingerprint::specifier_identity(path, &path.to_string_lossy())
+            })
+    })
+}
+
 /// Maps caller symbols to imported export provenance.
 /// Retains erased bindings solely so attempted runtime calls are explicitly refused.
 pub(super) fn collect_imports(program: &Program, file: &Path) -> HashMap<SymbolId, RunnerImport> {
@@ -232,6 +244,142 @@ pub(super) fn collect_imports(program: &Program, file: &Path) -> HashMap<SymbolI
 }
 
 impl<'a> Walker<'a> {
+    /// Sets up the proof of which value imports read by this file's tables hold a scalar literal,
+    /// run when a table cell first reaches one (see `registry::imported_constants`). A file whose
+    /// mocks or property rewrites could reach any module proves nothing; an import on a mocked
+    /// chain, or whose chain reaches this file (read in its temporal dead zone), is refused. A
+    /// historical file reads no value (the modules on disk are today's, not the ones it
+    /// imported): a cell the current tree would read, or one reading an import gone from today's
+    /// tree, makes it partial. Its proof runs under the same analysis-root confinement.
+    pub(super) fn prepare_imported_constants(&mut self, allocator: &'a Allocator) {
+        let historical = !self.allow_imported;
+        // Decided from this file's own text, so both trees agree: unreadable mocks could replace
+        // any module.
+        if self.mocks_unresolved {
+            return;
+        }
+        let eligible = |import: &RunnerImport| {
+            !import.erased
+                && !matches!(import.origin.exported.as_str(), "*" | "default")
+                && match &import.origin.resolved {
+                    // Only first-party source can declare a provable constant.
+                    Some(path) => {
+                        !helpers::is_dependency(path)
+                            && crate::discovery::classify_source_file(path).is_some()
+                    }
+                    // A historical file's relative import may name a module since renamed. An
+                    // alias or virtual specifier may never resolve, so it does not count.
+                    None => historical && import.origin.specifier.starts_with('.'),
+                }
+        };
+        // A mock that does not resolve could replace any first-party module (a package-shaped
+        // name may be a bundler alias). A Node builtin cannot be one. A historical file's mocks
+        // resolved in its own revision, so they do not decide its reads.
+        if !historical
+            && self.mocked_modules.iter().any(|mock| {
+                mock.specifier
+                    .strip_prefix("unresolved:")
+                    .is_some_and(|specifier| !resolver::is_node_builtin(specifier))
+            })
+        {
+            return;
+        }
+        let imports: HashMap<SymbolId, (ImportOrigin, Span)> = self
+            .runner_imports
+            .iter()
+            .filter(|(_, import)| eligible(import))
+            .map(|(symbol, import)| {
+                let span = self.semantic.scoping().symbol_span(*symbol);
+                (*symbol, (import.origin.clone(), span))
+            })
+            .collect();
+        if imports.is_empty() {
+            return;
+        }
+        let semantic = self.semantic;
+        let mocked = self.mocked_modules.clone();
+        let path = self.file.path.clone();
+        let own = std::cell::OnceCell::new();
+        // A property this file can rewrite may be any import's (`vi.spyOn(ns, 'X', 'get')`);
+        // decided once, on the first read.
+        let rewrites = std::cell::OnceCell::new();
+        // Counted per import read: a local binding a cell names spends nothing.
+        let left = std::cell::Cell::new(imported_constants::MAX_IMPORTED_CONSTANTS);
+        self.imported_constants = ImportedConstants::lazy(Box::new(move |symbol| {
+            let Some((origin, span)) = imports.get(&symbol) else {
+                return Proof::Refused;
+            };
+            if left.get() == 0 {
+                return Proof::Refused;
+            }
+            left.set(left.get() - 1);
+            if *rewrites.get_or_init(|| imported_constants::redefines_accessors(semantic)) {
+                return Proof::Refused;
+            }
+            // A historical import gone from today's tree (a renamed module) may have held a
+            // constant in its own revision.
+            if origin.resolved.is_none() {
+                return Proof::Unavailable;
+            }
+            // An optional lookup: a hop that leaves the analysis root leaves the cell unresolved
+            // without marking the file incomplete.
+            let value = resolver::quietly(|| {
+                // Resolved again under the proof's confinement: a revision baseline's own
+                // resolution of the import is unconfined.
+                let resolver::Resolved::Module(start) = resolver::resolve(&path, &origin.specifier)
+                else {
+                    return None;
+                };
+                let chain = resolve_value_export_chain(&start, &origin.exported).ok()?;
+                let nuxt_mocked = mocked.iter().any(|mock| {
+                    mock.specifier
+                        .strip_prefix("nuxt-import:")
+                        .is_some_and(|name| chain.exports.iter().any(|export| export == name))
+                });
+                if nuxt_mocked
+                    || chain_is_mocked(&mocked, origin, &chain.modules)
+                    || chain.modules.iter().any(|module| {
+                        helpers::canonical(module) == *own.get_or_init(|| helpers::canonical(&path))
+                    })
+                {
+                    return None;
+                }
+                imported_constants::exported_literal(
+                    allocator,
+                    &chain.terminal.path,
+                    &chain.terminal.export,
+                    *span,
+                )
+            });
+            match value {
+                None => Proof::Refused,
+                // A revision baseline cannot use today's value, only learn that the current tree
+                // reads one here.
+                Some(_) if historical => Proof::Unavailable,
+                Some(value) => Proof::Value(value),
+            }
+        }));
+    }
+
+    /// Records a revision baseline as partial when its tables read an imported constant it could
+    /// not use, as for a historical helper call.
+    pub(super) fn finish_imported_constants(&mut self) {
+        // One reason per file: a historical helper call may already have recorded it.
+        let reported = |reasons: &[ExclusionReason]| {
+            reasons.contains(&ExclusionReason::HelperSourcesUnavailable)
+        };
+        if self.imported_constants.read_unavailable()
+            && !reported(&self.reasons)
+            && !reported(&self.helper_refusal_reasons)
+        {
+            self.reasons.push(ExclusionReason::HelperSourcesUnavailable);
+            self.diagnostics.push(
+                "historical imported sources are unavailable; table cells naming an imported constant cannot populate a revision baseline"
+                    .to_owned(),
+            );
+        }
+    }
+
     /// Resolves direct imported calls and namespace/function invocation candidates.
     /// Ordinary named/default object methods do not invoke the imported runner.
     fn runner_origin(&self, callee: &Expression) -> Option<RunnerImport> {
@@ -376,17 +524,7 @@ impl<'a> Walker<'a> {
     /// Whether the imported module, or any module on its re-export chain, is mocked in the
     /// calling file, or mocking in it could not be read.
     fn is_mocked(&self, origin: &ImportOrigin, modules: &[PathBuf]) -> bool {
-        self.mocks_unresolved
-            || self.mocked_modules.iter().any(|mock| {
-                mock.specifier.as_ref() == origin.component
-                    || modules.iter().any(|path| {
-                        mock.specifier.as_ref()
-                            == super::super::fingerprint::specifier_identity(
-                                path,
-                                &path.to_string_lossy(),
-                            )
-                    })
-            })
+        self.mocks_unresolved || chain_is_mocked(&self.mocked_modules, origin, modules)
     }
 
     /// How many framework setup statements (`vi.stubGlobal(...)`, awaited calls) the file runs
@@ -546,7 +684,10 @@ impl<'a> Walker<'a> {
             let file =
                 SourceFile::without_project_context(terminal.path.clone(), language, module_flavor);
             let semantic = &semantic_return.semantic;
-            let mut child = Walker::new(source, &file, program, semantic, self.globals);
+            // Configuration is owned by the caller, while source and lexical symbols stay local.
+            let mut child_file = file.clone();
+            child_file.config_scope = self.file.config_scope.clone();
+            let mut child = Walker::new(source, &child_file, program, semantic, self.globals);
             if child.mocks_unresolved {
                 self.hook_scopes[0].unresolved = true;
                 for case in &mut self.tests {
@@ -709,13 +850,7 @@ impl<'a> Walker<'a> {
                 }
             }
 
-            let identity = (
-                terminal
-                    .path
-                    .canonicalize()
-                    .unwrap_or_else(|_| terminal.path.clone()),
-                start,
-            );
+            let identity = (helpers::canonical(&terminal.path), start);
             if let Err(reason) = self.expansion.borrow_mut().enter(identity) {
                 return Some(Err(reason));
             }
@@ -743,10 +878,6 @@ impl<'a> Walker<'a> {
                     .unwrap_or(&self.file.path)
                     .clone(),
             );
-            // Configuration is owned by the caller, while source and lexical symbols stay local.
-            let mut child_file = file.clone();
-            child_file.config_scope = self.file.config_scope.clone();
-            child.file = &child_file;
             let hooks_before = hook_count(child.hook_scopes.last());
             if prepare {
                 // Hooks join the calling scope, which the declaration walk then already holds.
@@ -1135,6 +1266,15 @@ fn hook_count(scope: Option<&ScopeHooks>) -> usize {
 /// Whether defining `class` runs nothing: no decorators, no computed keys, no static member
 /// that is initialised or runs a block, and a superclass named by a plain reference.
 pub(super) fn class_is_inert(class: &oxc_ast::ast::Class) -> bool {
+    class_defines_only_values(class, |_| false)
+}
+
+/// [`class_is_inert`], except that a static field may be initialised by an expression
+/// `static_value` accepts.
+fn class_defines_only_values(
+    class: &oxc_ast::ast::Class,
+    static_value: impl Fn(&Expression) -> bool,
+) -> bool {
     use oxc_ast::ast::ClassElement;
     class.decorators.is_empty()
         && class
@@ -1148,7 +1288,7 @@ pub(super) fn class_is_inert(class: &oxc_ast::ast::Class) -> bool {
             ClassElement::PropertyDefinition(property) => {
                 !property.computed
                     && property.decorators.is_empty()
-                    && (!property.r#static || property.value.is_none())
+                    && (!property.r#static || property.value.as_ref().is_none_or(&static_value))
             }
             ClassElement::TSIndexSignature(_) => true,
             ClassElement::StaticBlock(_) | ClassElement::AccessorProperty(_) => false,
@@ -1182,15 +1322,97 @@ fn reexport_is_inert(
     }
 }
 
+/// Whether `statement` is a TypeScript ambient declaration (`declare module`, `declare global`,
+/// `declare namespace` or `declare enum`, exported or not). The transform erases it before the
+/// module runs, so it evaluates nothing.
+fn is_ambient_declaration(statement: &Statement) -> bool {
+    let declaration = match statement {
+        Statement::ExportDeclaration(export) => &export.declaration,
+        other => match other.as_declaration() {
+            Some(declaration) => declaration,
+            None => return false,
+        },
+    };
+    match declaration {
+        Declaration::TSExternalModuleDeclaration(declaration) => declaration.declare,
+        Declaration::TSGlobalDeclaration(declaration) => declaration.declare,
+        Declaration::TSNamespaceDeclaration(declaration) => declaration.declare,
+        Declaration::TSEnumDeclaration(declaration) => declaration.declare,
+        _ => false,
+    }
+}
+
+/// Whether evaluating `expression` only creates a module-local value: literals, functions, and
+/// object and array literals of such values. Creating these calls no function, so nothing runs
+/// that the importing file could observe, even where a setup file has replaced a built-in or a
+/// Vitest export: no call or `new` (`vi.fn()`, `new Set()`), no accessor, no `__proto__`, and no
+/// coercion of an object.
+fn creates_value(expression: &Expression) -> bool {
+    use oxc_ast::ast::{ArrayExpressionElement, ObjectPropertyKind, PropertyKind};
+    use oxc_syntax::operator::UnaryOperator;
+    if inert_expression(expression) {
+        return true;
+    }
+    match expression {
+        Expression::ObjectExpression(object) => {
+            object.properties.iter().all(|property| match property {
+                ObjectPropertyKind::ObjectProperty(property) => {
+                    property.kind == PropertyKind::Init
+                        && !property.computed
+                        && !property.key.is_specific_static_name("__proto__")
+                        && creates_value(&property.value)
+                }
+                ObjectPropertyKind::SpreadProperty(_) => false,
+            })
+        }
+        Expression::ArrayExpression(array) => array.elements.iter().all(|element| match element {
+            ArrayExpressionElement::SpreadElement(_) => false,
+            ArrayExpressionElement::Elision(_) => true,
+            element => element.as_expression().is_some_and(creates_value),
+        }),
+        Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+        // Coercing an object runs its `valueOf`: only a primitive operand is admitted, and unary
+        // plus on a BigInt throws.
+        Expression::UnaryExpression(unary) => match (unary.operator, &unary.argument) {
+            (UnaryOperator::Delete, _)
+            | (UnaryOperator::UnaryPlus, Expression::BigIntLiteral(_)) => false,
+            (_, argument) => matches!(
+                argument,
+                Expression::NumericLiteral(_)
+                    | Expression::StringLiteral(_)
+                    | Expression::BooleanLiteral(_)
+                    | Expression::NullLiteral(_)
+                    | Expression::BigIntLiteral(_)
+            ),
+        },
+        Expression::ParenthesizedExpression(inner) => creates_value(&inner.expression),
+        Expression::TSAsExpression(inner) => creates_value(&inner.expression),
+        Expression::TSSatisfiesExpression(inner) => creates_value(&inner.expression),
+        _ => false,
+    }
+}
+
 /// Checks module execution for unmodeled setup effects.
-/// Allows erased declarations, inert values, Vitest imports and validated re-export hops.
+/// Allows erased declarations, module-local values, Vitest imports and validated re-export hops.
 fn module_is_inert(
     program: &Program,
     file: &Path,
     modules: &[PathBuf],
     imports_inert: &mut dyn FnMut(&Path, &str) -> bool,
 ) -> bool {
+    // Destructuring reads properties, and a property can be a getter: only a plain name binds an
+    // admitted value without running anything.
+    let declares_value = |declaration: &oxc_ast::ast::VariableDeclarator| {
+        declaration.init.as_ref().is_none_or(|init| {
+            inert_expression(init)
+                || (matches!(
+                    declaration.id,
+                    oxc_ast::ast::BindingPattern::BindingIdentifier(_)
+                ) && creates_value(init))
+        })
+    };
     program.body.iter().all(|statement| match statement {
+        statement if is_ambient_declaration(statement) => true,
         Statement::ImportDeclaration(import) => {
             matches!(import.import_kind, ImportOrExportKind::Type)
                 || import.specifiers.as_ref().is_some_and(|specifiers| {
@@ -1217,7 +1439,7 @@ fn module_is_inert(
             matches!(export.export_kind, ImportOrExportKind::Type)
                 || reexport_is_inert(file, export.source.value.as_str(), modules, imports_inert)
         }
-        Statement::ClassDeclaration(class) => class_is_inert(class),
+        Statement::ClassDeclaration(class) => class_defines_only_values(class, creates_value),
         Statement::FunctionDeclaration(_)
         | Statement::TSTypeAliasDeclaration(_)
         | Statement::TSInterfaceDeclaration(_)
@@ -1236,20 +1458,18 @@ fn module_is_inert(
             && helpers::find_export(program, "default").is_some())
         }
         Statement::ExportDeclaration(export) => match &export.declaration {
-            Declaration::ClassDeclaration(class) => class_is_inert(class),
+            Declaration::ClassDeclaration(class) => class_defines_only_values(class, creates_value),
             Declaration::FunctionDeclaration(_)
             | Declaration::TSTypeAliasDeclaration(_)
             | Declaration::TSInterfaceDeclaration(_) => true,
-            oxc_ast::ast::Declaration::VariableDeclaration(declaration) => declaration
-                .declarations
-                .iter()
-                .all(|declaration| declaration.init.as_ref().is_none_or(inert_expression)),
+            oxc_ast::ast::Declaration::VariableDeclaration(declaration) => {
+                declaration.declarations.iter().all(declares_value)
+            }
             _ => false,
         },
-        Statement::VariableDeclaration(declaration) => declaration
-            .declarations
-            .iter()
-            .all(|declaration| declaration.init.as_ref().is_none_or(inert_expression)),
+        Statement::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().all(declares_value)
+        }
         _ => false,
     })
 }

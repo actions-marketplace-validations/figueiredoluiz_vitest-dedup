@@ -1531,6 +1531,168 @@ fn imported_but_uncalled_modules_with_setup_effects_taint_the_file() {
 }
 
 #[test]
+/// A `declare` statement on the runner's module is erased before it runs, so it never refuses the
+/// runner; the same shape without `declare` emits code and still does.
+fn ambient_declarations_on_the_runner_module_are_not_setup_effects() {
+    for (statement, admitted) in [
+        (
+            "declare module 'vitest' { interface Assertion<T> { toBeSlug(): T } }",
+            true,
+        ),
+        ("declare global { var separator: string }", true),
+        ("declare namespace Slug { const separator: string }", true),
+        ("export declare namespace Slug { interface Shape {} }", true),
+        ("declare enum Case { Lower }", true),
+        ("export declare enum Case { Lower }", true),
+        ("namespace Slug { beforeEach(() => {}); }", false),
+        ("export namespace Slug { beforeEach(() => {}); }", false),
+        ("enum Case { Lower }", false),
+    ] {
+        let case = RunnerCase::new(
+            &format!(
+                "{NESTED_PRELUDE}{statement} export function run() {{ test('own', () => {{}}); }}"
+            ),
+            "test('before', () => {}); run();",
+        );
+        let extraction = case.extract(Globals::Disabled);
+        assert_eq!(
+            extraction.tests.len(),
+            if admitted { 2 } else { 1 },
+            "{statement}: {:?}",
+            extraction.diagnostics
+        );
+        assert_eq!(extraction.incomplete, !admitted, "{statement}");
+        assert_eq!(
+            extraction.tests.iter().any(|case| case.context.unresolved),
+            !admitted,
+            "{statement}"
+        );
+    }
+}
+
+#[test]
+/// A runner module may create module-local values at import: literals, functions, and object and
+/// array literals of them. Any call or `new` runs code (a setup file may have replaced it), and
+/// anything else its top level runs can change what the importing file observes, so it still
+/// refuses the runner.
+fn module_local_values_on_the_runner_module_are_not_setup_effects() {
+    for (prelude, statement, admitted) in [
+        // A call or `new` runs a function a setup file may have replaced, so none is a value.
+        ("", "export const api = { fetchUser: vi.fn(() => 1) };", false),
+        ("", "export const spy = vi.fn();", false),
+        ("", "const seen = new Set<string>(['a']);", false),
+        ("", "const seen = new Set();", false),
+        ("", "const byId = new Map([[1, 'a']]);", false),
+        ("", "export const handler = { fetchUser: () => ({ name: 'Ada' }) };", true),
+        ("", "export const seeds = [42, -1, `x`, null] as const;", true),
+        ("", "export const nested = { list: [{ ok: true }], label: 'x' };", true),
+        ("", "export class Registry { static items: string[] = []; }", true),
+        ("", "export const restore = vi.stubEnv('MODE', 'x');", false),
+        ("", "export const fetch = vi.stubGlobal('fetch', vi.fn());", false),
+        ("", "export const clock = vi.useFakeTimers();", false),
+        ("", "export const log = vi.spyOn(console, 'log');", false),
+        ("", "export const matchers = expect.extend({});", false),
+        ("", "export const tree = make({ id: 1 }); function make(o: object) { return o; }", false),
+        ("", "export const copy = { ...{ a: 1 } };", false),
+        ("", "export const keyed = { ['a']: 1 };", false),
+        ("", "export const gone = delete (globalThis as any).x;", false),
+        ("", "export class Registry { static items = Registry.load(); static load() { return []; } }", false),
+        ("", "export class Registry { static { (globalThis as any).x = 1; } }", false),
+        ("class Set { constructor() { (globalThis as any).x = 1; } } ", "const seen = new Set();", false),
+        ("const vi = { fn: () => { (globalThis as any).x = 1; } }; ", "export const spy = vi.fn();", false),
+        // Code that runs, or a throw, while an admitted-looking value is evaluated.
+        ("", "export const n = +{ valueOf() { test('hidden', () => {}); return 0; } };", false),
+        ("", "const byKey = new Map([{ get 0() { test('hidden', () => {}); return 'k'; }, 1: 0 }]);", false),
+        ("", "export const { x } = { get x() { test('hidden', () => {}); return 0; } };", false),
+        ("", "export const o = { get x() { return 0; } };", false),
+        ("", "export const o = { __proto__: { x: 1 } };", false),
+        ("", "const broken = new Map([1]);", false),
+        ("", "const broken = new Set({});", false),
+        ("", "const broken = new WeakSet([1]);", false),
+        ("", "const broken = new Array(-1);", false),
+        ("", "export const spy = vi.fn('not a function');", false),
+        ("", "export const n = +1n;", false),
+        ("", "export const n = [-1n, ~1n, +'x'];", true),
+        ("", "const pairs = new Map([['a', 1], ['b', 2]]);", false),
+        ("", "export const server = { listen() {}, close() {} };", true),
+    ] {
+        let case = RunnerCase::new(
+            &format!("import {{ test, describe, beforeEach, expect }} from 'vitest'; {}{prelude}{statement} export function run() {{ test('own', () => {{}}); }}",
+                if prelude.starts_with("const vi") { "" } else { "import { vi } from 'vitest'; " }),
+            "test('before', () => {}); run();",
+        );
+        let extraction = case.extract(Globals::Disabled);
+        assert_eq!(
+            extraction.tests.len(),
+            if admitted { 2 } else { 1 },
+            "{prelude}{statement}: {:?}",
+            extraction.diagnostics
+        );
+        assert_eq!(extraction.incomplete, !admitted, "{prelude}{statement}");
+    }
+}
+
+#[test]
+/// A module the runner imports may not use `vi` or `expect` while it loads: the effect reaches
+/// every test in the calling file, and no test's context records it. Using them only inside a
+/// function the import does not run is harmless.
+fn vitest_calls_while_an_imported_module_loads_taint_the_file() {
+    const VI: &str = "import { vi, expect } from 'vitest'; ";
+    for (effects, utils, tainted) in [
+        ("vi.mock('./slug', () => ({}));", "", true),
+        ("vi.stubEnv('MODE', 'x');", "", true),
+        ("expect.extend({});", "", true),
+        ("export const spy = vi.fn();", "", true),
+        ("export const log = vi.spyOn(console, 'log');", "", true),
+        ("export const restore = (() => vi.stubEnv('MODE', 'x'))();", "", true),
+        ("namespace Setup { vi.mock('./slug'); }", "", true),
+        // Every route to `vi` or `expect` while the module loads, not only `vi.member`.
+        ("export const r = vi['stubEnv']('MODE', 'x');", "", true),
+        ("const v = vi; export const r = v.stubEnv('MODE', 'x');", "", true),
+        ("const { stubEnv } = vi; export const r = stubEnv('MODE', 'x');", "", true),
+        ("const apply = (tool: any) => tool.stubEnv('MODE', 'x'); export const r = apply(vi);", "", true),
+        ("export const r = expect['extend']({});", "", true),
+        ("export const r = globalThis.vi.stubEnv('MODE', 'x');", "", true),
+        ("export const r = (global as any).vi.stubEnv('MODE', 'x');", "", true),
+        ("export const r = (window as any).vi.stubEnv('MODE', 'x');", "", true),
+        ("export const r = (self as any).vi.stubEnv('MODE', 'x');", "", true),
+        ("export const r = globalThis.expect.extend({});", "", true),
+        ("import { vi as v } from './utils'; export const r = v.stubEnv('MODE', 'x');", "export { vi } from 'vitest';", true),
+        ("import { mocker } from './utils'; export const r = mocker.stubEnv('MODE', 'x');", "export { vi as mocker } from 'vitest';", true),
+        ("import { vi as v } from './utils'; export const r = v.stubEnv('MODE', 'x');", "export * from 'vitest';", true),
+        ("import { setup } from './utils'; export const r = setup();", "import { vi } from 'vitest'; export function setup() { return vi.stubEnv('MODE', 'x'); }", true),
+        // Code that does not run while the module loads.
+        ("import { setup } from './utils'; export const later = () => setup();", "import { vi } from 'vitest'; export function setup() { return vi.stubEnv('MODE', 'x'); }", false),
+        ("export function later() { vi.mock('./slug'); }", "", false),
+        ("export const value = 1;", "", false),
+        ("declare namespace Setup { const value: string }", "", false),
+    ] {
+        let case = RunnerCase::new(
+            &format!("{NESTED_PRELUDE}import './effects'; export function run() {{ test('own', () => {{}}); }}"),
+            "test('before', () => {}); run();",
+        );
+        let prelude = if effects.starts_with("import") { "" } else { VI };
+        let effects_source = format!("{prelude}{effects}");
+        let mut modules = vec![("effects.ts", effects_source.as_str())];
+        if !utils.is_empty() {
+            modules.push(("utils.ts", utils));
+        }
+        write_modules(&case, &modules);
+        let extraction = case.extract(Globals::Disabled);
+        assert_eq!(
+            extraction.incomplete, tainted,
+            "{effects} / {utils}: {:?}",
+            extraction.diagnostics
+        );
+        assert_eq!(
+            extraction.tests.len(),
+            if tainted { 1 } else { 2 },
+            "{effects} / {utils}"
+        );
+    }
+}
+
+#[test]
 /// A recovered worker failure carries its own code, and a nested runner refusal keeps its own.
 fn recovered_and_nested_refusals_carry_their_own_codes() {
     let recovered = recovered_extraction("worker failed".to_owned());
