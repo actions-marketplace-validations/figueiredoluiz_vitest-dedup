@@ -1266,6 +1266,15 @@ fn hook_count(scope: Option<&ScopeHooks>) -> usize {
 /// Whether defining `class` runs nothing: no decorators, no computed keys, no static member
 /// that is initialised or runs a block, and a superclass named by a plain reference.
 pub(super) fn class_is_inert(class: &oxc_ast::ast::Class) -> bool {
+    class_defines_only_values(class, |_| false)
+}
+
+/// [`class_is_inert`], except that a static field may be initialised by an expression
+/// `static_value` accepts.
+fn class_defines_only_values(
+    class: &oxc_ast::ast::Class,
+    static_value: impl Fn(&Expression) -> bool,
+) -> bool {
     use oxc_ast::ast::ClassElement;
     class.decorators.is_empty()
         && class
@@ -1279,7 +1288,7 @@ pub(super) fn class_is_inert(class: &oxc_ast::ast::Class) -> bool {
             ClassElement::PropertyDefinition(property) => {
                 !property.computed
                     && property.decorators.is_empty()
-                    && (!property.r#static || property.value.is_none())
+                    && (!property.r#static || property.value.as_ref().is_none_or(&static_value))
             }
             ClassElement::TSIndexSignature(_) => true,
             ClassElement::StaticBlock(_) | ClassElement::AccessorProperty(_) => false,
@@ -1333,14 +1342,75 @@ fn is_ambient_declaration(statement: &Statement) -> bool {
     }
 }
 
+/// Whether evaluating `expression` only creates a module-local value: literals, functions, and
+/// object and array literals of such values. Creating these calls no function, so nothing runs
+/// that the importing file could observe, even where a setup file has replaced a built-in or a
+/// Vitest export: no call or `new` (`vi.fn()`, `new Set()`), no accessor, no `__proto__`, and no
+/// coercion of an object.
+fn creates_value(expression: &Expression) -> bool {
+    use oxc_ast::ast::{ArrayExpressionElement, ObjectPropertyKind, PropertyKind};
+    use oxc_syntax::operator::UnaryOperator;
+    if inert_expression(expression) {
+        return true;
+    }
+    match expression {
+        Expression::ObjectExpression(object) => {
+            object.properties.iter().all(|property| match property {
+                ObjectPropertyKind::ObjectProperty(property) => {
+                    property.kind == PropertyKind::Init
+                        && !property.computed
+                        && !property.key.is_specific_static_name("__proto__")
+                        && creates_value(&property.value)
+                }
+                ObjectPropertyKind::SpreadProperty(_) => false,
+            })
+        }
+        Expression::ArrayExpression(array) => array.elements.iter().all(|element| match element {
+            ArrayExpressionElement::SpreadElement(_) => false,
+            ArrayExpressionElement::Elision(_) => true,
+            element => element.as_expression().is_some_and(creates_value),
+        }),
+        Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+        // Coercing an object runs its `valueOf`: only a primitive operand is admitted, and unary
+        // plus on a BigInt throws.
+        Expression::UnaryExpression(unary) => match (unary.operator, &unary.argument) {
+            (UnaryOperator::Delete, _)
+            | (UnaryOperator::UnaryPlus, Expression::BigIntLiteral(_)) => false,
+            (_, argument) => matches!(
+                argument,
+                Expression::NumericLiteral(_)
+                    | Expression::StringLiteral(_)
+                    | Expression::BooleanLiteral(_)
+                    | Expression::NullLiteral(_)
+                    | Expression::BigIntLiteral(_)
+            ),
+        },
+        Expression::ParenthesizedExpression(inner) => creates_value(&inner.expression),
+        Expression::TSAsExpression(inner) => creates_value(&inner.expression),
+        Expression::TSSatisfiesExpression(inner) => creates_value(&inner.expression),
+        _ => false,
+    }
+}
+
 /// Checks module execution for unmodeled setup effects.
-/// Allows erased declarations, inert values, Vitest imports and validated re-export hops.
+/// Allows erased declarations, module-local values, Vitest imports and validated re-export hops.
 fn module_is_inert(
     program: &Program,
     file: &Path,
     modules: &[PathBuf],
     imports_inert: &mut dyn FnMut(&Path, &str) -> bool,
 ) -> bool {
+    // Destructuring reads properties, and a property can be a getter: only a plain name binds an
+    // admitted value without running anything.
+    let declares_value = |declaration: &oxc_ast::ast::VariableDeclarator| {
+        declaration.init.as_ref().is_none_or(|init| {
+            inert_expression(init)
+                || (matches!(
+                    declaration.id,
+                    oxc_ast::ast::BindingPattern::BindingIdentifier(_)
+                ) && creates_value(init))
+        })
+    };
     program.body.iter().all(|statement| match statement {
         statement if is_ambient_declaration(statement) => true,
         Statement::ImportDeclaration(import) => {
@@ -1369,7 +1439,7 @@ fn module_is_inert(
             matches!(export.export_kind, ImportOrExportKind::Type)
                 || reexport_is_inert(file, export.source.value.as_str(), modules, imports_inert)
         }
-        Statement::ClassDeclaration(class) => class_is_inert(class),
+        Statement::ClassDeclaration(class) => class_defines_only_values(class, creates_value),
         Statement::FunctionDeclaration(_)
         | Statement::TSTypeAliasDeclaration(_)
         | Statement::TSInterfaceDeclaration(_)
@@ -1388,20 +1458,18 @@ fn module_is_inert(
             && helpers::find_export(program, "default").is_some())
         }
         Statement::ExportDeclaration(export) => match &export.declaration {
-            Declaration::ClassDeclaration(class) => class_is_inert(class),
+            Declaration::ClassDeclaration(class) => class_defines_only_values(class, creates_value),
             Declaration::FunctionDeclaration(_)
             | Declaration::TSTypeAliasDeclaration(_)
             | Declaration::TSInterfaceDeclaration(_) => true,
-            oxc_ast::ast::Declaration::VariableDeclaration(declaration) => declaration
-                .declarations
-                .iter()
-                .all(|declaration| declaration.init.as_ref().is_none_or(inert_expression)),
+            oxc_ast::ast::Declaration::VariableDeclaration(declaration) => {
+                declaration.declarations.iter().all(declares_value)
+            }
             _ => false,
         },
-        Statement::VariableDeclaration(declaration) => declaration
-            .declarations
-            .iter()
-            .all(|declaration| declaration.init.as_ref().is_none_or(inert_expression)),
+        Statement::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().all(declares_value)
+        }
         _ => false,
     })
 }
