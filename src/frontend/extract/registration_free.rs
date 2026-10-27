@@ -28,16 +28,17 @@ use crate::frontend::js_text::string_text;
 use crate::frontend::resolver::{self, Resolved};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, Class, Declaration, ExportDefaultDeclarationKind, Expression, Function,
-    IdentifierReference, ImportDeclarationSpecifier, ImportExpression, ImportOrExportKind, Program,
-    Statement, StaticMemberExpression, TSEnumDeclaration, TSNamespaceDeclaration,
-    TSNamespaceDeclarationBody, VariableDeclaration, VariableDeclarator,
+    Argument, BindingPattern, Class, Declaration, ExportDefaultDeclarationKind, Expression,
+    FormalParameters, Function, IdentifierReference, ImportDeclarationSpecifier, ImportExpression,
+    ImportOrExportKind, ObjectPropertyKind, Program, PropertyKind, Statement,
+    StaticMemberExpression, TSEnumDeclaration, TSNamespaceDeclaration, TSNamespaceDeclarationBody,
+    VariableDeclaration, VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
-use oxc_semantic::{Semantic, SemanticBuilder, SymbolId};
-use oxc_span::SourceType;
+use oxc_semantic::{NodeId, Semantic, SemanticBuilder, SymbolId};
+use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::scope::ScopeFlags;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -559,6 +560,380 @@ fn evaluation_registers_nothing(
     proof.prove_edges(scanner.edges).then_some(proof.modules)
 }
 
+/// Whether what a call to a local helper evaluates before its body runs provably registers
+/// nothing: the call's `arguments`, the parameter defaults that can run, the reads a destructuring
+/// parameter makes on its value (a getter or an iterator runs code), and the defaults and computed
+/// keys nested in its pattern. An input that only creates values ([`creates_without_running`])
+/// runs no code; any other input must pass the registration scan, which follows getters, called
+/// functions and imports.
+pub(super) fn call_inputs_register_nothing(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    written: &HashSet<SymbolId>,
+    file: &Path,
+    parameters: &FormalParameters<'_>,
+    arguments: &[Argument<'_>],
+    call: Span,
+) -> bool {
+    let mut supplied = Vec::new();
+    for argument in arguments {
+        let Some(expression) = argument.as_expression() else {
+            return false;
+        };
+        supplied.push(expression);
+    }
+    let mut inputs: Vec<&Expression> = Vec::new();
+    // Read through a destructuring pattern, so scanned even when the expression itself is inert.
+    let mut destructured: Vec<&Expression> = Vec::new();
+    for (index, parameter) in parameters.items.iter().enumerate() {
+        // An argument written as `undefined` is passed as if absent.
+        let argument = supplied
+            .get(index)
+            .copied()
+            .filter(|argument| !written_undefined(semantic, argument));
+        // A default runs only when its argument is `undefined`, which a literal never is.
+        let default = parameter
+            .initializer
+            .as_deref()
+            .filter(|_| argument.is_none_or(|argument| !never_undefined(argument)));
+        inputs.extend(default);
+        if !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)) {
+            // The pattern reads whichever value it receives: the argument, or the default when
+            // that can run.
+            destructured.extend(argument);
+            destructured.extend(default);
+            pattern_inputs(&parameter.pattern, &mut inputs, &mut destructured);
+        }
+    }
+    if let Some(rest) = &parameters.rest {
+        if !matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_)) {
+            destructured.extend(supplied.iter().skip(parameters.items.len()).copied());
+            pattern_inputs(&rest.rest.argument, &mut inputs, &mut destructured);
+        }
+    }
+    let mut scanner = Scanner::new(semantic, program, file);
+    scanner.written = Some(written);
+    scanner.helper_call = Some((parameters.span, call));
+    for input in supplied.iter().chain(&inputs) {
+        if !creates_without_running(semantic, input) {
+            scanner.queue.push(Pending::Expression(input));
+        }
+    }
+    for value in destructured {
+        scanner.queue.push(Pending::Expression(value));
+    }
+    scanner.drain();
+    !scanner.failed && Proof::default().prove_edges(scanner.edges)
+}
+
+/// What a binding pattern receives, as far as the source shows it.
+#[derive(Clone, Copy)]
+enum Bound<'p, 'a> {
+    /// `undefined`: no argument, an argument spelled `undefined`, or a key or index a literal
+    /// lacks.
+    Missing,
+    Value(&'p Expression<'a>),
+}
+
+/// Whether some parameter of a call is known to fail to bind: destructuring `undefined` or `null`,
+/// or array-destructuring a value that is not iterable, throws before the helper's body runs.
+/// Only values the source spells out are judged, through literal object and array arguments and
+/// defaults; any other value is assumed to bind.
+pub(super) fn call_binding_fails(
+    semantic: &Semantic<'_>,
+    parameters: &FormalParameters<'_>,
+    arguments: &[Argument<'_>],
+) -> bool {
+    // A spread moves every later argument to a position the source does not show.
+    if arguments
+        .iter()
+        .any(|argument| argument.as_expression().is_none())
+    {
+        return false;
+    }
+    parameters
+        .items
+        .iter()
+        .enumerate()
+        .any(|(index, parameter)| {
+            let received = arguments
+                .get(index)
+                .and_then(Argument::as_expression)
+                .map_or(Bound::Missing, Bound::Value);
+            let received = match (received, parameter.initializer.as_deref()) {
+                (bound, Some(default)) if bound_is_undefined(semantic, bound) => {
+                    Bound::Value(default)
+                }
+                (bound, _) => bound,
+            };
+            pattern_binding_fails(semantic, &parameter.pattern, received)
+        })
+}
+
+/// Whether `bound` is `undefined`, the value that makes a parameter's default run.
+fn bound_is_undefined(semantic: &Semantic<'_>, bound: Bound<'_, '_>) -> bool {
+    match bound {
+        Bound::Missing => true,
+        Bound::Value(value) => written_undefined(semantic, strip_value(value)),
+    }
+}
+
+/// Whether binding `pattern` to `received` is known to throw.
+fn pattern_binding_fails(
+    semantic: &Semantic<'_>,
+    pattern: &BindingPattern<'_>,
+    received: Bound<'_, '_>,
+) -> bool {
+    let value = match received {
+        Bound::Value(value) => Some(strip_value(value)),
+        Bound::Missing => None,
+    };
+    match pattern {
+        BindingPattern::BindingIdentifier(_) => false,
+        BindingPattern::AssignmentPattern(assignment) => {
+            let received = if bound_is_undefined(semantic, received) {
+                Bound::Value(&assignment.right)
+            } else {
+                received
+            };
+            pattern_binding_fails(semantic, &assignment.left, received)
+        }
+        BindingPattern::ObjectPattern(object) => match value {
+            None => true,
+            Some(value) if written_undefined(semantic, value) => true,
+            Some(Expression::NullLiteral(_)) => true,
+            Some(Expression::ObjectExpression(literal)) => {
+                object.properties.iter().any(|property| {
+                    if property.computed {
+                        return false;
+                    }
+                    let Some(name) = property.key.static_name() else {
+                        return false;
+                    };
+                    literal_property(literal, &name).is_some_and(|bound| {
+                        pattern_binding_fails(semantic, &property.value, bound)
+                    })
+                })
+            }
+            Some(_) => false,
+        },
+        BindingPattern::ArrayPattern(array) => match value {
+            None => true,
+            Some(value) if written_undefined(semantic, value) => true,
+            Some(Expression::ObjectExpression(literal)) => {
+                literal.properties.iter().all(|property| {
+                    matches!(property, ObjectPropertyKind::ObjectProperty(property)
+                    if !property.computed && !sets_prototype(property))
+                })
+            }
+            Some(Expression::ArrayExpression(literal)) => {
+                array.elements.iter().enumerate().any(|(index, element)| {
+                    let Some(element) = element else { return false };
+                    // A spread before this index moves it to a position the source does not show.
+                    if literal
+                        .elements
+                        .iter()
+                        .take(index + 1)
+                        .any(|item| item.is_spread())
+                    {
+                        return false;
+                    }
+                    let bound = match literal
+                        .elements
+                        .get(index)
+                        .and_then(|item| item.as_expression())
+                    {
+                        Some(item) => Bound::Value(item),
+                        None => Bound::Missing,
+                    };
+                    pattern_binding_fails(semantic, element, bound)
+                })
+            }
+            // A string is iterable; every other scalar literal and a function is not. A class is
+            // only through a static iterator, so refusing one costs a read, never a test.
+            Some(other) => {
+                matches!(other, Expression::ClassExpression(_))
+                    || (!matches!(other, Expression::StringLiteral(_)) && is_value_literal(other))
+            }
+        },
+    }
+}
+
+/// What an object literal holds under `name`: `None` when unknown (a spread, an accessor or a
+/// computed key could supply it), `Missing` when no own property can.
+fn literal_property<'p, 'a>(
+    literal: &'p oxc_ast::ast::ObjectExpression<'a>,
+    name: &oxc_ast::StaticPropertyName<'_>,
+) -> Option<Bound<'p, 'a>> {
+    let mut found = None;
+    for property in &literal.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
+        if property.computed || property.kind != PropertyKind::Init || sets_prototype(property) {
+            return None;
+        }
+        if property.key.static_name().is_some_and(|key| &key == name) {
+            found = Some(&property.value);
+        }
+    }
+    // An absent own key may still be inherited (`toString`); reading it as `undefined` refuses
+    // more, never less.
+    Some(found.map_or(Bound::Missing, Bound::Value))
+}
+
+/// Whether an object-literal entry is `__proto__: value`, which sets the prototype the object
+/// inherits keys and an iterator from instead of defining a key.
+fn sets_prototype(property: &oxc_ast::ast::ObjectProperty<'_>) -> bool {
+    !property.shorthand && !property.method && property.key.is_specific_static_name("__proto__")
+}
+
+/// `expression` without the wrappers that do not change its value.
+fn strip_value<'p, 'a>(expression: &'p Expression<'a>) -> &'p Expression<'a> {
+    match expression {
+        Expression::ParenthesizedExpression(inner) => strip_value(&inner.expression),
+        Expression::TSAsExpression(inner) => strip_value(&inner.expression),
+        Expression::TSSatisfiesExpression(inner) => strip_value(&inner.expression),
+        Expression::TSNonNullExpression(inner) => strip_value(&inner.expression),
+        other => other,
+    }
+}
+
+/// Whether `expression` is spelled as `undefined`: the free name (a local binding of that name
+/// holds whatever it was given), or a `void` expression.
+fn written_undefined(semantic: &Semantic<'_>, expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::Identifier(identifier) => {
+            identifier.name == "undefined"
+                && identifier.reference_id.get().is_some_and(|reference| {
+                    semantic
+                        .scoping()
+                        .get_reference(reference)
+                        .symbol_id()
+                        .is_none()
+                })
+        }
+        Expression::UnaryExpression(unary) => {
+            unary.operator == oxc_syntax::operator::UnaryOperator::Void
+        }
+        Expression::ParenthesizedExpression(inner) => {
+            written_undefined(semantic, &inner.expression)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expression` evaluates to something other than `undefined` whatever the program does:
+/// a literal other than a name, so a parameter default it is passed for never runs.
+fn never_undefined(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::TemplateLiteral(_)
+        | Expression::ArrayExpression(_)
+        | Expression::ObjectExpression(_) => true,
+        Expression::ParenthesizedExpression(inner) => never_undefined(&inner.expression),
+        other => is_value_literal(other),
+    }
+}
+
+/// A scalar literal or a function: evaluating it creates a value that is never `undefined` and
+/// runs no code.
+fn is_value_literal(expression: &Expression<'_>) -> bool {
+    matches!(
+        expression,
+        Expression::StringLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::FunctionExpression(_)
+            | Expression::ArrowFunctionExpression(_)
+    )
+}
+
+/// Whether evaluating `expression` only creates values and runs no code: a literal, a name this
+/// file binds or imports (reading a binding calls nothing; a free name may be a global getter), a
+/// function or arrow, or an array or object literal of those with plain keys and no spread.
+/// Member reads, computed keys, operators and calls can run code and are not admitted.
+fn creates_without_running(semantic: &Semantic<'_>, expression: &Expression<'_>) -> bool {
+    if is_value_literal(expression) {
+        return true;
+    }
+    match expression {
+        Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+        Expression::Identifier(identifier) => {
+            identifier.reference_id.get().is_some_and(|reference| {
+                semantic
+                    .scoping()
+                    .get_reference(reference)
+                    .symbol_id()
+                    .is_some()
+            })
+        }
+        Expression::ArrayExpression(array) => array.elements.iter().all(|element| {
+            element.is_elision()
+                || element
+                    .as_expression()
+                    .is_some_and(|inner| creates_without_running(semantic, inner))
+        }),
+        Expression::ObjectExpression(object) => object.properties.iter().all(|property| {
+            matches!(property, ObjectPropertyKind::ObjectProperty(property)
+                if !property.computed
+                    && (property.method
+                        || property.kind != PropertyKind::Init
+                        || creates_without_running(semantic, &property.value)))
+        }),
+        Expression::ParenthesizedExpression(inner) => {
+            creates_without_running(semantic, &inner.expression)
+        }
+        Expression::TSAsExpression(inner) => creates_without_running(semantic, &inner.expression),
+        Expression::TSSatisfiesExpression(inner) => {
+            creates_without_running(semantic, &inner.expression)
+        }
+        Expression::TSNonNullExpression(inner) => {
+            creates_without_running(semantic, &inner.expression)
+        }
+        _ => false,
+    }
+}
+
+/// The expressions a binding pattern evaluates while it binds: defaults go to `inputs`, and a
+/// value the pattern goes on to read or coerce goes to `read` -- a default destructured further
+/// (its getters run) and a computed key (its `toString` runs).
+fn pattern_inputs<'p, 'a>(
+    pattern: &'p BindingPattern<'a>,
+    inputs: &mut Vec<&'p Expression<'a>>,
+    read: &mut Vec<&'p Expression<'a>>,
+) {
+    match pattern {
+        BindingPattern::BindingIdentifier(_) => {}
+        BindingPattern::AssignmentPattern(assignment) => {
+            inputs.push(&assignment.right);
+            if !matches!(assignment.left, BindingPattern::BindingIdentifier(_)) {
+                read.push(&assignment.right);
+            }
+            pattern_inputs(&assignment.left, inputs, read);
+        }
+        BindingPattern::ObjectPattern(object) => {
+            for property in &object.properties {
+                read.extend(property.key.as_expression());
+                pattern_inputs(&property.value, inputs, read);
+            }
+            if let Some(rest) = &object.rest {
+                pattern_inputs(&rest.argument, inputs, read);
+            }
+        }
+        BindingPattern::ArrayPattern(array) => {
+            for element in array.elements.iter().flatten() {
+                pattern_inputs(element, inputs, read);
+            }
+            if let Some(rest) = &array.rest {
+                pattern_inputs(&rest.argument, inputs, read);
+            }
+        }
+    }
+}
+
 /// Scans the part of the file at `path` named by `root`, and returns the edges it reaches.
 /// `at_import` says the code runs while an importing module loads.
 fn scan_file(path: &Path, root: &Root, at_import: bool) -> Option<Vec<Edge>> {
@@ -840,6 +1215,9 @@ struct Scanner<'s, 'a> {
     /// the scan is of a call's arguments, and a callback reassigned or a config changed before the
     /// call is not the declaration that was read.
     written: Option<&'s HashSet<SymbolId>>,
+    /// The parameter list of the helper whose call inputs are scanned, and the call: following a
+    /// binding whose value is unknown there is refused (see [`Scanner::unknown_at_call`]).
+    helper_call: Option<(Span, Span)>,
     failed: bool,
     /// Whether the scan is of a module's import-time code (see [`Root::ImportTime`]). `vi` and
     /// `expect` used there change what every test in the importing file sees, and no test's
@@ -878,6 +1256,7 @@ impl<'s, 'a> Scanner<'s, 'a> {
             queue: Vec::new(),
             edges: Vec::new(),
             written: None,
+            helper_call: None,
             failed: false,
             import_time: false,
         }
@@ -1350,12 +1729,38 @@ impl<'s, 'a> Scanner<'s, 'a> {
                 }
                 self.queue.push(Pending::Declarator(declarator));
             }
+            AstKind::FormalParameter(_)
+            | AstKind::FormalParameterRest(_)
+            | AstKind::CatchParameter(_)
+                if self.unknown_at_call(declaration) =>
+            {
+                self.failed = true;
+            }
             AstKind::Function(function) => self.queue.push(Pending::Function(function)),
             AstKind::Class(class) => self.queue.push(Pending::Class(class)),
             // A namespace object carries every member it declares.
             AstKind::TSNamespaceDeclaration(namespace) => self.seed_namespace_members(namespace),
             _ => {}
         }
+    }
+
+    /// Whether the parameter or catch binding `declaration` holds a value no declaration shows at
+    /// the helper call: the helper's own parameter holds the call's argument (`hook = register()`
+    /// runs the caller's function), and one of a function or `catch` the call sits in holds what
+    /// that function was called with or what was thrown (`forward(opts) { setup(opts) }`).
+    fn unknown_at_call(&self, declaration: NodeId) -> bool {
+        let Some((parameters, call)) = self.helper_call else {
+            return false;
+        };
+        let nodes = self.semantic.nodes();
+        let owner = nodes.parent_id(declaration);
+        let scope = match nodes.get_node(owner).kind() {
+            AstKind::FormalParameters(list) if list.span == parameters => return true,
+            AstKind::FormalParameters(_) => nodes.parent_kind(owner).span(),
+            AstKind::CatchClause(clause) => clause.span,
+            _ => return false,
+        };
+        scope.start <= call.start && call.end <= scope.end
     }
 
     /// Judges a free name: a Vitest export is judged by the caller, a host global is harmless, an

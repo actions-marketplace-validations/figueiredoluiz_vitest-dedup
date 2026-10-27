@@ -538,6 +538,13 @@ const DELIBERATE_BLIND_FILES = new Set([
   'recall/concise-suite-guarded-hook-uncertainty/run.test.ts',
   // A local helper reassigned with no overload signature: refused for the reassignment alone.
   'recall/local-helper-reassigned/run.test.ts',
+  // A generator helper, whose body a call does not run: refused, so the tests it declares are
+  // neither invented nor dropped silently.
+  'recall/local-helper-generator/run.test.ts',
+  // A helper whose destructuring parameter cannot bind its argument: the call throws before the
+  // body runs, so it is refused and the remaining test is unresolved.
+  'recall/local-helper-null-destructure/run.test.ts',
+  'recall/local-helper-noniterable-destructure/run.test.ts',
   // A local `const` arrow and a called parameter whose bodies are not read: refused so the tests
   // they declare are not dropped silently. The arrow stays blind until `const` helpers are inlined.
   'recall/local-helper-const-arrow/run.test.ts',
