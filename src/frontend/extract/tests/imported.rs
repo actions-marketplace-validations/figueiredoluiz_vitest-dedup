@@ -129,6 +129,30 @@ impl RunnerCase {
 
 const SIMPLE_RUNNER: &str = "import { test, expect } from 'vitest'; export function run() { test('a', () => { expect(3).toBe(3) }); test('b', () => { expect(3).toBe(3) }); }";
 
+/// Nested local helpers preserve initializer registrations and refuse unwalked hook effects.
+#[test]
+fn imported_runner_local_helper_initializers() {
+    for (effect, incomplete, hooks) in [
+        ("const registered = beforeEach(() => {});", false, 1),
+        ("true && beforeEach(() => {});", true, 0),
+    ] {
+        let helper = format!("import {{ test, beforeEach }} from 'vitest'; export function run() {{ const local = () => {{ {effect} const testRegistration = test('hidden', () => {{}}); }}; local(); }}");
+        let case = RunnerCase::new(&helper, "run(); test('visible', () => {});");
+        let extraction = case.extract(Globals::Disabled);
+        let tests = declared_tests(&extraction);
+        assert_eq!(tests.len(), if incomplete { 1 } else { 2 });
+        assert_eq!(
+            extraction.incomplete, incomplete,
+            "{:?}",
+            extraction.diagnostics
+        );
+        assert!(tests
+            .iter()
+            .all(|test| test.context.unresolved == incomplete));
+        assert!(tests.iter().all(|test| test.context.hooks.len() == hooks));
+    }
+}
+
 #[test]
 /// Retains caller hook/setup/configuration context while using the helper's lexical frame.
 fn caller_hooks_setup_configuration_and_modifiers_survive_the_helper_frame() {
@@ -602,8 +626,9 @@ fn default_namespace_spread_and_opaque_nested_callables_are_explicitly_refused()
     let helpers = [
         "export default makeRunner;",
         "export const run = () => setup();",
-        "export function run() { const local = () => test('a', () => {}); local(); }",
         "export function run() { const local = setup(); }",
+        "export function run() { let local = () => test('a', () => {}); local(); }",
+        "export function run() { local(); const local = () => test('a', () => {}); }",
         "export function run(value = test('default', () => {})) { return 2; }",
         "export function run() { return; test('a', () => {}); }",
     ];
@@ -621,6 +646,14 @@ fn default_namespace_spread_and_opaque_nested_callables_are_explicitly_refused()
         assert_eq!(extraction.tests.len(), 0);
         assert!(extraction.incomplete, "{helper}");
     }
+    // A `const` helper the runner initializes before calling it is read like a nested function.
+    let nested = RunnerCase::new(
+        "import { test } from 'vitest'; export function run() { const local = () => test('a', () => {}); local(); }",
+        "run();",
+    );
+    let extraction = nested.extract(Globals::Disabled);
+    assert_eq!(extraction.tests.len(), 1, "{:?}", extraction.diagnostics);
+    assert!(!extraction.incomplete, "{:?}", extraction.diagnostics);
     for method in ["call", "apply"] {
         let ordinary = RunnerCase::new(
             "export function run() { return 2; }",

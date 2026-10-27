@@ -21,10 +21,10 @@ use crate::model::{
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, ArrowFunctionBody, AssignmentOperator, AssignmentTarget,
-    BindingPattern, CallExpression, Expression, ForOfStatement, ForStatementLeft, FormalParameters,
-    Function, FunctionType, IdentifierReference, ImportDeclarationSpecifier, LabelIdentifier,
-    ObjectExpression, ObjectPropertyKind, Program, Statement, TemplateLiteral, UnaryOperator,
-    VariableDeclarator,
+    BindingPattern, CallExpression, ChainElement, Expression, ForOfStatement, ForStatementLeft,
+    FormalParameters, Function, FunctionType, IdentifierReference, ImportDeclarationSpecifier,
+    LabelIdentifier, ObjectExpression, ObjectPropertyKind, Program, Statement, TemplateLiteral,
+    UnaryOperator, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
@@ -43,10 +43,11 @@ mod setup_identity;
 
 use super::fingerprint::{fingerprint, FunctionLike, RowSubstitution};
 use super::registry::{
-    canonicalize_export_name, const_fold, is_ecmascript_trim_whitespace, js_number_to_string,
-    js_radix_digits_value, property_key_name, render_js_to_string, resolve_callee, source_text,
-    split_radix_prefix, CellValue, ChainStep, Globals, ImportedConstants, Registry, ResolvedCallee,
-    Row, RowCells, TitleArg, TitleNumber, OVER_LIMIT_TABLE,
+    canonicalize_export_name, const_fold, is_ecmascript_trim_whitespace,
+    is_import_meta_vitest_expr, js_number_to_string, js_radix_digits_value, property_key_name,
+    render_js_to_string, resolve_callee, source_text, split_radix_prefix, CellValue, ChainStep,
+    Globals, ImportedConstants, Registry, ResolvedCallee, Row, RowCells, TitleArg, TitleNumber,
+    OVER_LIMIT_TABLE,
 };
 use super::FileExtraction;
 
@@ -617,8 +618,7 @@ fn collect_module_setup(
     program: &Program,
     source: &str,
     semantic: &Semantic,
-    import_specifiers: &HashMap<SymbolId, Arc<str>>,
-    exported_as: &HashMap<SymbolId, String>,
+    registry: &Registry,
 ) -> Vec<(u32, String)> {
     let mut calls = Vec::new();
     for statement in &program.body {
@@ -631,8 +631,7 @@ fn collect_module_setup(
                     .then(|| await_expression.argument.span())
             }
             Expression::CallExpression(call) => {
-                is_ambient_state_call(call, semantic, import_specifiers, exported_as)
-                    .then(|| call.span())
+                is_ambient_state_call(call, semantic, registry).then(|| call.span())
             }
             _ => None,
         };
@@ -655,74 +654,19 @@ fn collect_module_setup(
     calls
 }
 
-/// Whether a module-top-level call establishes ambient state every test in the file inherits.
-///
-/// The second admission rule for [`collect_module_setup`], and the narrowest one that closes a
-/// four-instance false-positive class. `Context` saw only AWAITED module-scope calls, so a
-/// synchronous one was invisible and two files differing *only* in it compared equal —
-/// `cross-file-duplicate` then reported them "under an equivalent context" for:
-///
-/// ```text
-/// vi.useFakeTimers()                          vs  vi.useRealTimers()
-/// vi.spyOn(flags, 'isEnabled').mockReturnValue(true)  vs  ...(false)
-/// vi.stubEnv('MODE', 'production')            vs  ...'development'
-/// expect.extend({ toBeWithin: inclusive })    vs  ...exclusive
-/// ```
-///
-/// In the last of those, exactly one of the two "identical" tests passes.
-///
-/// **Why not simply admit every module-scope call.** [`crate::model::Context::module_setup`]'s
-/// doc rules it out in as many words: since S11 a module-scope helper call can *declare tests*,
-/// and folding it into the context key would key those tests on their own declaration. So the
-/// rule keys on the CALLEE instead — a member call on a resolved `vi` or `expect` namespace is
-/// the framework changing ambient behaviour, and a call to anything else is ordinary program
-/// text. That resolution is [`is_vitest_namespace`], the same three-state binding check
-/// `redundant-hook` uses, so a file-local `const vi = createFakeVi()` does not qualify here
-/// either.
-///
-/// **Whole-namespace, not an allowlist.** Naming the four APIs that were reported would leave
-/// `vi.stubGlobal` and everything Vitest adds next behaving the old way — this repository's most
-/// repeated defect is a fix that lands for the reported site and not its siblings.
-///
-/// `vi.mock`/`vi.unmock` are excluded: [`collect_mocked_modules`] already folds them into
-/// `Context::mocked_modules`, and admitting them twice would move every existing `contextKey`
-/// that has one without changing what the key distinguishes.
-fn is_ambient_state_call(
-    call: &CallExpression,
-    semantic: &Semantic,
-    import_specifiers: &HashMap<SymbolId, Arc<str>>,
-    exported_as: &HashMap<SymbolId, String>,
-) -> bool {
-    /// Already modelled as [`crate::model::Context::mocked_modules`].
-    const ALREADY_MODELLED: [&str; 2] = ["mock", "unmock"];
-
-    // Walk to the root of the member/call chain. `vi.spyOn(f, 'x').mockReturnValue(true)` is a
-    // call whose callee's object is itself a CALL, not an identifier, so stopping at the first
-    // member expression misses exactly the case with the widest blast radius -- measured: the
-    // spy false positive survived a first version of this function that did.
+/// Whether a top-level call chain changes framework state not already carried by mock context.
+fn is_ambient_state_call(call: &CallExpression, semantic: &Semantic, registry: &Registry) -> bool {
     let mut cursor = &call.callee;
-    let mut root_property: Option<&str> = None;
     loop {
+        if let Some((api, method)) = registry.api_member(cursor, semantic) {
+            return api == "expect" || !matches!(method.as_str(), "mock" | "unmock");
+        }
+        if registry.api_name(cursor, semantic).is_some() {
+            return true;
+        }
         match cursor {
-            Expression::StaticMemberExpression(member) => {
-                root_property = Some(member.property.name.as_str());
-                cursor = &member.object;
-            }
+            Expression::StaticMemberExpression(member) => cursor = &member.object,
             Expression::CallExpression(inner) => cursor = &inner.callee,
-            Expression::Identifier(object) => {
-                // `vi.mock(...)` is excluded by the property directly on the namespace, which is
-                // the one this walk ends holding.
-                if is_vitest_namespace(object, "vi", semantic, import_specifiers, exported_as) {
-                    return !root_property.is_some_and(|p| ALREADY_MODELLED.contains(&p));
-                }
-                return is_vitest_namespace(
-                    object,
-                    "expect",
-                    semantic,
-                    import_specifiers,
-                    exported_as,
-                );
-            }
             _ => return false,
         }
     }
@@ -732,13 +676,12 @@ fn is_ambient_state_call(
 fn collect_import_specifiers(
     program: &Program,
     file: &std::path::Path,
-) -> (HashMap<SymbolId, Arc<str>>, HashMap<SymbolId, String>) {
+) -> HashMap<SymbolId, Arc<str>> {
     let mut map = HashMap::new();
     // Local symbol to the name it was EXPORTED under, which is not always the name it is used by:
     // `import { vi as v } from 'vitest'` binds `v` to the export `vi`. Without this, a namespace
     // check comparing the LOCAL name rejects an aliased import, so `v.useFakeTimers()` never
     // reaches `module_setup` and the false positive C1 removes comes straight back. Measured.
-    let mut exported_as = HashMap::new();
     // One shared allocation per distinct specifier in the file: every binding of it, across
     // however many declarations, and every test that references one of them, holds an `Arc` to
     // this same text. Keyed by the specifier as written; `file` is fixed, so the same text always
@@ -753,30 +696,25 @@ fn collect_import_specifiers(
             continue;
         };
         for specifier in specifiers {
-            let (local, export) = match specifier {
-                ImportDeclarationSpecifier::ImportSpecifier(s) => {
-                    if matches!(s.import_kind, oxc_ast::ast::ImportOrExportKind::Type) {
+            let local = match specifier {
+                ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
+                    if matches!(
+                        specifier.import_kind,
+                        oxc_ast::ast::ImportOrExportKind::Type
+                    ) {
                         continue;
                     }
-                    (&s.local, Some(s.imported.name().to_string()))
+                    &specifier.local
                 }
-                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
-                    (&s.local, Some("default".to_owned()))
-                }
-                // A namespace import binds the whole module, so there is no single export name to
-                // record. `vitest.vi.useFakeTimers()` is a two-level chain the namespace check does
-                // not model either way; left as it was rather than half-handled here.
-                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => (&s.local, None),
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => &specifier.local,
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => &specifier.local,
             };
             if let Some(symbol_id) = local.symbol_id.get() {
                 map.insert(symbol_id, Arc::clone(&identity));
-                if let Some(export) = export {
-                    exported_as.insert(symbol_id, export);
-                }
             }
         }
     }
-    (map, exported_as)
+    map
 }
 
 /// The local bindings of `mockNuxtImport` imported from `@nuxt/test-utils`.
@@ -927,30 +865,53 @@ fn collect_mocked_modules(
         call: &CallExpression<'_>,
         registry: &Registry,
         semantic: &Semantic<'_>,
-        source: &str,
-        file: &std::path::Path,
     ) -> Option<String> {
-        // Only the root and the last member matter here; never read a `.each` table's rows.
-        registry.limit_table_rows(0);
-        let resolved = resolve_callee(
-            &call.callee,
-            registry,
-            semantic,
-            &ImportedConstants::default(),
-            source,
-            file,
-        )?;
-        if resolved.root != "vi" {
-            return None;
+        let (api, member) = registry.api_member(&call.callee, semantic)?;
+        (api == "vi" && matches!(member.as_str(), "mock" | "unmock" | "doMock" | "doUnmock"))
+            .then_some(member)
+    }
+
+    /// Vitest recognizes direct vi/vitest member syntax for hoisting; identity through an alias
+    /// or namespace alone says nothing about whether imports execute before the mock.
+    fn hoistable(call: &CallExpression, semantic: &Semantic, source: &str) -> bool {
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return false;
+        };
+        let Expression::Identifier(object) = &member.object else {
+            return false;
+        };
+        if call.optional || member.optional || !matches!(object.name.as_str(), "vi" | "vitest") {
+            return false;
         }
-        match resolved.steps.last() {
-            Some(ChainStep::Member(name))
-                if matches!(name.as_str(), "mock" | "unmock" | "doMock" | "doUnmock") =>
-            {
-                Some(name.clone())
+        if let Some(symbol) = object
+            .reference_id
+            .get()
+            .and_then(|id| semantic.scoping().get_reference(id).symbol_id())
+        {
+            if matches!(
+                semantic
+                    .nodes()
+                    .kind(semantic.scoping().symbol_declaration(symbol)),
+                AstKind::VariableDeclarator(_)
+            ) {
+                return false;
             }
-            _ => None,
         }
+        // Match the transform's whitespace-only trigger; comments/TS syntax may prevent it.
+        let text = source_text(source, call.span);
+        let Some(tail) = text.strip_prefix(object.name.as_str()) else {
+            return false;
+        };
+        let Some(tail) = tail.trim_start().strip_prefix('.') else {
+            return false;
+        };
+        let Some(tail) = tail
+            .trim_start()
+            .strip_prefix(member.property.name.as_str())
+        else {
+            return false;
+        };
+        tail.trim_start().starts_with('(')
     }
 
     let mut unresolved = false;
@@ -967,10 +928,14 @@ fn collect_mocked_modules(
         let Expression::CallExpression(call) = &expression_statement.expression else {
             continue;
         };
-        let Some(member) = mocking_member(call, registry, semantic, source, file) else {
+        let Some(member) = mocking_member(call, registry, semantic) else {
             continue;
         };
         read_at_top_level.insert((call.span.start, call.span.end));
+        if !hoistable(call, semantic, source) {
+            unresolved = true;
+            continue;
+        }
         match member.as_str() {
             "mock" => match call.arguments.first() {
                 Some(Argument::StringLiteral(literal)) => {
@@ -1080,8 +1045,6 @@ fn collect_mocked_modules(
     struct NestedMockScan<'r, 'a> {
         registry: &'r Registry,
         semantic: &'r Semantic<'a>,
-        source: &'r str,
-        file: &'r std::path::Path,
         read_at_top_level: &'r HashSet<(u32, u32)>,
         nuxt_mock_symbols: &'r HashSet<SymbolId>,
         found: bool,
@@ -1093,8 +1056,7 @@ fn collect_mocked_modules(
             if !self
                 .read_at_top_level
                 .contains(&(it.span.start, it.span.end))
-                && (mocking_member(it, self.registry, self.semantic, self.source, self.file)
-                    .is_some()
+                && (mocking_member(it, self.registry, self.semantic).is_some()
                     || is_nuxt_mock_call(it, self.semantic, self.nuxt_mock_symbols))
             {
                 self.found = true;
@@ -1105,8 +1067,6 @@ fn collect_mocked_modules(
     let mut nested = NestedMockScan {
         registry,
         semantic,
-        source,
-        file,
         read_at_top_level: &read_at_top_level,
         nuxt_mock_symbols: &nuxt_mock_symbols,
         found: false,
@@ -1158,14 +1118,50 @@ struct BindingValue {
 /// the inlined walk and popped by [`Walker::end_helper_expansion`].
 #[derive(Clone, Copy)]
 struct HelperFrame<'a> {
-    /// The helper's declaration, whose `body` is what gets walked.
-    function: &'a Function<'a>,
+    /// The helper whose body is what gets walked.
+    helper: LocalHelper<'a>,
+    /// Where the call that opened this frame starts: one link of the execution chain
+    /// [`Walker::initialized_before_call`] reads.
+    call_start: u32,
     /// How many entries this frame pushed onto [`Walker::param_bindings`], to truncate back to on
     /// the way out.
     bindings: usize,
     /// An explicit throw observed while walking this expansion or a nested expansion.
     /// Unlike a return, it may leave the caller too, so its exit uncertainty must survive.
     saw_throw: bool,
+}
+
+/// A helper this file declares and the walker inlines: a `function` declaration, or the arrow or
+/// function expression a `const` binding holds.
+#[derive(Clone, Copy)]
+struct LocalHelper<'a> {
+    /// Where the callable starts, its expansion identity.
+    start: u32,
+    params: &'a FormalParameters<'a>,
+    body: LocalHelperBody<'a>,
+    /// Calling a generator only creates an iterator; its body does not run.
+    generator: bool,
+    asynchronous: bool,
+}
+
+impl<'a> LocalHelper<'a> {
+    /// The helper a function with a body is; `None` for an overload signature or `declare`.
+    fn of_function(function: &'a Function<'a>) -> Option<Self> {
+        Some(Self {
+            start: function.span.start,
+            params: &function.params,
+            body: LocalHelperBody::Statements(&function.body.as_ref()?.statements),
+            generator: function.generator,
+            asynchronous: function.r#async,
+        })
+    }
+}
+
+/// A [`LocalHelper`]'s body: a statement list, or a concise arrow's single call.
+#[derive(Clone, Copy)]
+enum LocalHelperBody<'a> {
+    Statements(&'a [Statement<'a>]),
+    Concise(&'a CallExpression<'a>),
 }
 
 /// One conditional exit a statement list left open: the branch later statements land in when
@@ -1374,7 +1370,6 @@ struct Walker<'a> {
     /// test's `Context::unresolved` in [`Walker::push_test_case`].
     mocks_unresolved: bool,
     import_specifiers: HashMap<SymbolId, Arc<str>>,
-    exported_as: HashMap<SymbolId, String>,
     suite_path: Vec<Title>,
     hook_scopes: Vec<ScopeHooks>,
     /// The control-flow positions the walk is currently inside, outermost first -- an `if`
@@ -1510,12 +1505,12 @@ impl<'a> Walker<'a> {
         semantic: &'a Semantic<'a>,
         globals: Globals,
     ) -> Self {
-        let (import_specifiers, exported_as) = collect_import_specifiers(program, &file.path);
+        let import_specifiers = collect_import_specifiers(program, &file.path);
         let registry = Registry::new(program, globals);
         let (mocked_modules, mocks_unresolved) =
             collect_mocked_modules(program, &registry, semantic, source, &file.path);
         let (module_setup_starts, module_setup): (Vec<u32>, Vec<String>) =
-            collect_module_setup(program, source, semantic, &import_specifiers, &exported_as)
+            collect_module_setup(program, source, semantic, &registry)
                 .into_iter()
                 .unzip();
         Self {
@@ -1533,7 +1528,6 @@ impl<'a> Walker<'a> {
             setup_site: None,
             written: std::cell::OnceCell::new(),
             import_specifiers,
-            exported_as,
             suite_path: Vec::new(),
             hook_scopes: vec![ScopeHooks::default()],
             guards: Vec::new(),
@@ -1605,18 +1599,41 @@ impl<'a> Walker<'a> {
         match statement {
             Statement::VariableDeclaration(declaration) => {
                 for declarator in &declaration.declarations {
-                    self.register_variable_declarator(declarator, registry);
+                    let handled_binding = self.register_variable_declarator(declarator, registry);
+                    if let Some(frame) = self.helper_frames.last() {
+                        if matches!(declarator.id, BindingPattern::BindingIdentifier(_)) {
+                            if let Some(init) = &declarator.init {
+                                self.prepare_helper_expression(init, registry);
+                            }
+                        } else if !handled_binding
+                            && !self.guards_prove_unreachable()
+                            && !registration_free::ignored_declarator_registers_nothing(
+                                self.program,
+                                self.semantic,
+                                self.written_bindings(),
+                                &self.file.path,
+                                frame.helper.params.span,
+                                declarator,
+                            )
+                        {
+                            self.refuse_unwalked_helper_expression();
+                        }
+                    }
                 }
             }
             Statement::ExpressionStatement(expression_statement) => {
                 if let Expression::CallExpression(call) = &expression_statement.expression {
                     self.prepare_call(call, registry);
+                } else {
+                    self.prepare_helper_expression(&expression_statement.expression, registry);
                 }
             }
             // `return f()` runs `f()` before it leaves, exactly as the statement `f()` would.
             Statement::ReturnStatement(return_statement) => {
                 if let Some(Expression::CallExpression(call)) = &return_statement.argument {
                     self.prepare_call(call, registry);
+                } else if let Some(expression) = &return_statement.argument {
+                    self.prepare_helper_expression(expression, registry);
                 }
             }
             // A bare block does not introduce a new hook scope; its hooks belong to the
@@ -1644,6 +1661,96 @@ impl<'a> Walker<'a> {
             // control-flow constructs, whose reading must not differ between the passes.
             other => self.guarded_control_flow(other, registry, Self::prepare_statement),
         }
+    }
+
+    /// Reads a helper initializer's direct call; other unwalked expressions must register nothing.
+    fn prepare_helper_expression(&mut self, expression: &Expression<'a>, registry: &mut Registry) {
+        if self.helper_frames.is_empty() || self.guards_prove_unreachable() {
+            return;
+        }
+        // Resolving the whole initializer recognizes a factory value, not a registration.
+        let proved = if self.resolve_call_callee(expression, registry).is_some() {
+            self.factory_inputs_register_nothing(expression)
+        } else {
+            match expression {
+                Expression::CallExpression(call) => {
+                    self.prepare_call(call, registry);
+                    return;
+                }
+                _ => self.ignored_helper_expression_registers_nothing(expression),
+            }
+        };
+        if !proved {
+            self.refuse_unwalked_helper_expression();
+        }
+    }
+
+    /// Checks every evaluated input of a registry-recognized factory, including earlier chain links.
+    fn factory_inputs_register_nothing(&self, mut expression: &Expression<'a>) -> bool {
+        loop {
+            let call = match super::registry::unwrap_transparent(expression) {
+                Expression::Identifier(_) => return true,
+                Expression::CallExpression(call) => call.as_ref(),
+                Expression::StaticMemberExpression(member) => {
+                    expression = &member.object;
+                    continue;
+                }
+                Expression::TaggedTemplateExpression(tagged) => {
+                    if !tagged
+                        .quasi
+                        .expressions
+                        .iter()
+                        .all(|input| self.ignored_helper_expression_registers_nothing(input))
+                    {
+                        return false;
+                    }
+                    expression = &tagged.tag;
+                    continue;
+                }
+                Expression::ChainExpression(chain) => match &chain.expression {
+                    ChainElement::CallExpression(call) => call.as_ref(),
+                    ChainElement::StaticMemberExpression(member) => {
+                        expression = &member.object;
+                        continue;
+                    }
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            if !call.arguments.iter().all(|argument| {
+                argument
+                    .as_expression()
+                    .is_some_and(|input| self.ignored_helper_expression_registers_nothing(input))
+            }) {
+                return false;
+            }
+            expression = &call.callee;
+        }
+    }
+
+    /// Proves evaluation effects with the active helper's parameter bindings left unknown.
+    fn ignored_helper_expression_registers_nothing(&self, expression: &Expression<'a>) -> bool {
+        registration_free::ignored_expression_registers_nothing(
+            self.program,
+            self.semantic,
+            self.written_bindings(),
+            &self.file.path,
+            self.helper_frames
+                .last()
+                .expect("active helper")
+                .helper
+                .params
+                .span,
+            expression,
+        )
+    }
+
+    /// Makes an unwalked helper effect visible and excludes its scope from comparison.
+    fn refuse_unwalked_helper_expression(&mut self) {
+        self.refuse_helper_expansion(refusal(
+            ExclusionReason::HelperEffectsUnproved,
+            "an unwalked expression in the called helper may register tests or hooks",
+        ));
     }
 
     /// Prepare all statements of a block body, otherwise prepare the single body statement.
@@ -1716,7 +1823,7 @@ impl<'a> Walker<'a> {
             if let Expression::Identifier(ident) = &call.callee {
                 if let Some(kind) = hook_kind(ident.name.as_str()) {
                     if self.is_free_reference(ident) {
-                        self.record_hook(call, kind);
+                        self.record_hook(call, kind, registry);
                         return;
                     }
                 }
@@ -1740,7 +1847,7 @@ impl<'a> Walker<'a> {
             None
         };
         if let Some(kind) = kind {
-            self.record_hook(call, kind);
+            self.record_hook(call, kind, registry);
         }
     }
 
@@ -1794,7 +1901,18 @@ impl<'a> Walker<'a> {
                     self.classify_call(call, registry);
                 }
             }
-            // Already handled by `prepare_statements`.
+            // Bindings and hooks were prepared already; a helper initializer may also declare tests.
+            Statement::VariableDeclaration(declaration) if !self.helper_frames.is_empty() => {
+                for declarator in &declaration.declarations {
+                    if matches!(declarator.id, BindingPattern::BindingIdentifier(_)) {
+                        if let Some(init @ Expression::CallExpression(call)) = &declarator.init {
+                            if self.resolve_call_callee(init, registry).is_none() {
+                                self.classify_call(call, registry);
+                            }
+                        }
+                    }
+                }
+            }
             Statement::VariableDeclaration(_) => {}
             Statement::BlockStatement(block) => self.walk_statement_list(&block.body, registry),
             Statement::ForOfStatement(for_of) => {
@@ -2507,13 +2625,16 @@ impl<'a> Walker<'a> {
     }
 
     /// Binds a local symbol introduced outside a plain `import` statement: either an
-    /// `import.meta.vitest` destructure, or a `test.extend(...)` result.
+    /// `import.meta.vitest` destructure, or a `test.extend(...)` result. Returns whether a simple
+    /// in-source destructure was fully handled, with no defaults, computed keys or rest to evaluate.
     fn register_variable_declarator(
         &mut self,
         declarator: &VariableDeclarator<'a>,
         registry: &mut Registry,
-    ) {
-        let Some(init) = &declarator.init else { return };
+    ) -> bool {
+        let Some(init) = &declarator.init else {
+            return false;
+        };
 
         if is_import_meta_vitest_expr(init) {
             if let BindingPattern::ObjectPattern(pattern) = &declarator.id {
@@ -2530,17 +2651,22 @@ impl<'a> Walker<'a> {
                         }
                     }
                 }
+                return pattern.rest.is_none()
+                    && pattern.properties.iter().all(|property| {
+                        !property.computed
+                            && matches!(property.value, BindingPattern::BindingIdentifier(_))
+                    });
             }
-            return;
+            return false;
         }
 
         // `const myTest = baseTest.extend({...})` (or a plain re-export like `const x = test`):
         // either way, `myTest`/`x` should resolve exactly like `resolved` did, fixtures included.
         let Some(resolved) = self.resolve_call_callee(init, registry) else {
-            return;
+            return false;
         };
         if resolved.root != "test" {
-            return;
+            return false;
         }
         if let BindingPattern::BindingIdentifier(binding) = &declarator.id {
             if let Some(symbol_id) = binding.symbol_id.get() {
@@ -2552,6 +2678,7 @@ impl<'a> Walker<'a> {
                 );
             }
         }
+        false
     }
 
     /// Dispatch recognized test/suite calls for emission; attempt helper expansion for
@@ -2594,7 +2721,7 @@ impl<'a> Walker<'a> {
 
     /// Fingerprint a readable hook callback and record its kind, location and idempotence in
     /// the current scope.
-    fn record_hook(&mut self, call: &CallExpression<'a>, kind: HookKind) {
+    fn record_hook(&mut self, call: &CallExpression<'a>, kind: HookKind, registry: &Registry) {
         // The refusal below covers every registration under a guard, including one whose
         // callback is not inline (`beforeEach(reset)`): the early return for a missing
         // function-like argument must not skip it, or a guarded registration that names its
@@ -2630,7 +2757,7 @@ impl<'a> Walker<'a> {
             &function_like,
             self.semantic,
             &self.import_specifiers,
-            &self.exported_as,
+            registry,
         );
         // A hook body is never a `.each` row callback -- nothing to substitute.
         let body = fingerprint(
@@ -3088,16 +3215,17 @@ impl<'a> Walker<'a> {
         if self.refuse_redeclared_helper(&call.callee) {
             return;
         }
-        if self.resolve_local_helper(&call.callee).is_some() {
-            self.with_helper_body(call, registry, walk);
+        if self.resolve_local_helper(call).is_some() {
+            self.with_helper_body(call, registry, walk, prepare);
         } else if !self.refuse_unread_local_helper(call) {
             self.imported_helper_call(call, prepare);
         }
     }
 
-    /// Refuses a call to a local binding this walker does not inline (an arrow or function
-    /// expression, a parameter, a value computed elsewhere) unless the call provably registers
-    /// nothing: skipping it would drop whatever it declares silently. Whether it refused.
+    /// Refuses a call to a local binding this walker does not inline (a `let` function, a
+    /// parameter, a `const` read before it is initialized, a value computed elsewhere) unless the
+    /// call provably registers nothing: skipping it would drop whatever it declares silently.
+    /// Whether it refused.
     fn refuse_unread_local_helper(&mut self, call: &CallExpression<'a>) -> bool {
         let Expression::Identifier(ident) = &call.callee else {
             return false;
@@ -3141,7 +3269,7 @@ impl<'a> Walker<'a> {
         }
         self.refuse_helper_expansion(refusal(
             ExclusionReason::HelperExportUnreadable,
-            "the called local helper is not a `function` declaration",
+            "the called local helper is not a `function` declaration or an initialized `const` function",
         ));
         true
     }
@@ -3156,6 +3284,7 @@ impl<'a> Walker<'a> {
         call: &CallExpression<'a>,
         registry: &mut Registry,
         walk: fn(&mut Self, &[Statement<'a>], &mut Registry),
+        prepare: bool,
     ) {
         let Some(frame) = self.begin_helper_expansion(call) else {
             return;
@@ -3173,8 +3302,10 @@ impl<'a> Walker<'a> {
             .last()
             .expect("root hook scope")
             .exit_unexpressible;
-        if let Some(body) = &frame.function.body {
-            walk(self, &body.statements, registry);
+        match frame.helper.body {
+            LocalHelperBody::Statements(statements) => walk(self, statements, registry),
+            LocalHelperBody::Concise(body) if prepare => self.prepare_call(body, registry),
+            LocalHelperBody::Concise(body) => self.classify_call(body, registry),
         }
         // A local return cannot skip caller registrations. Keep the guards and any unresolved
         // hooks recorded in the helper, but end its local exit state at the function boundary.
@@ -3204,18 +3335,18 @@ impl<'a> Walker<'a> {
     /// (silently, when `call` is simply not a local helper; with a diagnostic when it is one this
     /// walker refuses to expand -- see [`Self::refuse_helper_expansion`]).
     fn begin_helper_expansion(&mut self, call: &CallExpression<'a>) -> Option<HelperFrame<'a>> {
-        let (_, function) = self.resolve_local_helper(&call.callee)?;
+        let helper = self.resolve_local_helper(call)?;
         let identity = (
             self.file
                 .path
                 .canonicalize()
                 .unwrap_or_else(|_| self.file.path.clone()),
-            function.span.start,
+            helper.start,
         );
         // A recursive call is refused below for what it is; its inputs read the helper's own
         // parameters, which would otherwise be the reason given.
         if !self.expansion.borrow().is_active(&identity) {
-            if let Some(reason) = self.unwalkable_helper_call(function, call) {
+            if let Some(reason) = self.unwalkable_helper_call(helper, call) {
                 self.refuse_helper_expansion(reason);
                 return None;
             }
@@ -3227,9 +3358,10 @@ impl<'a> Walker<'a> {
         }
 
         let before = self.param_bindings.len();
-        self.bind_helper_parameters(function, call);
+        self.bind_helper_parameters(helper.params, call);
         let frame = HelperFrame {
-            function,
+            helper,
+            call_start: call.span.start,
             bindings: self.param_bindings.len() - before,
             saw_throw: false,
         };
@@ -3237,27 +3369,27 @@ impl<'a> Walker<'a> {
         Some(frame)
     }
 
-    /// Why calling `function` from `call` registers more than walking its body shows, if it may:
+    /// Why calling `helper` from `call` registers more than walking its body shows, if it may:
     /// a generator runs none of its body; an async body that awaits registers what follows on
     /// promise timing; and the call's arguments and the parameters' defaults run before the body.
     fn unwalkable_helper_call(
         &self,
-        function: &'a Function<'a>,
+        helper: LocalHelper<'a>,
         call: &CallExpression<'a>,
     ) -> Option<Refusal> {
-        if function.generator {
+        if helper.generator {
             return Some(refusal(
                 ExclusionReason::UnsupportedExpression,
                 "the called helper is a generator, whose body a call does not run",
             ));
         }
-        if function.r#async && function.body.as_ref().is_some_and(|body| awaits(body)) {
+        if helper.asynchronous && awaits(helper.body) {
             return Some(refusal(
                 ExclusionReason::UnsupportedExpression,
                 "the called helper is async and awaits, so what follows depends on promise timing",
             ));
         }
-        if registration_free::call_binding_fails(self.semantic, &function.params, &call.arguments) {
+        if registration_free::call_binding_fails(self.semantic, helper.params, &call.arguments) {
             return Some(refusal(
                 ExclusionReason::UnsupportedExpression,
                 "an argument cannot bind the helper's destructuring parameter, so the call throws before the body runs",
@@ -3268,7 +3400,7 @@ impl<'a> Walker<'a> {
             self.semantic,
             self.written_bindings(),
             &self.file.path,
-            &function.params,
+            helper.params,
             &call.arguments,
             call.span,
         ))
@@ -3383,23 +3515,21 @@ impl<'a> Walker<'a> {
         true
     }
 
-    /// The callee of `expr`, when it names a `function` declaration in *this* file.
+    /// The helper `call` runs, when it is one this file declares and the walker inlines.
     ///
     /// Deliberately narrow, and every restriction is load-bearing:
     ///
     /// - a bare identifier only, resolved through `oxc_semantic` to its binding rather than by
     ///   name -- `ruleTester.run(...)` (a member expression) is not a local helper, and neither is
-    ///   a same-named import, whose declaration node is an import specifier and not a `Function`;
-    /// - a `FunctionType::FunctionDeclaration`, so a `const f = () => {}` binding (whose declaring
-    ///   node is a `VariableDeclarator`) is left alone: a `let`/`var` binding can be reassigned
-    ///   between declaration and call, and proving which function a name holds at call time is the
-    ///   call-graph question this fix deliberately does not open;
-    /// - a body present, which excludes a TypeScript overload signature or `declare function`.
+    ///   a same-named import, whose declaration node is an import specifier;
+    /// - a `FunctionType::FunctionDeclaration` with a body (not an overload signature or
+    ///   `declare function`), or a `const` binding (see [`Self::const_helper`]); a `let`/`var`
+    ///   binding can be reassigned between declaration and call.
     ///
     /// Anything outside that set is not guessed at: [`Self::refuse_unread_local_helper`] refuses
     /// the call unless it provably registers nothing.
-    fn resolve_local_helper(&self, expr: &Expression) -> Option<(SymbolId, &'a Function<'a>)> {
-        let Expression::Identifier(ident) = expr else {
+    fn resolve_local_helper(&self, call: &CallExpression) -> Option<LocalHelper<'a>> {
+        let Expression::Identifier(ident) = &call.callee else {
             return None;
         };
         let semantic: &'a Semantic<'a> = self.semantic;
@@ -3407,16 +3537,107 @@ impl<'a> Walker<'a> {
         let symbol = semantic.scoping().get_reference(reference_id).symbol_id()?;
         // The declaration that runs: an overload set's implementation, none when redeclared.
         let node = registration_free::runtime_declaration(semantic, symbol)?;
-        let AstKind::Function(function) = semantic.nodes().kind(node) else {
-            return None;
-        };
-        if function.r#type != FunctionType::FunctionDeclaration || function.body.is_none() {
-            return None;
+        match semantic.nodes().kind(node) {
+            AstKind::Function(function) => {
+                if function.r#type != FunctionType::FunctionDeclaration {
+                    return None;
+                }
+                LocalHelper::of_function(function)
+            }
+            AstKind::VariableDeclarator(declarator) => {
+                self.const_helper(symbol, node, declarator, call)
+            }
+            _ => None,
         }
-        Some((symbol, function))
     }
 
-    /// Binds each of `function`'s formal parameters to the const-folded text of the argument this
+    /// The function a `const` binding holds when `call` runs it: the binding's single
+    /// declarator holds an arrow or function expression and has finished evaluating before the
+    /// call executes, so the name cannot hold anything else. A concise arrow is read only when its
+    /// body is a call, the one expression the walker reads.
+    fn const_helper(
+        &self,
+        symbol: SymbolId,
+        node: oxc_semantic::NodeId,
+        declarator: &'a VariableDeclarator<'a>,
+        call: &CallExpression,
+    ) -> Option<LocalHelper<'a>> {
+        let semantic: &'a Semantic<'a> = self.semantic;
+        let AstKind::VariableDeclaration(declaration) = semantic.nodes().parent_kind(node) else {
+            return None;
+        };
+        if declaration.kind != VariableDeclarationKind::Const
+            || declaration.declare
+            || semantic.scoping().symbol_is_mutated(symbol)
+            || !matches!(&declarator.id, BindingPattern::BindingIdentifier(binding)
+                if binding.symbol_id.get() == Some(symbol))
+            || !self.initialized_before_call(symbol, node, declarator.span.end, call)
+        {
+            return None;
+        }
+        let helper = match super::registry::unwrap_transparent(declarator.init.as_ref()?) {
+            Expression::ArrowFunctionExpression(arrow) => LocalHelper {
+                start: arrow.span.start,
+                params: &arrow.params,
+                body: match &arrow.body {
+                    ArrowFunctionBody::FunctionBody(body) => {
+                        LocalHelperBody::Statements(&body.statements)
+                    }
+                    ArrowFunctionBody::CallExpression(body) => LocalHelperBody::Concise(body),
+                    _ => return None,
+                },
+                generator: false,
+                asynchronous: arrow.r#async,
+            },
+            Expression::FunctionExpression(function) => LocalHelper::of_function(function)?,
+            _ => return None,
+        };
+        Some(helper)
+    }
+
+    /// Whether the `const` binding `symbol`, whose declarator ends at `declared_end`, has been
+    /// initialized when `call` executes.
+    ///
+    /// A call inside an inlined helper executes where that helper was called, not where it is
+    /// written: `run(); const f = ...; function run() { f() }` reads `f` in its temporal dead
+    /// zone. The execution chain is the open helper frames' call sites, outermost first, then
+    /// `call`. The binding is initialized when the outermost link inside its scope comes after
+    /// the declarator, because that scope runs in source order -- except a `switch`, one scope
+    /// any case can be entered at: a link in a later case can skip the declarator, so the
+    /// outermost link in the whole `switch` must lie in the declarator's own case.
+    fn initialized_before_call(
+        &self,
+        symbol: SymbolId,
+        declarator: oxc_semantic::NodeId,
+        declared_end: u32,
+        call: &CallExpression,
+    ) -> bool {
+        let semantic: &'a Semantic<'a> = self.semantic;
+        let scoping = semantic.scoping();
+        let nodes = semantic.nodes();
+        let scope_node = nodes.kind(scoping.get_node_id(scoping.symbol_scope_id(symbol)));
+        let scope = scope_node.span();
+        let Some(position) = self
+            .helper_frames
+            .iter()
+            .map(|frame| frame.call_start)
+            .chain(std::iter::once(call.span.start))
+            .find(|position| scope.start <= *position && *position < scope.end)
+        else {
+            return false;
+        };
+        if matches!(scope_node, AstKind::SwitchStatement(_)) {
+            let AstKind::SwitchCase(case) = nodes.parent_kind(nodes.parent_id(declarator)) else {
+                return false;
+            };
+            if position < case.span.start || case.span.end <= position {
+                return false;
+            }
+        }
+        declared_end <= position
+    }
+
+    /// Binds each of `parameters` to the const-folded text of the argument this
     /// call site passed for it, for [`Walker::fold_title_text`].
     ///
     /// Positional, and therefore refused wholesale the moment the positions stop being knowable:
@@ -3426,8 +3647,12 @@ impl<'a> Walker<'a> {
     /// missing or does not const-fold. Every skip leaves the parameter unbound, which is what
     /// makes a title reading it degrade to [`Title::Dynamic`] instead of rendering a value nobody
     /// proved.
-    fn bind_helper_parameters(&mut self, function: &'a Function<'a>, call: &CallExpression<'a>) {
-        let bound = self.fold_parameter_arguments(&function.params, call);
+    fn bind_helper_parameters(
+        &mut self,
+        parameters: &'a FormalParameters<'a>,
+        call: &CallExpression<'a>,
+    ) {
+        let bound = self.fold_parameter_arguments(parameters, call);
         self.param_bindings.extend(bound);
     }
 
@@ -4123,7 +4348,7 @@ fn hook_body_is_idempotent(
     function_like: &FunctionLike,
     semantic: &Semantic,
     import_specifiers: &HashMap<SymbolId, Arc<str>>,
-    exported_as: &HashMap<SymbolId, String>,
+    registry: &Registry,
 ) -> bool {
     let Some(statements) = function_like_statements(function_like) else {
         // A concise-arrow body (`() => expr`) is one expression; treat it as a single statement.
@@ -4139,7 +4364,7 @@ fn hook_body_is_idempotent(
     let mut written_targets: Vec<String> = Vec::new();
 
     for statement in statements {
-        match idempotent_statement(statement, semantic, import_specifiers, exported_as) {
+        match idempotent_statement(statement, semantic, import_specifiers, registry) {
             Some(IdempotentStatement::Guarded { target }) => {
                 guard_targets.push(target.clone());
                 written_targets.push(target);
@@ -4231,7 +4456,7 @@ fn idempotent_statement(
     statement: &Statement,
     semantic: &Semantic,
     import_specifiers: &HashMap<SymbolId, Arc<str>>,
-    exported_as: &HashMap<SymbolId, String>,
+    registry: &Registry,
 ) -> Option<IdempotentStatement> {
     match statement {
         Statement::ExpressionStatement(statement) => match &statement.expression {
@@ -4253,7 +4478,7 @@ fn idempotent_statement(
                 }
             }
             Expression::CallExpression(call) => {
-                is_framework_reset_call(call, semantic, import_specifiers, exported_as)
+                is_framework_reset_call(call, semantic, import_specifiers, registry)
                     .then_some(IdempotentStatement::Reset)
             }
             _ => None,
@@ -4297,9 +4522,8 @@ fn idempotent_statement(
 ///
 /// Collapsing the last two was a real defect: `None` meant both "free reference" and "bound to
 /// something that is not an import", so a file-local `const vi = createFakeVi()` was accepted as
-/// Vitest's own. Shared by [`is_framework_reset_call`] and [`collect_module_setup`] rather than
-/// written twice — the production duplication ceiling is 0.00%, and a second copy of a security-
-/// relevant binding check is how the two drift apart.
+/// Vitest's own. Framework APIs use the registry; this remaining classification identifies
+/// Testing Library imports for reset operations.
 enum Binding {
     /// Binds to nothing: the ambient `vi` of a `globals: true` run.
     Free,
@@ -4329,42 +4553,6 @@ fn binding_of(
     }
 }
 
-/// Whether `ident` is Vitest's own namespace of the given name (`vi` or `expect`).
-///
-/// A free reference qualifies because that is exactly what `globals: true` produces; an import
-/// qualifies only when it really comes from the `vitest` package; a file-local binding never does.
-/// Which name is compared depends on the binding, and conflating the two was a review finding.
-/// A FREE reference has only its own name — that is the ambient `vi` of a `globals: true` run, so
-/// the local name is the evidence. An IMPORTED one must be compared on the name it was exported
-/// under: `import { vi as v } from 'vitest'` is Vitest's `vi` however the file spells it, and
-/// rejecting it on the local name `v` let the C1 false positive back in for aliased imports.
-/// Measured before the fix, and the same gap existed in `is_framework_reset_call`, which this now
-/// closes too.
-fn is_vitest_namespace(
-    ident: &IdentifierReference,
-    name: &str,
-    semantic: &Semantic,
-    import_specifiers: &HashMap<SymbolId, Arc<str>>,
-    exported_as: &HashMap<SymbolId, String>,
-) -> bool {
-    match binding_of(ident, semantic, import_specifiers) {
-        Binding::Free => ident.name.as_str() == name,
-        Binding::Imported(module) => {
-            if !import_is_package(&module, "vitest") {
-                return false;
-            }
-            let exported = ident
-                .reference_id
-                .get()
-                .and_then(|reference| semantic.scoping().get_reference(reference).symbol_id())
-                .and_then(|symbol| exported_as.get(&symbol));
-            // No recorded export name means a namespace import, which this check does not model.
-            exported.is_some_and(|exported| exported == name)
-        }
-        Binding::Local => false,
-    }
-}
-
 /// Whether `call` is one of the framework reset operations, resolved through the import graph.
 ///
 /// Never by bare name. `not-redundant-hook-guarded-connect.test.ts` exists to forbid an
@@ -4374,7 +4562,7 @@ fn is_framework_reset_call(
     call: &CallExpression,
     semantic: &Semantic,
     import_specifiers: &HashMap<SymbolId, Arc<str>>,
-    exported_as: &HashMap<SymbolId, String>,
+    registry: &Registry,
 ) -> bool {
     /// `vi`'s reset family: each replaces a whole registry's state, so running it twice leaves
     /// what running it once left.
@@ -4397,13 +4585,10 @@ fn is_framework_reset_call(
             Binding::Imported(module) => import_is_package(&module, "@testing-library/"),
             Binding::Free | Binding::Local => false,
         },
-        // `vi.clearAllMocks()` and family.
+        // The same binding proof covers named, renamed, namespace and in-source APIs.
         Expression::StaticMemberExpression(member) => {
-            let Expression::Identifier(object) = &member.object else {
-                return false;
-            };
             VI_RESETS.contains(&member.property.name.as_str())
-                && is_vitest_namespace(object, "vi", semantic, import_specifiers, exported_as)
+                && registry.api_name(&member.object, semantic) == Some("vi")
         }
         _ => false,
     }
@@ -4777,15 +4962,6 @@ fn parse_numeric_prefix(rendered: &str, float: bool) -> Option<f64> {
     trimmed[..index].parse::<f64>().ok()
 }
 
-/// Recognize the static import.meta.vitest member expression used by in-source tests.
-fn is_import_meta_vitest_expr(expr: &Expression) -> bool {
-    matches!(
-        expr,
-        Expression::StaticMemberExpression(member)
-            if matches!(&member.object, Expression::ImportMeta(_)) && member.property.name.as_str() == "vitest"
-    )
-}
-
 struct LineIndex<'a> {
     source: &'a str,
     line_starts: Vec<u32>,
@@ -4829,7 +5005,7 @@ impl<'a> LineIndex<'a> {
 
 /// Whether `body` suspends: an `await`, `for await` or `await using` of its own, outside nested
 /// functions, which run only when called.
-fn awaits(body: &oxc_ast::ast::FunctionBody) -> bool {
+fn awaits(body: LocalHelperBody<'_>) -> bool {
     struct Awaits(bool);
     impl<'a> Visit<'a> for Awaits {
         fn visit_await_expression(&mut self, _it: &oxc_ast::ast::AwaitExpression<'a>) {
@@ -4851,7 +5027,14 @@ fn awaits(body: &oxc_ast::ast::FunctionBody) -> bool {
         }
     }
     let mut visitor = Awaits(false);
-    visitor.visit_function_body(body);
+    match body {
+        LocalHelperBody::Statements(statements) => {
+            for statement in statements {
+                visitor.visit_statement(statement);
+            }
+        }
+        LocalHelperBody::Concise(call) => visitor.visit_call_expression(call),
+    }
     visitor.0
 }
 
@@ -8763,6 +8946,23 @@ mod tests {
         assert!(extraction.tests[0].context.unresolved);
     }
 
+    /// Asserts a helper call in `case` was read in full: the file is complete and holds two tests,
+    /// the helper's and `visible`, which it returns.
+    fn assert_read_in_full<'e>(extraction: &'e FileExtraction, case: &str) -> Vec<&'e TestCase> {
+        assert!(
+            !extraction.incomplete,
+            "{case}: {:?}",
+            extraction.diagnostics
+        );
+        let tests: Vec<_> = extraction
+            .tests
+            .iter()
+            .filter(|test| test.kind != DeclarationKind::Suite)
+            .collect();
+        assert_eq!(tests.len(), 2, "{case}");
+        tests
+    }
+
     /// Asserts a helper call in `case` was refused visibly: the file is incomplete, the one test
     /// left (`visible`) is unresolved, and a diagnostic names `reason`.
     fn assert_visible_refusal(extraction: &FileExtraction, case: &str, reason: &str) {
@@ -8800,6 +9000,13 @@ mod tests {
                 "arguments",
             ),
             ("function* declare() { test('hidden', () => {}); } declare();", "generator"),
+            // A `const` helper is held to the same check.
+            ("const declare = function* () { test('hidden', () => {}); }; declare();", "generator"),
+            ("const setup = async () => { await 0; beforeEach(() => {}); }; setup();", "awaits"),
+            ("const declare = async () => test(await name, () => {}); declare();", "awaits"),
+            ("const declare = (_hook) => {}; declare(test('hidden', () => {}));", "arguments"),
+            ("const declare = (_hook = test('hidden', () => {})) => {}; declare();", "arguments"),
+            ("const declare = ({ v }) => { test('hidden', () => {}); }; declare(null);", "cannot bind"),
             ("async function setup() { await 0; beforeEach(() => {}); } setup();", "awaits"),
             (
                 "async function setup() { await using _r = null; beforeEach(() => {}); } setup();",
@@ -8850,13 +9057,7 @@ mod tests {
             "function declare({ v }) { test('hidden', () => {}); } const handler = (event) => event; declare({ v: handler });",
         ] {
             let extraction = extract_with(body);
-            assert!(!extraction.incomplete, "{body}: {:?}", extraction.diagnostics);
-            let tests: Vec<_> = extraction
-                .tests
-                .iter()
-                .filter(|case| case.kind != DeclarationKind::Suite)
-                .collect();
-            assert_eq!(tests.len(), 2, "{body}");
+            let tests = assert_read_in_full(&extraction, body);
             assert!(tests.iter().all(|case| !case.context.unresolved), "{body}");
         }
 
@@ -10888,16 +11089,46 @@ mod tests {
         );
     }
 
+    /// A `const` function the call runs after its declarator is inlined like a `function`
+    /// declaration; one the call reaches in its temporal dead zone is not.
+    #[test]
+    fn a_const_helper_initialized_before_its_call_is_inlined() {
+        for body in [
+            "const declare = () => { test('hidden', () => {}); }; declare();",
+            "const declare = function () { test('hidden', () => {}); }; declare();",
+            "const declare = () => test('hidden', () => {}); declare();",
+            "const declare = (() => { test('hidden', () => {}); }) as () => void; declare();",
+            "function run() { declare(); } const declare = () => { test('hidden', () => {}); }; run();",
+            "describe('d', () => { const declare = () => { test('hidden', () => {}); }; declare(); });",
+            "switch (mode) { case 1: const declare = () => { test('hidden', () => {}); }; declare(); }",
+            "const made = make(); const declare = (_m, _s = '') => { test('hidden', () => {}); }; declare(made);",
+        ] {
+            let source = format!(
+                "import {{ describe, test }} from 'vitest';\n{body}\ntest('visible', () => {{}});"
+            );
+            let extraction = extract_source(&source, "case.test.ts", Globals::Disabled);
+            let tests = assert_read_in_full(&extraction, body);
+            assert!(
+                tests
+                    .iter()
+                    .any(|case| matches!(&case.title, Title::Static(text) if text == "hidden")),
+                "{body}"
+            );
+        }
+    }
+
     /// A call to a local binding the walker does not inline is refused when it may register, and
     /// left alone when it provably registers nothing or is never called.
     #[test]
     fn an_unread_local_helper_call_is_refused_unless_it_registers_nothing() {
         let refused = [
-            "const declare = () => { test('hidden', () => {}); }; declare();",
-            "const declare = function () { test('hidden', () => {}); }; declare();",
             "let declare = () => {}; declare = () => { test('hidden', () => {}); }; declare();",
             "function wrap(fn) { fn(); } wrap(() => { test('hidden', () => {}); });",
-            "const declare = () => {}; declare(() => test('hidden', () => {}));",
+            "declare(); const declare = () => { test('hidden', () => {}); };",
+            "run(); const declare = () => { test('hidden', () => {}); }; function run() { declare(); }",
+            "const declare = (() => () => { test('hidden', () => {}); })(); declare();",
+            "switch (mode) { case 1: const declare = () => { test('hidden', () => {}); }; break; case 2: declare(); }",
+            "switch (mode) { case 1: const declare = () => { test('hidden', () => {}); }; function run() { declare(); } break; case 2: run(); }",
         ];
         for body in refused {
             let source =
@@ -10911,6 +11142,8 @@ mod tests {
 
         let kept = [
             "const values = []; const fill = () => { values.push(1); }; fill();",
+            // An argument that only creates a function registers nothing until it is called.
+            "const declare = () => {}; declare(() => test('hidden', () => {}));",
             "const declare = () => { test('never', () => {}); };",
             "setup();",
             "declare const declare: () => void; declare();",
@@ -10931,7 +11164,7 @@ mod tests {
         // The refusal taints the scope the call runs in, not its siblings.
         let extraction = extract_source(
             "import { describe, test } from 'vitest';\n\
-             describe('d', () => { const declare = () => { test('hidden', () => {}); }; declare(); test('inner', () => {}); });\n\
+             describe('d', () => { let declare = () => { test('hidden', () => {}); }; declare(); test('inner', () => {}); });\n\
              test('outer', () => {});",
             "case.test.ts",
             Globals::Disabled,
@@ -10966,3 +11199,11 @@ mod registration_free_tests;
 #[cfg(test)]
 #[path = "extract/tests/imported_constants.rs"]
 mod imported_constants_tests;
+
+#[cfg(test)]
+#[path = "extract/tests/helper_expressions.rs"]
+mod helper_expression_tests;
+
+#[cfg(test)]
+#[path = "extract/tests/vitest_api.rs"]
+mod vitest_api_tests;

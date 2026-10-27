@@ -51,10 +51,10 @@
 // no assertion that can fail, and a clustering property is not a relation between two records at
 // all. See `lib/isolation.mjs`'s UNCHECKED, UNSTATEABLE and NOT_ISOLABLE for the split and the
 // discipline on it.
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parseFixture } from './lib/fixture-directives.mjs'
-import { checkExpectation, collectFingerprintRecords } from './lib/isolation.mjs'
+import { enumerateFixtures, parseFixture } from './lib/fixture-directives.mjs'
+import { checkExpectation, collectFingerprintRecords, tallyExpectation } from './lib/isolation.mjs'
 import { defaultBinary } from './lib/run-analyzer.mjs'
 
 // Every fixture directory carrying `@vitest-dedup:` expectation blocks. `fixtures/observed/` holds
@@ -62,6 +62,9 @@ import { defaultBinary } from './lib/run-analyzer.mjs'
 // happening exactly like every other negative, so it is checked here on the same terms. Keep this
 // in step with `check-duplicates-corpus.mjs`'s `TARGETS` -- a directory that gate analyzes but this
 // one does not would have negatives whose isolation nobody checks.
+//
+// Fixtures are enumerated by `enumerateFixtures`, the same helper the corpus gate uses, so the two
+// gates cannot disagree about which files carry expectations.
 //
 // Each directory is analyzed as ONE run, because a participant may name a test in a sibling file
 // (the `-a`/`-b` corpus convention) and cross-file identity is scoped to the run.
@@ -107,7 +110,10 @@ const DIRS = ['fixtures/duplicates', 'fixtures/observed', 'fixtures/near', 'fixt
 // stopped being an `@vitest-dedup:isolation-violation` and became a real check, because an
 // ambient `beforeAll` now reaches `ContextKey` and the two describes' context keys genuinely
 // differ. Known violations 1 -> 0.
-const MIN_CHECKED_EXPECTATIONS = 44
+// Ratcheted 44 -> 77, which is what the corpus checks: the floor had trailed the real count by 32,
+// so a regression that dropped up to 32 checks still passed. 77 includes
+// `not-duplicates-literal-kind-spec-extension.spec.ts`; enumerating only `.test.ts` leaves 76.
+const MIN_CHECKED_EXPECTATIONS = 77
 
 // A ceiling on the debt bucket, which ratchets the other way. `unchecked` means "an isolation claim
 // with no mechanism yet"; it went 16 -> 22 -> 29 over three PRs under the source-level checker,
@@ -156,13 +162,13 @@ export function run(binary = DEFAULT_BINARY) {
   const unstateable = []
   const notIsolable = []
   const violations = []
-  let checked = 0
+  const tally = { failures, unchecked, unstateable, notIsolable, violations, checked: 0 }
   let negatives = 0
 
   for (const dir of DIRS) {
-    const names = readdirSync(dir)
-      .filter((name) => name.endsWith('.test.ts'))
-      .sort()
+    // Participants here must be fixtures: a helper sibling has no fingerprint records and no source
+    // loaded, so naming one is rejected at parse time rather than failing later.
+    const { fixtureNames: names } = enumerateFixtures(dir)
     const knownFiles = new Set(names)
     const sources = new Map(names.map((name) => [name, readFileSync(join(dir, name), 'utf8')]))
     const readSource = (file) => sources.get(file) ?? null
@@ -191,23 +197,12 @@ export function run(binary = DEFAULT_BINARY) {
         if (expectation.rule !== 'none') continue
         negatives += 1
         const result = checkExpectation(expectation, index, readSource)
-        if (result.status === 'fail') {
-          failures.push(`FAIL ${join(dir, name)}: ${result.message}`)
-        } else if (result.status === 'unchecked') {
-          unchecked.push(`${join(dir, name)}: ${result.message}`)
-        } else if (result.status === 'unstateable') {
-          unstateable.push(`${join(dir, name)}: ${result.message}`)
-        } else if (result.status === 'not-isolable') {
-          notIsolable.push(`${join(dir, name)}: ${result.message}`)
-        } else if (result.status === 'violation') {
-          violations.push(`${join(dir, name)}: ${result.message}`)
-        } else {
-          checked += 1
-        }
+        tallyExpectation(tally, join(dir, name), result)
       }
     }
   }
 
+  const { checked } = tally
   if (checked < MIN_CHECKED_EXPECTATIONS) {
     failures.push(
       `FAIL (gate): only ${checked} negative expectation(s) were actually checked, below the floor ` +

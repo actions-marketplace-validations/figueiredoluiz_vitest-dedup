@@ -91,7 +91,7 @@ import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSyn
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { report as reportIsolation, run as runIsolation } from './check-fixture-isolation.mjs'
-import { parseFixture } from './lib/fixture-directives.mjs'
+import { enumerateFixtures, FIXTURE_NAME, parseFixture } from './lib/fixture-directives.mjs'
 import { findCallback, tokenize } from './lib/js-tokens.mjs'
 import { defaultBinary, runAnalyzerJsonl } from './lib/run-analyzer.mjs'
 
@@ -172,38 +172,15 @@ function runJsonl(target, args) {
 }
 
 /**
- * A file this gate enumerates as a fixture: named like a test, in any extension discovery reaches.
- *
- * This was `.endsWith('.test.ts')` and the narrowness was a blind spot, not a simplification. A
- * `.test.tsx` fixture placed in a scanned directory was COPIED into the temp run (so it analyzed and
- * could be named as a participant) but never enumerated, so its directive block was never parsed and
- * its expectations never asserted. It looked asserted and asserted nothing — the worst state for a
- * gate to be in, and invisible precisely because the gate is what would have reported it. Component
- * tests are roughly 8% of real test files, so the extension that mattered most was the one missing.
- *
- * Named like a test, not merely analyzable: a helper module beside a fixture carries no directive
- * block, and enumerating it would turn a legitimate sibling into a gate failure.
- */
-const FIXTURE_NAME = /\.(test|spec|bench)\.[cm]?[jt]sx?$/
-
-/**
  * Runs every check this gate owns against one fixture directory, appending to `failures`.
  *
  * @returns {number} how many fixtures the directory holds, for the summary line.
  */
 function checkTarget(target, failures, pendingHeld) {
   const { dir } = target
-  const fixtureNames = readdirSync(dir).filter((f) => FIXTURE_NAME.test(f)).sort()
-  // Participant references may name any analyzable sibling, not only the fixtures this gate parses
-  // and asserts: the directive grammar admits the full script-extension set discovery reaches, so a
-  // cross-file pair with an in-source `.ts` half is nameable the day one lands. The enumeration
-  // above is narrower than that on purpose -- it admits files NAMED like tests, because those are
-  // the ones that can carry a directive block, and a helper module with no block would be a gate
-  // failure rather than a fixture.
-  const knownFiles = new Set([
-    ...fixtureNames,
-    ...readdirSync(dir).filter((f) => /\.[cm]?[jt]sx?$/.test(f)),
-  ])
+  const { fixtureNames, knownFiles } = enumerateFixtures(dir)
+  // `knownFiles` is wider than `fixtureNames` on purpose: a participant may name any analyzable
+  // sibling, but only files named like tests carry a block, so a helper is never parsed as one.
 
   // Parse every fixture's expectation block up front. A fixture that fails to parse still counts
   // toward the total and is reported, but is excluded from the finding/extraction checks below --
@@ -500,6 +477,10 @@ const DELIBERATE_BLIND_FILES = new Set([
   'each/each-printf-directives.test.ts',
   'edge/vi-domock-scoped.test.ts',
   'edge/vi-dounmock-scoped.test.ts',
+  // API identity does not prove hoisting through renamed or namespace mock calls.
+  'recall/vitest-api-namespace-dynamic/alias.test.ts',
+  'recall/vitest-api-renamed/alias.test.ts',
+  'recall/vitest-api-renamed/renamed-vi.test.ts',
   'mixed/mixed-loop-each-in-non-idempotent-hook-scope.test.ts',
   'recall/duplicate-test-dynamic-title/session.test.ts',
   'recall/duplicate-test-name-dynamic-title/tenants.test.ts',
@@ -545,10 +526,15 @@ const DELIBERATE_BLIND_FILES = new Set([
   // body runs, so it is refused and the remaining test is unresolved.
   'recall/local-helper-null-destructure/run.test.ts',
   'recall/local-helper-noniterable-destructure/run.test.ts',
-  // A local `const` arrow and a called parameter whose bodies are not read: refused so the tests
-  // they declare are not dropped silently. The arrow stays blind until `const` helpers are inlined.
-  'recall/local-helper-const-arrow/run.test.ts',
+  // A called parameter, a `const` generator, and `const` helpers reached in their temporal dead
+  // zone (through a hoisted function, or from another `switch` case): refused so the tests they
+  // may declare are not dropped silently.
   'recall/local-helper-parameter-callee/run.test.ts',
+  'recall/local-helper-const-tdz/run.test.ts',
+  'recall/local-helper-const-switch-case/run.test.ts',
+  'recall/local-helper-const-generator/run.test.ts',
+  'recall/local-helper-const-async-await/run.test.ts',
+  'recall/local-helper-const-switch-cross-case/run.test.ts',
   // Default exports a runner must keep refusing (a `let`, a reassigned declaration, an imported
   // binding): blind on purpose, permanently, as the controls for the default-identifier support.
   'recall/framework-runner-default-imported-negative/slugs.test.ts',
