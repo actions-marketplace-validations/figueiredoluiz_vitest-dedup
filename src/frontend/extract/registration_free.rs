@@ -24,6 +24,7 @@
 
 use crate::frontend::auto_imports;
 use crate::frontend::helpers;
+use crate::frontend::js_text::string_text;
 use crate::frontend::resolver::{self, Resolved};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -511,8 +512,39 @@ pub(super) fn arguments_register_nothing(
     file: &Path,
     arguments: &[Argument<'_>],
 ) -> Option<Vec<PathBuf>> {
+    evaluation_registers_nothing(program, semantic, written, file, None, arguments)
+}
+
+/// Whether calling `callee`, a binding written in the file at `file`, with `arguments` provably
+/// registers nothing: neither the value its declaration gives it nor the arguments reach a
+/// registration API. A binding written after it is declared fails the proof.
+pub(super) fn local_call_registers_nothing(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    written: &HashSet<SymbolId>,
+    file: &Path,
+    callee: &Expression<'_>,
+    arguments: &[Argument<'_>],
+) -> bool {
+    evaluation_registers_nothing(program, semantic, written, file, Some(callee), arguments)
+        .is_some()
+}
+
+/// Scans `callee` (when given) and `arguments` as code that runs in the file at `file`, and proves
+/// the modules they reach; the modules the proof relied on, or `None`.
+fn evaluation_registers_nothing(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    written: &HashSet<SymbolId>,
+    file: &Path,
+    callee: Option<&Expression<'_>>,
+    arguments: &[Argument<'_>],
+) -> Option<Vec<PathBuf>> {
     let mut scanner = Scanner::new(semantic, program, file);
     scanner.written = Some(written);
+    if let Some(callee) = callee {
+        scanner.queue.push(Pending::Expression(callee));
+    }
     for argument in arguments {
         if matches!(argument, Argument::SpreadElement(_)) {
             return None;
@@ -823,7 +855,7 @@ impl<'s, 'a> Scanner<'s, 'a> {
             let Statement::ImportDeclaration(import) = statement else {
                 continue;
             };
-            let source = import.source.value.as_str();
+            let source: &str = &string_text(&import.source);
             for specifier in import.specifiers.iter().flatten() {
                 let (local, imported) = import_binding(specifier);
                 if let Some(symbol) = local.symbol_id.get() {
@@ -958,7 +990,7 @@ impl<'s, 'a> Scanner<'s, 'a> {
     /// is erased by the TypeScript transform, so one that names no module on disk (a package
     /// that ships only types) costs nothing; a resolvable one is still loaded.
     fn import_edge(&mut self, import: &'a oxc_ast::ast::ImportDeclaration<'a>) {
-        let specifier = import.source.value.as_str();
+        let specifier: &str = &string_text(&import.source);
         let unread = import.specifiers.as_ref().is_some_and(|specifiers| {
             !specifiers.is_empty()
                 && specifiers.iter().all(|specifier| {
@@ -996,12 +1028,12 @@ impl<'s, 'a> Scanner<'s, 'a> {
                 Statement::ExportFromDeclaration(export)
                     if !matches!(export.export_kind, ImportOrExportKind::Type) =>
                 {
-                    self.module_edge(self.file, export.source.value.as_str(), Root::ImportTime);
+                    self.module_edge(self.file, &string_text(&export.source), Root::ImportTime);
                 }
                 Statement::ExportAllDeclaration(export)
                     if !matches!(export.export_kind, ImportOrExportKind::Type) =>
                 {
-                    self.module_edge(self.file, export.source.value.as_str(), Root::ImportTime);
+                    self.module_edge(self.file, &string_text(&export.source), Root::ImportTime);
                 }
                 Statement::ClassDeclaration(class) => self.seed_class(class),
                 Statement::ExpressionStatement(statement) => {
@@ -1101,7 +1133,7 @@ impl<'s, 'a> Scanner<'s, 'a> {
                             found = true;
                             self.module_edge(
                                 self.file,
-                                export.source.value.as_str(),
+                                string_text(&export.source).as_ref(),
                                 Root::Reexport(specifier.local.name().to_string()),
                             );
                         }
@@ -1110,14 +1142,14 @@ impl<'s, 'a> Scanner<'s, 'a> {
                 Statement::ExportAllDeclaration(export) => match &export.exported {
                     Some(exported) if exported.name() == name => {
                         found = true;
-                        self.module_edge(self.file, export.source.value.as_str(), Root::Whole);
+                        self.module_edge(self.file, &string_text(&export.source), Root::Whole);
                     }
                     Some(_) => {}
                     None => {
                         stars = true;
                         self.module_edge(
                             self.file,
-                            export.source.value.as_str(),
+                            string_text(&export.source).as_ref(),
                             Root::ExportIfPresent(name.to_owned()),
                         );
                     }
@@ -1210,7 +1242,7 @@ impl<'s, 'a> Scanner<'s, 'a> {
                     } else {
                         Root::Export(imported)
                     };
-                    self.module_edge(self.file, import.source.value.as_str(), root);
+                    self.module_edge(self.file, string_text(&import.source).as_ref(), root);
                 }
             }
         }
@@ -1485,10 +1517,12 @@ impl<'a> Visit<'a> for Scanner<'_, 'a> {
         self.failed = true;
     }
 
+    /// A dynamic `import('...')` with a literal specifier loads that whole module when it runs;
+    /// any other specifier could load anything.
     fn visit_import_expression(&mut self, import: &ImportExpression<'a>) {
         match &import.source {
             Expression::StringLiteral(literal) => {
-                let specifier = literal.value.to_string();
+                let specifier = string_text(literal);
                 self.module_edge(self.file, &specifier, Root::Whole);
             }
             _ => self.failed = true,

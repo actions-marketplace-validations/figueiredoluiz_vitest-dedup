@@ -208,10 +208,14 @@ const RUST_MODULES = {
   // after an `is_none` check, and a default-export function-expression arm the parser's
   // paren handling never produces.
   'src/frontend/helpers.rs': 98,
+  // JavaScript string text: measured at 91.94% (57/62); the 5 uncovered lines are the `panic!`
+  // arms of this file's own test helpers, reached only by a malformed test input.
+  'src/frontend/js_text.rs': 91,
   'src/frontend/registry.rs': 97,
   // Imported table constants: measured at 94.57% (87/92 instrumented lines).
   'src/frontend/registry/imported_constants.rs': 94,
   'src/frontend/resolver.rs': 100,
+  'src/frontend/resolver/manifest_fs.rs': 99,
   'src/main.rs': 97,
   // Native memory readers: measured 41/44 instrumented lines (93.18%) on macOS.
   'src/rss.rs': 93,
@@ -230,6 +234,7 @@ const RUST_MODULES = {
   // through arithmetic that never calls `.heap_bytes()` on the count itself).
   'src/memory.rs': 98,
   'src/model.rs': 99,
+  'src/package_json.rs': 94,
   'src/prerequisites.rs': 99,
   'src/modes.rs': 97,
   // `src/reporters.rs` is the module root: the `Reporter` trait, the dispatch table, and the shared
@@ -373,6 +378,9 @@ const JS_MODULES = {
   // The pure release identity guard is imported by recovery-release.test.mjs (15/30 lines).
   // The gh CLI adapter runs as a separate process in the workflow, outside this coverage run.
   'scripts/release/check-recovery-release.mjs': 50,
+  // Measured at 85/87 lines (97.70%), including the portable CLI subprocess test
+  // through Node's inherited coverage environment.
+  'scripts/release/recover-npm-binaries.mjs': 97,
   'scripts/release/release-comparison.mjs': 98,
   'scripts/release/platform-package.mjs': 100,
   'scripts/release/prepare-npm-packages.mjs': 65,

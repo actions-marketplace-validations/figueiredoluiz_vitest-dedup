@@ -2299,7 +2299,8 @@ pub struct BlindFile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExclusionReason {
-    /// An imported runner's export could not be resolved, read, or proved to be the same function.
+    /// An imported runner's export, or a called local helper, could not be resolved, read, or
+    /// proved to be the function that runs.
     HelperExportUnreadable,
     /// An imported runner has module, setup or fixture effects that could not be proved inert.
     HelperSetupEffects,
@@ -2332,6 +2333,8 @@ pub enum ExclusionReason {
     ExtractionFailed,
     /// A per-file declaration or loop-unrolling budget was reached.
     WalkLimit,
+    /// Required package metadata was refused by the bounded regular-file reader.
+    PackageManifestUnreadable,
     /// An import resolved outside the analysis root and was not read.
     ImportOutsideRoot,
     /// The governing project's `globals` setting could not be determined.
@@ -2349,7 +2352,7 @@ pub enum ExclusionReason {
 
 impl ExclusionReason {
     /// Every code, in the order that breaks ties between a file's reasons.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::HelperExportUnreadable,
         Self::HelperSetupEffects,
         Self::HelperEffectsUnproved,
@@ -2366,6 +2369,7 @@ impl ExclusionReason {
         Self::SourceLimit,
         Self::ExtractionFailed,
         Self::WalkLimit,
+        Self::PackageManifestUnreadable,
         Self::ImportOutsideRoot,
         Self::GlobalsUndetermined,
         Self::FileTooLarge,
@@ -2393,6 +2397,7 @@ impl ExclusionReason {
             Self::SourceLimit => "source-limit",
             Self::ExtractionFailed => "extraction-failed",
             Self::WalkLimit => "walk-limit",
+            Self::PackageManifestUnreadable => "package-manifest-unreadable",
             Self::ImportOutsideRoot => "import-outside-root",
             Self::GlobalsUndetermined => "globals-undetermined",
             Self::FileTooLarge => "file-too-large",

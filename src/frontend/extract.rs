@@ -12,6 +12,7 @@
 //! read later.
 
 use crate::discovery::{ModuleFlavor, SourceFile};
+use crate::frontend::js_text::{cooked_text, string_text};
 use crate::model::{
     Context, DeclarationKind, EachRows, EachTable, ExclusionReason, Fingerprints, FixtureBinding,
     Hook, HookGuard, HookGuardKind, HookKind, Location, MockFactory, MockedModule, Modifier,
@@ -526,22 +527,23 @@ fn run(source: &str, file: &SourceFile, globals: Globals, allow_imported: bool) 
     let semantic = &semantic_return.semantic;
 
     // Every body fingerprinted below shares this file's import origins, computed once here.
-    let walker = super::fingerprint::with_file_import_origins(source, &file.path, program, || {
-        let mut registry = Registry::new(program, globals);
-        let mut walker = Walker::new(source, file, program, semantic, globals);
-        walker.allow_imported = allow_imported;
-        walker.prepare_imported_constants(&allocator);
-        walker.walk_statements(&program.body, &mut registry);
-        walker.finish_imported_constants();
-        if !walker.helper_setup.is_empty() {
-            for case in &mut walker.tests {
-                case.context
-                    .module_setup
-                    .extend(walker.helper_setup.iter().cloned());
+    let mut walker =
+        super::fingerprint::with_file_import_origins(source, &file.path, program, || {
+            let mut registry = Registry::new(program, globals);
+            let mut walker = Walker::new(source, file, program, semantic, globals);
+            walker.allow_imported = allow_imported;
+            walker.prepare_imported_constants(&allocator);
+            walker.walk_statements(&program.body, &mut registry);
+            walker.finish_imported_constants();
+            if !walker.helper_setup.is_empty() {
+                for case in &mut walker.tests {
+                    case.context
+                        .module_setup
+                        .extend(walker.helper_setup.iter().cloned());
+                }
             }
-        }
-        walker
-    });
+            walker
+        });
     reasons.extend(walker.reasons);
     diagnostics.extend(walker.diagnostics);
     for (reason, text) in walker.expansion.borrow().budget_diagnostics() {
@@ -551,6 +553,13 @@ fn run(source: &str, file: &SourceFile, globals: Globals, allow_imported: bool) 
     for text in super::resolver::take_refusals() {
         reasons.push(ExclusionReason::ImportOutsideRoot);
         diagnostics.push(text);
+    }
+    for text in super::resolver::take_manifest_refusals() {
+        reasons.push(ExclusionReason::PackageManifestUnreadable);
+        diagnostics.push(text);
+        for test in &mut walker.tests {
+            test.context.unresolved = true;
+        }
     }
     debug_assert_eq!(reasons.len(), diagnostics.len());
 
@@ -734,11 +743,11 @@ fn collect_import_specifiers(
     // however many declarations, and every test that references one of them, holds an `Arc` to
     // this same text. Keyed by the specifier as written; `file` is fixed, so the same text always
     // resolves to the same identity and a repeat declaration skips the resolution too.
-    let mut identities: HashMap<&str, Arc<str>> = HashMap::new();
+    let mut identities: HashMap<std::borrow::Cow<str>, Arc<str>> = HashMap::new();
     for import in super::fingerprint::value_import_declarations(program) {
-        let source = import.source.value.as_str();
-        let identity = Arc::clone(identities.entry(source).or_insert_with(|| {
-            Arc::from(super::fingerprint::specifier_identity(file, source).as_str())
+        let source = string_text(&import.source);
+        let identity = Arc::clone(identities.entry(source.clone()).or_insert_with(|| {
+            Arc::from(super::fingerprint::specifier_identity(file, &source).as_str())
         }));
         let Some(specifiers) = &import.specifiers else {
             continue;
@@ -774,7 +783,7 @@ fn collect_import_specifiers(
 fn nuxt_mock_import_symbols(program: &Program) -> HashSet<SymbolId> {
     let mut symbols = HashSet::new();
     for import in super::fingerprint::value_import_declarations(program) {
-        if import.source.value.as_str() != "@nuxt/test-utils/runtime" {
+        if string_text(&import.source).as_ref() != "@nuxt/test-utils/runtime" {
             continue;
         }
         for specifier in import.specifiers.iter().flatten() {
@@ -992,8 +1001,11 @@ fn collect_mocked_modules(
                     // never match the `mock` it is meant to cancel.
                     events.push(MockEvent::Mock(MockedModule {
                         specifier: std::sync::Arc::from(
-                            super::fingerprint::specifier_identity(file, literal.value.as_str())
-                                .as_str(),
+                            super::fingerprint::specifier_identity(
+                                file,
+                                string_text(literal).as_ref(),
+                            )
+                            .as_str(),
                         ),
                         factory,
                     }));
@@ -1008,7 +1020,7 @@ fn collect_mocked_modules(
                 Some(Argument::StringLiteral(literal)) => {
                     events.push(MockEvent::Unmock(super::fingerprint::specifier_identity(
                         file,
-                        literal.value.as_str(),
+                        string_text(literal).as_ref(),
                     )));
                 }
                 // A3 again, and for the same reason in reverse: an `unmock` whose target cannot
@@ -1054,7 +1066,7 @@ fn collect_mocked_modules(
                 match read_factory(factory, semantic, source, file).filter(|_| harmless) {
                     Some(factory) => events.push(MockEvent::Mock(MockedModule {
                         specifier: std::sync::Arc::from(
-                            format!("nuxt-import:{}", name.value).as_str(),
+                            format!("nuxt-import:{}", string_text(name)).as_str(),
                         ),
                         factory,
                     })),
@@ -2967,9 +2979,60 @@ impl<'a> Walker<'a> {
         }
         if self.resolve_local_helper(&call.callee).is_some() {
             self.with_helper_body(call, registry, walk);
-        } else {
+        } else if !self.refuse_unread_local_helper(call) {
             self.imported_helper_call(call, prepare);
         }
+    }
+
+    /// Refuses a call to a local binding this walker does not inline (an arrow or function
+    /// expression, a parameter, a value computed elsewhere) unless the call provably registers
+    /// nothing: skipping it would drop whatever it declares silently. Whether it refused.
+    fn refuse_unread_local_helper(&mut self, call: &CallExpression<'a>) -> bool {
+        let Expression::Identifier(ident) = &call.callee else {
+            return false;
+        };
+        let semantic: &'a Semantic<'a> = self.semantic;
+        let scoping = semantic.scoping();
+        let Some(symbol) = ident
+            .reference_id
+            .get()
+            .and_then(|reference| scoping.get_reference(reference).symbol_id())
+        else {
+            return false;
+        };
+        // An ambient (`declare`) binding is a global the runtime provides, judged like a free name.
+        let flags = scoping.symbol_flags(symbol);
+        if flags.is_import() || flags.is_ambient() {
+            return false;
+        }
+        // Only a declaration that states the value can be read; a parameter's value is the
+        // caller's, and a redeclared name has no single declaration that runs.
+        let shows_value =
+            registration_free::runtime_declaration(semantic, symbol).is_some_and(|node| {
+                match semantic.nodes().kind(node) {
+                    AstKind::VariableDeclarator(declarator) => declarator.init.is_some(),
+                    AstKind::Function(function) => function.body.is_some(),
+                    AstKind::Class(_) => true,
+                    _ => false,
+                }
+            });
+        if shows_value
+            && registration_free::local_call_registers_nothing(
+                self.program,
+                semantic,
+                self.written_bindings(),
+                &self.file.path,
+                &call.callee,
+                &call.arguments,
+            )
+        {
+            return false;
+        }
+        self.refuse_helper_expansion(refusal(
+            ExclusionReason::HelperExportUnreadable,
+            "the called local helper is not a `function` declaration",
+        ));
+        true
     }
 
     /// The shape both helper-expansion passes share: open the frame, run one walk over the
@@ -3174,8 +3237,8 @@ impl<'a> Walker<'a> {
     ///   call-graph question this fix deliberately does not open;
     /// - a body present, which excludes a TypeScript overload signature or `declare function`.
     ///
-    /// Anything outside that set falls through to the pre-S11 behaviour -- the call contributes
-    /// nothing -- rather than being guessed at.
+    /// Anything outside that set is not guessed at: [`Self::refuse_unread_local_helper`] refuses
+    /// the call unless it provably registers nothing.
     fn resolve_local_helper(&self, expr: &Expression) -> Option<(SymbolId, &'a Function<'a>)> {
         let Expression::Identifier(ident) = expr else {
             return None;
@@ -3746,7 +3809,7 @@ struct TitlePattern {
 fn raw_title_pattern(title_arg: Option<&Argument>, source: &str) -> TitlePattern {
     match title_arg {
         Some(Argument::StringLiteral(literal)) => TitlePattern {
-            text: literal.value.as_str().to_owned(),
+            text: string_text(literal).into_owned(),
             resolved: true,
         },
         Some(Argument::TemplateLiteral(template)) if template.is_no_substitution_template() => {
@@ -3754,8 +3817,8 @@ fn raw_title_pattern(title_arg: Option<&Argument>, source: &str) -> TitlePattern
                 text: template
                     .quasis
                     .first()
-                    .and_then(|quasi| quasi.value.cooked.as_ref())
-                    .map(|cooked| cooked.as_str().to_owned())
+                    .and_then(|quasi| cooked_text(&quasi.value))
+                    .map(std::borrow::Cow::into_owned)
                     .unwrap_or_default(),
                 resolved: true,
             }
@@ -3784,15 +3847,15 @@ impl<'a> Walker<'a> {
     fn extract_title(&self, title_arg: Option<&Argument>) -> Title {
         match title_arg {
             Some(Argument::StringLiteral(literal)) => {
-                Title::Static(literal.value.as_str().to_owned())
+                Title::Static(string_text(literal).into_owned())
             }
             Some(Argument::TemplateLiteral(template)) => {
                 if template.is_no_substitution_template() {
                     let text = template
                         .quasis
                         .first()
-                        .and_then(|quasi| quasi.value.cooked.as_ref())
-                        .map(|cooked| cooked.as_str().to_owned())
+                        .and_then(|quasi| cooked_text(&quasi.value))
+                        .map(std::borrow::Cow::into_owned)
                         .unwrap_or_default();
                     Title::Static(text)
                 } else {
@@ -3827,14 +3890,7 @@ impl<'a> Walker<'a> {
         if folded.iter().all(Option::is_some) {
             let mut rendered = String::new();
             for (index, quasi) in template.quasis.iter().enumerate() {
-                rendered.push_str(
-                    quasi
-                        .value
-                        .cooked
-                        .as_ref()
-                        .map(|cooked| cooked.as_str())
-                        .unwrap_or(""),
-                );
+                rendered.push_str(cooked_text(&quasi.value).as_deref().unwrap_or(""));
                 if let Some(Some(value)) = folded.get(index) {
                     rendered.push_str(value);
                 }
@@ -3843,14 +3899,7 @@ impl<'a> Walker<'a> {
         } else {
             let mut shape = String::new();
             for (index, quasi) in template.quasis.iter().enumerate() {
-                shape.push_str(
-                    quasi
-                        .value
-                        .cooked
-                        .as_ref()
-                        .map(|cooked| cooked.as_str())
-                        .unwrap_or(""),
-                );
+                shape.push_str(cooked_text(&quasi.value).as_deref().unwrap_or(""));
                 if index < template.expressions.len() {
                     shape.push_str("${_}");
                 }
@@ -10394,6 +10443,73 @@ mod tests {
             "and spending the budget must be visible, never silent: {:?}",
             past.diagnostics
         );
+    }
+
+    /// A call to a local binding the walker does not inline is refused when it may register, and
+    /// left alone when it provably registers nothing or is never called.
+    #[test]
+    fn an_unread_local_helper_call_is_refused_unless_it_registers_nothing() {
+        let refused = [
+            "const declare = () => { test('hidden', () => {}); }; declare();",
+            "const declare = function () { test('hidden', () => {}); }; declare();",
+            "let declare = () => {}; declare = () => { test('hidden', () => {}); }; declare();",
+            "function wrap(fn) { fn(); } wrap(() => { test('hidden', () => {}); });",
+            "const declare = () => {}; declare(() => test('hidden', () => {}));",
+        ];
+        for body in refused {
+            let source =
+                format!("import {{ test }} from 'vitest';\n{body}\ntest('visible', () => {{}});");
+            let extraction = extract_source(&source, "case.test.ts", Globals::Disabled);
+            assert!(extraction.incomplete, "{body}");
+            assert_eq!(extraction.tests.len(), 1, "{body}");
+            assert!(extraction.tests[0].context.unresolved, "{body}");
+            assert!(
+                extraction.diagnostics.iter().any(|diagnostic| diagnostic
+                    .contains("the called local helper is not a `function` declaration")),
+                "{body}: {:?}",
+                extraction.diagnostics
+            );
+        }
+
+        let kept = [
+            "const values = []; const fill = () => { values.push(1); }; fill();",
+            "const declare = () => { test('never', () => {}); };",
+            "setup();",
+            "declare const declare: () => void; declare();",
+        ];
+        for body in kept {
+            let source =
+                format!("import {{ test }} from 'vitest';\n{body}\ntest('visible', () => {{}});");
+            let extraction = extract_source(&source, "case.test.ts", Globals::Disabled);
+            assert!(
+                !extraction.incomplete,
+                "{body}: {:?}",
+                extraction.diagnostics
+            );
+            assert_eq!(extraction.tests.len(), 1, "{body}");
+            assert!(!extraction.tests[0].context.unresolved, "{body}");
+        }
+
+        // The refusal taints the scope the call runs in, not its siblings.
+        let extraction = extract_source(
+            "import { describe, test } from 'vitest';\n\
+             describe('d', () => { const declare = () => { test('hidden', () => {}); }; declare(); test('inner', () => {}); });\n\
+             test('outer', () => {});",
+            "case.test.ts",
+            Globals::Disabled,
+        );
+        assert!(extraction.incomplete);
+        let unresolved = |title: &str| {
+            extraction
+                .tests
+                .iter()
+                .find(|case| matches!(&case.title, Title::Static(text) if text == title))
+                .unwrap_or_else(|| panic!("{title} extracted"))
+                .context
+                .unresolved
+        };
+        assert!(unresolved("inner"));
+        assert!(!unresolved("outer"));
     }
 }
 

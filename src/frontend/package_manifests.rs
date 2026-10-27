@@ -12,6 +12,7 @@
 
 use super::extract::registration_free::REGISTRATION;
 use super::package_supervisor::supervise;
+use crate::frontend::js_text::string_text;
 use crate::model::PackageWorkerFailure;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -87,9 +88,11 @@ fn find_package(from: &Path, name: &str) -> Option<PathBuf> {
         } else {
             directory.join("node_modules").join(name)
         };
-        candidate
-            .join("package.json")
-            .is_file()
+        std::fs::symlink_metadata(candidate.join("package.json"))
+            .map_or_else(
+                |error| error.kind() != std::io::ErrorKind::NotFound,
+                |_| true,
+            )
             .then_some(candidate)
     })
 }
@@ -140,7 +143,7 @@ fn closure_has_no_runner(root: &Path) -> bool {
         if visited.len() > MAX_PACKAGES {
             return false;
         }
-        let Some(manifest) = std::fs::read_to_string(package.join("package.json"))
+        let Some(manifest) = crate::package_json::read(&package.join("package.json"))
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         else {
@@ -264,7 +267,9 @@ fn scan_script(
         /// The first argument of a load: a string, or a template with no substitution.
         fn argument(&mut self, expression: Option<&Expression<'_>>) {
             match expression {
-                Some(Expression::StringLiteral(literal)) => self.specifier(literal.value.as_str()),
+                Some(Expression::StringLiteral(literal)) => {
+                    self.specifier(string_text(literal).as_ref())
+                }
                 Some(Expression::TemplateLiteral(template)) if template.expressions.is_empty() => {
                     match template.quasis.first() {
                         Some(quasi) => self.specifier(quasi.value.raw.as_str()),
@@ -287,20 +292,20 @@ fn scan_script(
             &mut self,
             it: &oxc_ast::ast::TSExternalModuleReference<'a>,
         ) {
-            self.specifier(it.expression.value.as_str());
+            self.specifier(string_text(&it.expression).as_ref());
         }
         /// `import ... from 'x'`.
         fn visit_import_declaration(&mut self, it: &oxc_ast::ast::ImportDeclaration<'a>) {
-            self.specifier(it.source.value.as_str());
+            self.specifier(string_text(&it.source).as_ref());
             walk::walk_import_declaration(self, it);
         }
         /// `export { a } from 'x'`.
         fn visit_export_from_declaration(&mut self, it: &oxc_ast::ast::ExportFromDeclaration<'a>) {
-            self.specifier(it.source.value.as_str());
+            self.specifier(string_text(&it.source).as_ref());
         }
         /// `export * from 'x'`.
         fn visit_export_all_declaration(&mut self, it: &oxc_ast::ast::ExportAllDeclaration<'a>) {
-            self.specifier(it.source.value.as_str());
+            self.specifier(string_text(&it.source).as_ref());
         }
         /// `import('x')`.
         fn visit_import_expression(&mut self, it: &oxc_ast::ast::ImportExpression<'a>) {
@@ -498,12 +503,13 @@ fn reads_registration_global(program: &oxc_ast::ast::Program<'_>) -> bool {
                     if unary.operator == oxc_ast::ast::UnaryOperator::Typeof)
             } else {
                 let (property, span) = match user {
-                    AstKind::StaticMemberExpression(member) => {
-                        (Some(member.property.name.as_str()), member.span)
-                    }
+                    AstKind::StaticMemberExpression(member) => (
+                        Some(std::borrow::Cow::Borrowed(member.property.name.as_str())),
+                        member.span,
+                    ),
                     AstKind::ComputedMemberExpression(member) => match &member.expression {
                         Expression::StringLiteral(literal) => {
-                            (Some(literal.value.as_str()), member.span)
+                            (Some(string_text(literal)), member.span)
                         }
                         _ => (None, member.span),
                     },
@@ -517,7 +523,8 @@ fn reads_registration_global(program: &oxc_ast::ast::Program<'_>) -> bool {
                             if assign.operator == oxc_ast::ast::AssignmentOperator::Assign
                                 && assign.left.span() == span
                     );
-                !assigned && property.is_some_and(|property| REGISTRATION.contains(&property))
+                !assigned
+                    && property.is_some_and(|property| REGISTRATION.contains(&property.as_ref()))
             };
             if counts {
                 return true;
@@ -680,8 +687,13 @@ fn resolve_target(
     }
     found.existed = true;
     let manifest = base.join("package.json");
-    if use_manifest && manifest.is_file() {
-        let Some(value) = std::fs::read_to_string(&manifest)
+    if use_manifest
+        && std::fs::symlink_metadata(&manifest).map_or_else(
+            |error| error.kind() != std::io::ErrorKind::NotFound,
+            |_| true,
+        )
+    {
+        let Some(value) = crate::package_json::read(&manifest)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         else {
@@ -699,7 +711,7 @@ fn resolve_target(
             let target = normalized(&base.join(main));
             // A directory target with a manifest of its own would be routed by it.
             if !target.starts_with(real_root)
-                || target.join("package.json").is_file()
+                || std::fs::symlink_metadata(target.join("package.json")).is_ok()
                 || !resolve_target(&target, real_root, false, false, found)
             {
                 return false;
@@ -881,10 +893,13 @@ fn reached_files_register(entry: &Path, globals: bool, guarded: bool) -> bool {
     let Some(real_root) = package_root(&real_entry) else {
         return true;
     };
-    let own = std::fs::read_to_string(real_root.join("package.json"))
+    let Some(manifest) = crate::package_json::read(&real_root.join("package.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.get("name").and_then(Value::as_str).map(str::to_owned));
+    else {
+        return true;
+    };
+    let own = manifest.get("name").and_then(Value::as_str);
     let mut pending = vec![real_entry];
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut bytes = 0u64;
@@ -920,7 +935,7 @@ fn reached_files_register(entry: &Path, globals: bool, guarded: bool) -> bool {
         if kind == Kind::Data {
             continue;
         }
-        let scan = scan_script(&file, &text, own.as_deref(), guarded, globals);
+        let scan = scan_script(&file, &text, own, guarded, globals);
         if globals && scan.registers_global {
             return true;
         }
@@ -957,6 +972,49 @@ pub(crate) fn cannot_register_tests(file: &Path, globals: bool) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Refused manifests taint closure roots, installed optional peers and nested entry routing.
+    #[test]
+    fn refused_manifests_never_become_clean_package_proofs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let package = install(root, "owned", r#"{"name":"owned"}"#);
+        let oversized = " ".repeat(crate::package_json::MAX_BYTES as usize + 1);
+        assert!(closure_has_no_runner(&package));
+        fs::write(package.join("package.json"), &oversized).unwrap();
+        assert!(!closure_has_no_runner(&package));
+        assert!(reached_files_register(
+            &package.join("index.js"),
+            false,
+            true
+        ));
+        fs::write(
+            package.join("package.json"),
+            r#"{"optionalDependencies":{"peer":"1"}}"#,
+        )
+        .unwrap();
+        assert!(closure_has_no_runner(&package));
+        let peer = install(root, "peer", &oversized);
+        assert!(!closure_has_no_runner(&package));
+        fs::remove_file(peer.join("package.json")).unwrap();
+        fs::create_dir(peer.join("package.json")).unwrap();
+        assert!(!closure_has_no_runner(&package));
+        fs::write(package.join("package.json"), "{}").unwrap();
+        write_file(&package, "sub/package.json", &oversized);
+        write_file(&package, "sub/index.js", "");
+        write_file(&package, "index.js", "import './sub';");
+        assert!(reached_files_register(
+            &package.join("index.js"),
+            false,
+            true
+        ));
+        fs::write(package.join("sub/package.json"), "{}").unwrap();
+        assert!(!reached_files_register(
+            &package.join("index.js"),
+            false,
+            true
+        ));
+    }
 
     /// Writes `node_modules/<name>/package.json` under `root` and returns the package directory.
     fn install(root: &Path, name: &str, manifest: &str) -> PathBuf {

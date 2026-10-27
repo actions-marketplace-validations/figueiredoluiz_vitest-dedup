@@ -511,6 +511,7 @@ const DELIBERATE_BLIND_FILES = new Set([
   'recall/framework-package-mock-call-uninstalled/users.test.ts',
   // Required generated metadata beyond the nesting budget must leave its callers unproved.
   'recall/framework-auto-import-table-depth/clock.test.ts',
+  'recall/framework-package-manifest-oversized/metadata.test.ts',
   // `mockNuxtImport` factories that must stay refused: a redeclared `var` whose later value registers,
   // and a counter a hook increments (identical tests that observe different values).
   'recall/framework-nuxt-mock-redeclared-binding/run.test.ts',
@@ -535,6 +536,10 @@ const DELIBERATE_BLIND_FILES = new Set([
   'recall/concise-suite-guarded-hook-uncertainty/run.test.ts',
   // A local helper reassigned with no overload signature: refused for the reassignment alone.
   'recall/local-helper-reassigned/run.test.ts',
+  // A local `const` arrow and a called parameter whose bodies are not read: refused so the tests
+  // they declare are not dropped silently. The arrow stays blind until `const` helpers are inlined.
+  'recall/local-helper-const-arrow/run.test.ts',
+  'recall/local-helper-parameter-callee/run.test.ts',
   // Default exports a runner must keep refusing (a `let`, a reassigned declaration, an imported
   // binding): blind on purpose, permanently, as the controls for the default-identifier support.
   'recall/framework-runner-default-imported-negative/slugs.test.ts',
