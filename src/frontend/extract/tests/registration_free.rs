@@ -724,3 +724,247 @@ fn a_chain_of_modules_past_the_cap_is_refused() {
     assert!(!calls(&directory, "m0.ts", "run"));
     assert!(calls(&directory, "m60.ts", "run"));
 }
+
+/// Parses a call `helper(<arguments>)` to `function helper(<parameters>) {}`, written after
+/// `prelude` in a test file, and answers `judge` about it.
+fn judge_helper_call(
+    prelude: &str,
+    parameters: &str,
+    arguments: &str,
+    judge: impl FnOnce(
+        &oxc_ast::ast::Program<'_>,
+        &oxc_semantic::Semantic<'_>,
+        &oxc_ast::ast::FormalParameters<'_>,
+        &[oxc_ast::ast::Argument<'_>],
+        oxc_span::Span,
+    ) -> bool,
+) -> bool {
+    use oxc_ast::ast::{Expression, Statement};
+    let source = format!(
+        "import {{ beforeEach }} from 'vitest';\n{prelude}\nfunction helper({parameters}) {{}}\nhelper({arguments});\n"
+    );
+    let allocator = oxc_allocator::Allocator::default();
+    let parsed = oxc_parser::Parser::new(&allocator, &source, oxc_span::SourceType::ts()).parse();
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "{source}: {:?}",
+        parsed.diagnostics
+    );
+    let semantic = oxc_semantic::SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program)
+        .semantic;
+    let program = &parsed.program;
+    let parameters = program
+        .body
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::FunctionDeclaration(function)
+                if function.id.as_ref().is_some_and(|id| id.name == "helper") =>
+            {
+                Some(&function.params)
+            }
+            _ => None,
+        })
+        .expect("helper declared");
+    let Some(Statement::ExpressionStatement(statement)) = program.body.last() else {
+        panic!("call last");
+    };
+    let Expression::CallExpression(call) = &statement.expression else {
+        panic!("call last");
+    };
+    judge(program, &semantic, parameters, &call.arguments, call.span)
+}
+
+/// Whether the call provably evaluates no registration before the helper's body runs.
+fn inputs_register_nothing(prelude: &str, parameters: &str, arguments: &str) -> bool {
+    judge_helper_call(
+        prelude,
+        parameters,
+        arguments,
+        |program, semantic, parameters, arguments, call| {
+            let written = super::registration_free::written_bindings(program, semantic);
+            super::registration_free::call_inputs_register_nothing(
+                program,
+                semantic,
+                &written,
+                std::path::Path::new("case.test.ts"),
+                parameters,
+                arguments,
+                call,
+            )
+        },
+    )
+}
+
+/// Whether binding the call's arguments to the helper's parameters is known to throw.
+fn binding_fails(parameters: &str, arguments: &str) -> bool {
+    binding_fails_after("", parameters, arguments)
+}
+
+/// [`binding_fails`] for a call written after `prelude`.
+fn binding_fails_after(prelude: &str, parameters: &str, arguments: &str) -> bool {
+    judge_helper_call(
+        prelude,
+        parameters,
+        arguments,
+        |_, semantic, parameters, arguments, _| {
+            super::registration_free::call_binding_fails(semantic, parameters, arguments)
+        },
+    )
+}
+
+/// Binding fails only for a value the source spells out and that cannot bind: `undefined` or
+/// `null` for any pattern, a non-iterable literal for an array pattern, nested through literals
+/// and the defaults that run. A value the source does not show is assumed to bind.
+#[test]
+fn a_binding_fails_only_for_a_value_that_cannot_bind() {
+    for (parameters, arguments) in [
+        ("{ _a }", ""),
+        ("{ _a }", "undefined"),
+        ("{ _a }", "void 0"),
+        ("{ _a }", "(null as any)"),
+        ("_x, [_a]", "0, {}"),
+        ("[_a]", "1"),
+        ("[_a]", "{ __proto__ }"),
+        ("[_a]", "() => {}"),
+        ("[_a]", "class {}"),
+        ("{ _a } = null", ""),
+        ("{ _a: { _b } }", "{}"),
+        ("{ _a: { _b } }", "{ _a: null }"),
+        ("{ _a: { _b } = null }", "{}"),
+        ("[[_a]]", "[0]"),
+        ("[, [_a]]", "[0]"),
+        ("[_a, { _b }]", "[0, , ]"),
+    ] {
+        assert!(
+            binding_fails(parameters, arguments),
+            "({parameters}) <- ({arguments})"
+        );
+    }
+    for (parameters, arguments) in [
+        ("_a", ""),
+        ("{ _a }", "{}"),
+        ("{ _a }", "0"),
+        ("{ _a }", "options"),
+        ("{ _a } = {}", ""),
+        ("{ _a } = {}", "undefined"),
+        ("{ _a } = {}", "(undefined as any)"),
+        ("[_a]", "{ __proto__: [1] }"),
+        ("{ _a: { _b } }", "{ __proto__: { _a: {} } }"),
+        ("[_a]", "'ab'"),
+        ("[_a]", "`ab`"),
+        ("[_a]", "[]"),
+        ("[_a]", "options"),
+        ("[_a]", "{ [Symbol.iterator]: f }"),
+        ("[_a]", "{ ...iterable }"),
+        ("{ [key]: { _b } }", "{}"),
+        ("{ _a: { _b } }", "{ ...rest }"),
+        ("{ _a: { _b } }", "{ get _a() { return {}; } }"),
+        ("{ _a: { _b } }", "{ [name]: {} }"),
+        ("{ _a: { _b } = {} }", "{}"),
+        ("{ _a: { _b } }", "{ _a: 1 }"),
+        ("[[_a]]", "[...rows]"),
+        ("[_x, [_a]]", "[...rows, 0]"),
+        ("_x, { _a }", "...rest"),
+    ] {
+        assert!(
+            !binding_fails(parameters, arguments),
+            "({parameters}) <- ({arguments})"
+        );
+    }
+    // A local `undefined` binds like the value it holds; `void 0` is still `undefined`.
+    assert!(!binding_fails_after(
+        "const undefined = {};",
+        "{ _a }",
+        "undefined"
+    ));
+    assert!(binding_fails_after(
+        "const undefined = {};",
+        "{ _a }",
+        "void 0"
+    ));
+}
+
+/// Inputs that only read or create values pass without a scan; any input that runs code passes
+/// only when the scan proves it registers nothing, whichever pattern position evaluates it.
+#[test]
+fn call_inputs_are_proved_by_what_they_evaluate() {
+    let unproved = "function make() { return eval('0'); }\nconst made = make();\n\
+        const input = { get value() { beforeEach(() => {}); return 0; } };";
+    for (parameters, arguments) in [
+        ("_a", "1n, /a/, `x`, null, true, 'x'"),
+        (
+            "_a",
+            "[1, , made], { made, f() {}, get g() { return beforeEach; }, k: (made as any)! }",
+        ),
+        (
+            "_a",
+            "(made satisfies unknown), () => beforeEach(() => {}), function () {}",
+        ),
+        ("_a = made", ""),
+        ("[_a = 1, ..._rest]", "[]"),
+        ("{ _a, ..._rest }", "{}"),
+        ("..._rest", "made"),
+        // A default its argument never lets run, and destructuring that reads only plain data.
+        ("_a = beforeEach(() => {})", "null"),
+        ("{ _a } = {}", ""),
+        (
+            "{ value: _v } = { get value() { beforeEach(() => {}); return 0; } }",
+            "{ value: 1 }",
+        ),
+        ("{ _a }", "{ _a: 1 }"),
+        // A parameter that receives a registering function but is never called.
+        ("_register, _h = 1", "() => beforeEach(() => {})"),
+        // A nested default that only binds is not read.
+        ("{ child: _c = input }", "{}"),
+    ] {
+        assert!(
+            inputs_register_nothing(unproved, parameters, arguments),
+            "({parameters}) <- ({arguments})"
+        );
+    }
+    for (parameters, arguments) in [
+        ("_a", "beforeEach(() => {})"),
+        ("_a", "...[made]"),
+        ("_a", "{ [String(beforeEach(() => {}))]: 0 }"),
+        ("_a", "`${beforeEach(() => {})}`"),
+        ("_a", "made.value"),
+        ("_a = beforeEach(() => {})", ""),
+        ("[_a = beforeEach(() => {})]", "[]"),
+        ("[..._rest] = [beforeEach(() => {})]", ""),
+        ("{ [String(beforeEach(() => {}))]: _a }", "{}"),
+        ("{ ..._rest } = { a: beforeEach(() => {}) }", ""),
+        ("...[_a = beforeEach(() => {})]", ""),
+        // Destructuring reads the argument (a getter here), and an unproved value may be iterated
+        // or read.
+        ("{ value: _v }", "input"),
+        ("[_a]", "made"),
+        ("_a = beforeEach(() => {})", "made"),
+        // A default that can run is destructured too, so a getter in it registers.
+        (
+            "{ value: _v } = { get value() { beforeEach(() => {}); return 0; } }",
+            "",
+        ),
+        (
+            "{ value: _v } = { get value() { beforeEach(() => {}); return 0; } }",
+            "undefined",
+        ),
+        // A default calls another parameter, whose value only the caller shows.
+        ("register, _h = register()", "() => beforeEach(() => {})"),
+        // A nested default destructured further is read, and a computed key is coerced.
+        ("{ child: { value: _v } = input }", "{}"),
+        ("{ [input]: _v }", "{}"),
+    ] {
+        assert!(
+            !inputs_register_nothing(unproved, parameters, arguments),
+            "({parameters}) <- ({arguments})"
+        );
+    }
+    // A local `undefined` is a value like any other, so destructuring it runs its getter.
+    assert!(!inputs_register_nothing(
+        "const undefined = { get value() { beforeEach(() => {}); return 0; } };",
+        "{ value: _v }",
+        "undefined",
+    ));
+}
