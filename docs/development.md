@@ -29,6 +29,14 @@ means (a test, a hook, a table member) instead of spelling the name. Modules lis
 `src/framework/tests.rs` may not contain any name the dialect declares as a string literal; the
 test names the file and literal it rejects.
 
+### The next core
+
+A second analysis core is being built beside the current one, in layers that each read only the
+layer below: `lang` (parsing, scopes, resolution; with `frontend`, the only importer of `oxc_*`),
+`inventory` (registration sites by provenance), `normal` (normal forms and identities) and
+`corpus` (each test keyed for comparison, or excluded with a reason). No run reaches it yet; unit tests
+check every layer, and `normal` has its own mutation scope (`npm run mutants:next-core`).
+
 ### Gates `npm run check` does not run
 
 They are slow: `check:memory`, `check:memory:scaling`, `check:coverage:rust`, `check:mutation`.
@@ -48,7 +56,14 @@ compares the result with what the analyzer extracts: test titles per file, and h
 sites. Vitest runs as `vitest list --staticParse=false` with a probe runner, so describe callbacks
 run and test and hook bodies do not. An import of a module that does not exist loads as a stub, and
 a file whose collection reads a stub, or that imports one only for its side effects, is not
-compared. The gate assumes a missing module registers no tests or hooks when it loads. Known disagreements are listed with their
+compared. The gate assumes a missing module registers no tests or hooks when it loads.
+
+The same collection checks the next engine's inventory (`VITEST_DEDUP_ENGINE=next`): every test and
+suite Vitest collects must have a registration site of its kind on the line Vitest places it on, or
+a wrapper call or module load that accounts for it. Sites that register nothing Vitest collected are
+counted, not failed. Floors on the files and tasks compared keep a shrunken comparison from passing.
+
+Known disagreements are listed with their
 reasons in `scripts/check/collection-oracle-known.json`; the gate fails on a disagreement that is not
 listed and on a listed one that no longer occurs, so a fix deletes its entry.
 
