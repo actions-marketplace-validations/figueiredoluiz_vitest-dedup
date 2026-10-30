@@ -18,7 +18,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { parseJsonl, runAnalyzerJsonl } from './run-analyzer.mjs'
+import { defaultBinary, parseJsonl, runAnalyzerJsonl } from './run-analyzer.mjs'
 
 const LIB = dirname(fileURLToPath(import.meta.url))
 const PROBE_RUNNER = join(LIB, 'collection-probe-runner.mjs')
@@ -228,8 +228,8 @@ export function analyzerRecordsOf(binary, args, env = {}) {
 
 /**
  * The next engine's registration sites for `dir`, per file relative to it: `{kind, line,
- * lineFrom}`, where `kind` is the dialect's name (`test`, `describe`, a hook), `wrapper` or
- * `module-load`.
+ * lineFrom}`, where `kind` is the dialect's name (`test`, `describe`, a hook), `wrapper`,
+ * `hook-wrapper` (registers only hooks, so no task) or `module-load`.
  */
 export function collectSites(binary, root, dir) {
   return siteView(analyzerRecords(binary, root, dir, { VITEST_DEDUP_ENGINE: 'next' }), resolve(root, dir))
@@ -420,6 +420,37 @@ export function matchKnown(found, known) {
     else unlisted.push(disagreement)
   }
   return { unlisted, stale: [...remaining.values()].flat() }
+}
+
+/**
+ * Why the oracle cannot run from `root` with `binary`: the pinned Vitest or the analyzer binary is
+ * missing. `null` when both are there.
+ *
+ * @param {string} root - checkout root.
+ * @param {string} binary - analyzer binary path.
+ * @returns {string | null} The failure message, without its `FAIL:` prefix.
+ */
+export function oracleSetupError(root, binary) {
+  const installError = vitestInstallError(root)
+  if (installError) return `${installError}. The oracle is the pinned Vitest; a missing one measures nothing.`
+  if (!existsSync(binary)) return `analyzer binary ${binary} not found. Build it: cargo build --release --locked`
+  return null
+}
+
+/**
+ * The analyzer binary a gate entry point runs, from its first argument or the release build.
+ * Prints why the oracle cannot run and returns `null` when the pinned Vitest or the binary is
+ * missing, for the caller to exit 2.
+ *
+ * @param {string} root - checkout root.
+ * @param {string | undefined} argument - the binary path the gate was given, if any.
+ * @returns {string | null} The binary's absolute path.
+ */
+export function oracleBinary(root, argument) {
+  const binary = resolve(root, argument ?? defaultBinary({ root }))
+  const error = oracleSetupError(root, binary)
+  if (error) console.error(`FAIL: ${error}`)
+  return error ? null : binary
 }
 
 /** Why `root` lacks the pinned Vitest the gate requires, or `null` when it has it. */
