@@ -1,0 +1,23 @@
+{
+  "files": {
+    "closed.test.ts": {
+      "tasks": 2,
+      "wrapperSites": [
+        "hook-wrapper@5"
+      ],
+      "next": {}
+    },
+    "rewritten.test.ts": {
+      "tasks": 3,
+      "wrapperSites": [
+        "wrapper@5"
+      ],
+      "next": {
+        "reasons": [
+          "registered-elsewhere"
+        ],
+        "testsExcluded": 1
+      }
+    }
+  }
+}

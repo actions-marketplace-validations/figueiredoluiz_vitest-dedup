@@ -2,23 +2,25 @@
 // `fixtures/duplicates`, `fixtures/observed` and `fixtures/mixed`.
 //
 // The shared fixture headers pin the default engine -- nine rules, one verdict vocabulary -- so
-// they cannot say what the next engine, which ports two rules, should do. This gate reads the
+// they cannot say what the next engine, whose ported rules are listed below, should do. This gate reads the
 // same headers and judges only the ported rules' pairwise claims, the way the spike evaluator
-// did: a positive `duplicate-test` or `cross-file-duplicate` expectation requires its
+// did: a positive expectation for any ported rule requires its
 // participants connected by that rule, in the spanning pairs it reports; a `rule=none` expectation forbids any ported rule from
 // linking its pairs; anything else the next engine links is a delta someone must adjudicate --
 // a fixture to fix, or an entry in `next-duplicates-known.json` with a reason. A known entry
 // whose delta stops being observed fails the gate, so an entry dies the moment the header or
 // the behavior moves.
 //
-// A rule outside the ported pair emitting under the next engine is a failure outright: its
+// A rule outside the ported set emitting under the next engine is a failure outright: its
 // expectations must move through the corpus gate's engine axis, never be satisfied silently.
 //
 // Nothing here judges a run pass or fail except the floors the caller asserts on top: a
 // contract violation is data, a measurement that did not measure is an error.
 
+import { describeMatcher, findingMatches } from './recall-runner.mjs'
+
 /** The rules the next engine runs. */
-export const PORTED_RULES = new Set(['duplicate-test', 'cross-file-duplicate'])
+export const PORTED_RULES = new Set(['duplicate-test', 'duplicate-test-name', 'cross-file-duplicate'])
 
 /** The identity one participant is matched by, the way the spike evaluator matched: file:line. */
 function endpoint(participant) {
@@ -120,6 +122,81 @@ export function expectationEdges(fixtures) {
   }
   const requiredEdges = new Set(required.map((r) => r.edge))
   return { required, declared, forbidden: forbidden.filter((f) => !requiredEdges.has(f.edge)) }
+}
+
+/** The sorted `path:line` of a finding's locations. */
+const locationsOf = (finding) => finding.locations.map((location) => `${location.path}:${location.line}`).sort()
+
+/**
+ * Body findings retain their source pattern; name findings carry exact rendered titles, which
+ * must be checked even when two different title groups share the same declaration locations.
+ */
+const readable = (expected) => (expected.locations && expected.rule !== 'duplicate-test-name' ? { ...expected, titles: undefined } : expected)
+
+/** A name finding's title distinguishes two row groups at the same pair of declarations. */
+const findingIdentity = (finding) => locationsOf(finding).join(',') + (finding.rule === 'duplicate-test-name' ? `|${JSON.stringify(finding.titles)}` : '')
+
+/** Missing name groups also stay distinct when their expected declaration locations agree. */
+const matcherIdentity = (expected) => (expected.locations ?? expected.titles ?? []).join(',') + (expected.rule === 'duplicate-test-name' && expected.locations && expected.titles ? `|${JSON.stringify(expected.titles)}` : '')
+
+/**
+ * Judges one recall case: its ported expectations against what the next engine reported.
+ *
+ * @param {object} testCase A manifest case.
+ * @param {object[]} records The run's jsonl records.
+ * @returns {{failures: {id: string, message: string}[], judged: number}} Each delta under the
+ *   stable id a known entry names, and how many expectations were judged.
+ */
+export function judgeRecall(testCase, records) {
+  const findings = records.filter((record) => record?.type === 'finding' && PORTED_RULES.has(record.rule))
+  const ported = (list) => (list ?? []).filter((expected) => PORTED_RULES.has(expected.rule))
+  const failures = []
+  const delta = (kind, rule, where, text) => {
+    failures.push({ id: `recall-${kind}|${testCase.name}|${rule}|${where}`, message: `FAIL recall ${testCase.name}: ${text}` })
+  }
+  const matched = new Set()
+  const take = (expected) => {
+    const found = findings.find((finding) => !matched.has(finding) && findingMatches(finding, readable(expected)))
+    if (found) matched.add(found)
+    return found
+  }
+  // A case that read fewer tests can pass its silences without having compared anything.
+  const analyzed = records.find((record) => record?.type === 'summary')?.testsAnalyzed
+  if (analyzed !== testCase.expectedTests) {
+    delta('tests', 'all', String(analyzed), `the next engine analyzed ${analyzed} test(s), and the case expects ${testCase.expectedTests}`)
+  }
+  const expected = ported(testCase.expectedFindings)
+  for (const matcher of expected) {
+    if (!take(matcher)) {
+      delta('miss', matcher.rule, matcherIdentity(matcher), `expected ${describeMatcher(matcher)}, which the next engine did not report`)
+    }
+  }
+  for (const matcher of ported(testCase.knownMisses)) take(matcher)
+  for (const matcher of ported(testCase.expectedAbsent)) {
+    const found = findings.find((finding) => findingMatches(finding, readable(matcher)))
+    if (found) {
+      matched.add(found)
+      delta('absent', matcher.rule, findingIdentity(found), `${describeMatcher(matcher)} must stay absent, and the next engine reported it`)
+    }
+  }
+  for (const finding of findings.filter((candidate) => !matched.has(candidate))) {
+    delta('extra', finding.rule, findingIdentity(finding), `the next engine reported ${finding.rule} at ${locationsOf(finding).join(', ')}, which the case does not expect`)
+  }
+  return { failures, judged: expected.length }
+}
+
+/**
+ * How many expectations each rule the next engine does not port still holds.
+ *
+ * @param {{rule: string}[]} expectations Expectations of the fixture headers and recall cases.
+ * @returns {Record<string, number>} Count per rule.
+ */
+export function pendingByRule(expectations) {
+  const counts = {}
+  for (const { rule } of expectations) {
+    if (rule !== 'none' && !PORTED_RULES.has(rule)) counts[rule] = (counts[rule] ?? 0) + 1
+  }
+  return counts
 }
 
 /**

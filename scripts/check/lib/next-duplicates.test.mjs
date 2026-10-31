@@ -8,8 +8,10 @@ import {
   edgeKey,
   expectationEdges,
   judge,
+  judgeRecall,
   knownProblems,
   pairEdges,
+  pendingByRule,
   PORTED_RULES,
   strayFindings,
 } from './next-duplicates.mjs'
@@ -279,6 +281,57 @@ test('a pair an expectation names fails when the other rule links it too', () =>
   assert.deepEqual(judge({ required, declared, forbidden, linked: pairEdges([expected, other]), known: held, scope: 'd' }).failures, [])
 })
 
+/** A recall finding of `rule` at `lines` of `a.test.ts`, with the title the next engine renders. */
+const located = (rule, lines) => ({ type: 'finding', rule, severity: 'error', titles: ['row %i'], locations: lines.map((line) => ({ path: 'a.test.ts', line })) })
+
+/** The summary record of a run that analyzed `testsAnalyzed` tests. */
+const summary = (testsAnalyzed) => ({ type: 'summary', testsAnalyzed })
+
+test('a case that analyzed another number of tests is a delta carrying the count, so a loss changes it', () => {
+  const { failures } = judgeRecall({ name: 'c', expectedTests: 2 }, [summary(1)])
+  assert.deepEqual(failures.map((f) => f.id), ['recall-tests|c|all|1'])
+  assert.match(failures[0].message, /analyzed 1 test\(s\), and the case expects 2/)
+  assert.deepEqual(judgeRecall({ name: 'c', expectedTests: 2 }, []).failures.map((f) => f.id), ['recall-tests|c|all|undefined'])
+})
+
+test('a recall expectation is met by rule and locations, whatever title the next engine renders', () => {
+  const matcher = { rule: 'duplicate-test', titles: ['row 1'], locations: ['a.test.ts:3', 'a.test.ts:6'] }
+  const outcome = judgeRecall({ name: 'c', expectedTests: 2, expectedFindings: [matcher] }, [summary(2), located('duplicate-test', [6, 3])])
+  assert.deepEqual(outcome, { failures: [], judged: 1 })
+})
+
+test('a recall expectation of a rule not ported is not judged, and a titled matcher keeps its titles', () => {
+  const other = { name: 'c', expectedFindings: [{ rule: 'redundant-hook' }] }
+  assert.deepEqual(judgeRecall({ ...other, expectedTests: 1 }, [summary(1)]), { failures: [], judged: 0 })
+  const titled = { name: 'c', expectedFindings: [{ rule: 'duplicate-test', titles: ['row 1'] }] }
+  const { failures } = judgeRecall({ ...titled, expectedTests: 2 }, [summary(2), located('duplicate-test', [3, 6])])
+  assert.deepEqual(failures.map((f) => f.id.split('|')[0]).sort(), ['recall-extra', 'recall-miss'])
+  assert.equal(failures.find((f) => f.id.startsWith('recall-miss')).id, 'recall-miss|c|duplicate-test|row 1')
+})
+
+test('a missing, a forbidden and an unexpected finding each carry their own stable id', () => {
+  const matcher = { rule: 'duplicate-test', locations: ['a.test.ts:3', 'a.test.ts:6'] }
+  const missed = judgeRecall({ name: 'c', expectedTests: 2, expectedFindings: [matcher] }, [summary(2)])
+  assert.equal(missed.failures[0].id, 'recall-miss|c|duplicate-test|a.test.ts:3,a.test.ts:6')
+  const absent = judgeRecall({ name: 'c', expectedTests: 2, expectedAbsent: [matcher] }, [summary(2), located('duplicate-test', [3, 6])])
+  assert.deepEqual(absent.failures.map((f) => f.id), ['recall-absent|c|duplicate-test|a.test.ts:3,a.test.ts:6'])
+  const extra = judgeRecall({ name: 'c', expectedTests: 2 }, [summary(2), located('cross-file-duplicate', [9, 12])])
+  assert.deepEqual(extra.failures.map((f) => f.id), ['recall-extra|c|cross-file-duplicate|a.test.ts:12,a.test.ts:9'])
+  assert.match(extra.failures[0].message, /FAIL recall c: the next engine reported cross-file-duplicate/)
+})
+
+test('a known miss is not required, and consumes the finding that meets it', () => {
+  const matcher = { rule: 'duplicate-test', locations: ['a.test.ts:3', 'a.test.ts:6'] }
+  const testCase = { name: 'c', expectedTests: 2, knownMisses: [matcher] }
+  assert.deepEqual(judgeRecall(testCase, [summary(2)]).failures, [])
+  assert.deepEqual(judgeRecall(testCase, [summary(2), located('duplicate-test', [3, 6])]).failures, [])
+})
+
+test('expectations waiting on a port are counted per rule, without the ported rules or `none`', () => {
+  const expectations = [{ rule: 'duplicate-suite' }, { rule: 'duplicate-suite' }, { rule: 'redundant-hook' }, { rule: 'duplicate-test' }, { rule: 'none' }]
+  assert.deepEqual(pendingByRule(expectations), { 'duplicate-suite': 2, 'redundant-hook': 1 })
+})
+
 test('a known entry needs an id and a reason', () => {
   assert.deepEqual(knownProblems([{ id: 'a', reason: 'b' }]), [])
   assert.deepEqual(knownProblems({}), ['the known list must be a list of cases'])
@@ -287,4 +340,20 @@ test('a known entry needs an id and a reason', () => {
     'known entry 1 needs an id and a reason',
     'known entry 2 needs an id and a reason',
   ])
+})
+
+test('name findings require exact titles even when locations match', () => {
+  const expected = { rule: 'duplicate-test-name', locations: ['a.test.ts:3', 'a.test.ts:6'], titles: ['row 1', 'row 1'] }
+  const record = { ...located('duplicate-test-name', [3, 6]), titles: ['row 1', 'row 1'] }
+  const testCase = { name: 'names', expectedTests: 4, expectedFindings: [expected, { ...expected, titles: ['row 2', 'row 2'] }] }
+  assert.deepEqual(judgeRecall(testCase, [summary(4), record, { ...record, titles: ['row 2', 'row 2'] }]).failures, [])
+  const missing = judgeRecall(testCase, [summary(4)])
+  assert.equal(new Set(missing.failures.map(failure => failure.id)).size, 2)
+  const collapsed = judgeRecall(testCase, [summary(4), record])
+  assert.equal(collapsed.failures.length, 1)
+  assert.match(collapsed.failures[0].id, /^recall-miss/)
+  const wrong = judgeRecall(testCase, [summary(4), record, { ...record, titles: ['row 3', 'row 3'] }])
+  assert.equal(wrong.failures.length, 2)
+  const extra = judgeRecall({ name: 'names', expectedTests: 4 }, [summary(4), record, { ...record, titles: ['row 2', 'row 2'] }])
+  assert.equal(new Set(extra.failures.map(failure => failure.id)).size, 2)
 })
